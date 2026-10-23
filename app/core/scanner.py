@@ -16,7 +16,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 from PySide6.QtCore import QThread, Signal
 
-from app.core import planner
+from app.core import densify, planner
 from app.core.guard import SafetyGuard
 from app.core.io_profile import IoProfile
 from app.core.journal import MoveJournal
@@ -713,6 +713,12 @@ class PlanWorker(QThread):
         try:
             if self._mode == "range":
                 plan = self._plan_range()
+            elif self._mode == "auto_fill":
+                plan = self._plan_auto_fill()
+            elif self._mode == "compact":
+                plan = self._plan_compact()
+            elif self._mode == "zone":
+                plan = self._plan_zone()
             else:
                 plan = self._plan_tail()
             if self._cancel:
@@ -775,6 +781,46 @@ class PlanWorker(QThread):
             io_profile=io_profile,
         )
         return planner.build_range_plan(self._entries, params)
+
+    # ---- 1.0.0C 密实化策略（densify）----
+    def _plan_auto_fill(self) -> MovePlan:
+        """策略①：全池自动挑选文件填入末端预留区空闲（大文件优先、放不下跳过）。"""
+        total = self._info.total_clusters
+        runs = bitmap_mod.free_runs_in_window(self._snapshot.bits, 0, total)
+        params = planner.PlanParams(
+            total_clusters=total,
+            bytes_per_cluster=self._info.bytes_per_cluster,
+            reserve_clusters=self._reserve,
+            free_runs=runs,
+            mft_zone_start=self._info.mft_zone_start,
+            mft_zone_end=self._info.mft_zone_end,
+        )
+        return densify.auto_fill_tail(self._entries, params)
+
+    def _plan_compact(self) -> MovePlan:
+        """策略②：选定区间预密实化（区间内可移动文件密集重排、coalesce 空闲）。"""
+        if self._window is None:
+            raise ValueError("区间预密实化需要先设定目标区间")
+        total = self._info.total_clusters
+        free_all = bitmap_mod.free_runs_in_window(self._snapshot.bits, 0, total)
+        return densify.compact_range(
+            self._entries,
+            (self._window.start_lcn, self._window.end_lcn),
+            free_all,
+            total,
+            self._info.mft_zone_start,
+            self._info.mft_zone_end,
+        )
+
+    def _plan_zone(self) -> MovePlan:
+        """策略③：按文件大小把目标区间切成尺寸区段装箱。"""
+        if self._window is None:
+            raise ValueError("按大小分区需要先设定目标区间")
+        return densify.zone_plan(
+            self._entries,
+            (self._window.start_lcn, self._window.end_lcn),
+            total_clusters=self._info.total_clusters,
+        )
 
     @staticmethod
     def _complement(runs: Sequence[Tuple[int, int]], total: int) -> List[Tuple[int, int]]:

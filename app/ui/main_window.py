@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.core import densify as densify_mod
 from app.core import packer
 from app.core import ranges as ranges_mod
 from app.core.io_profile import IoProfile
@@ -454,6 +455,7 @@ class MainWindow(QMainWindow):
         target_card = cards.Card(inner, padding=14, spacing=8)
         self._target_panel = TargetPanel(target_card)
         self._target_panel.windowChanged.connect(self._on_target_changed)
+        self._target_panel.strategyChanged.connect(self._on_target_changed)
         self._target_panel.excludeChanged.connect(self._on_exclude_changed)
         self._target_panel.reserveChanged.connect(self._on_reserve_changed)
         target_card.body().addWidget(self._target_panel)
@@ -939,6 +941,7 @@ class MainWindow(QMainWindow):
                 f"合计 {human_bytes(total)}"
             )
             self._table.file_model.set_checked_rows(True)
+            self._annotate_front_half(items)
 
         if self._scan_panel.channel() == CHANNEL_HANDLE:
             # 句柄通道没有 MFT 健康度，统计条只报能报的
@@ -947,6 +950,27 @@ class MainWindow(QMainWindow):
         self._count_badge.set_state(f"{len(items)} 个", "accent")
         self._on_selection_changed()
         self._build_index()
+
+    def _annotate_front_half(self, items: List[FileEntry]) -> None:
+        """卷前半大文件扫描（1.0.0C）：把占前部的大文件标注为「前半·候选」。只读。"""
+        info = self._volume
+        if info is None or not items:
+            return
+        try:
+            report = densify_mod.front_half_report(items, info.total_clusters)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warn(f"前半大文件扫描失败：{exc}")
+            return
+        if not report.files:
+            return
+        for candidate in report.files:
+            self._table.file_model.update_status(candidate.entry.path, "前半·候选")
+        self._log.info(
+            f"卷前半大文件扫描：{len(report.files)} 个候选，占前半 "
+            f"{report.front_occupied:,} 簇（可移动 {report.movable_front:,} 簇），"
+            f"分界 LCN {report.boundary_lcn:,} —— 已标注「前半·候选」，"
+            "可切到「自动填满末端」策略搬运以腾出前部连续空间"
+        )
 
     def _on_scan_failed(self, message: str) -> None:
         self._progress.set_indeterminate(False)
@@ -1319,23 +1343,32 @@ class MainWindow(QMainWindow):
         if not selected:
             self._set_notice("请先勾选需要迁移的文件", "warning")
             return
+        strategy = self._target_panel.strategy()
         start, end = self._target_panel.window()
-        if end <= start:
-            self._set_notice("请先设定目标区间（起点必须小于终点）", "warning")
-            return
-        if self._feasibility is not None and not self._feasibility.ok:
-            self._set_notice(
-                "当前目标区间不可行：" + "；".join(self._feasibility.reasons[:2]),
-                "danger",
-            )
-            return
+        needs_window = strategy in ("range", "compact", "zone")
+        if needs_window:
+            if end <= start:
+                self._set_notice("请先设定目标区间（起点必须小于终点）", "warning")
+                return
+            if self._feasibility is not None and not self._feasibility.ok:
+                self._set_notice(
+                    "当前目标区间不可行：" + "；".join(self._feasibility.reasons[:2]),
+                    "danger",
+                )
+                return
 
         policy = self._policy()
         profile = self._io_panel.profile()
-        self._log.info(
-            f"开始规划（v2 区间模式）：{len(selected)} 个文件，目标 LCN "
-            f"{start:,} – {max(start, end - 1):,}，IO {profile.summary}"
-        )
+        if needs_window:
+            self._log.info(
+                f"开始规划（策略 {strategy}）：{len(selected)} 个文件，目标 LCN "
+                f"{start:,} – {max(start, end - 1):,}，IO {profile.summary}"
+            )
+        else:
+            self._log.info(
+                f"开始规划（策略 {strategy}）：{len(selected)} 个文件，卷尾保留区 "
+                f"{self._target_panel.reserve_tail_clusters():,} 簇，IO {profile.summary}"
+            )
         self._progress.set_indeterminate(True)
         self._progress.set_state(0, 1, "正在计算迁移计划", "")
         self._set_busy(True)
@@ -1346,12 +1379,12 @@ class MainWindow(QMainWindow):
             selected,
             self._target_panel.reserve_tail_clusters(),
             self,
-            window=TargetWindow(start, end),
+            window=TargetWindow(start, end) if needs_window else None,
             safety=policy,
             io_profile=profile,
             ownership=self._ownership,
             excluded_paths=tuple(sorted(self._target_panel.excluded_paths())),
-            mode="range",
+            mode=strategy,
         )
         worker.completed.connect(self._on_plan_ready)
         worker.failed.connect(self._on_plan_failed)

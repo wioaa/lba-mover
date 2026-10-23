@@ -58,6 +58,8 @@ def status_kind(status: str) -> str:
         return "danger"
     if status == "待迁移":
         return "accent"
+    if status == "前半·候选":
+        return "warning"
     return "neutral"
 
 

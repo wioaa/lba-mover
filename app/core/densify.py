@@ -381,3 +381,47 @@ def front_half_report(
         front_occupied=front_occupied,
         movable_front=movable_front,
     )
+
+
+def zone_plan(
+    entries: Sequence[FileEntry],
+    window: Sequence[int],
+    *,
+    class_count: int = 3,
+    total_clusters: int = 0,
+) -> MovePlan:
+    """把 :func:`plan_size_zones` 的装箱结果包成 :class:`MovePlan`（供 UI / 执行器复用）。
+
+    ``plan_size_zones`` 返回 ``(placed, unplaced, zones)``；这里转成与 tail / range
+    一致的 MovePlan 结构（items 带 segments、failures、note），从而直接走既有的
+    计划展示与执行流水线。只算目标布局，搬运顺序 / 中转交由 ``scheduler``。
+    """
+    lo, hi = int(window[0]), int(window[1])
+    placed, unplaced, zones = plan_size_zones(entries, (lo, hi), class_count=class_count)
+    plan = MovePlan(
+        total_clusters=int(total_clusters),
+        tail_floor_lcn=lo,
+        window=TargetWindow(lo, hi),
+    )
+    plan.version = 2
+    by_path = {e.path: e for e in entries}
+    for path, target in placed.items():
+        entry = by_path.get(path)
+        if entry is None:
+            continue
+        segments = build_segments(entry, target)
+        item = PlanItem(
+            entry=entry,
+            target_lcn=target,
+            clusters=entry.allocated_clusters,
+            segments=segments,
+        )
+        if not any(seg.src_lcn != seg.dst_lcn for seg in segments):
+            item.skipped_reason = "已位于目标位置"
+        plan.items.append(item)
+    for entry in unplaced:
+        plan.failures.append(PlanFailure(entry=entry, reason="区段空间不足，自动策略未纳入"))
+    plan.items.sort(key=lambda i: i.target_lcn)
+    moved = sum(1 for i in plan.items if not i.skipped_reason)
+    plan.note = f"按大小分区：{moved} 个文件装入 {len(zones)} 个尺寸区段 [{lo:,}, {hi:,})"
+    return plan

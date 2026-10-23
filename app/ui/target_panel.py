@@ -56,6 +56,15 @@ class TargetPanel(QWidget):
     excludeChanged = Signal(object)      # FrozenSet[str]
     reserveChanged = Signal(int, int)    # 卷首 MB, 卷尾 MB
     modeChanged = Signal(str)            # MODE_ANY / MODE_QUICK
+    strategyChanged = Signal(str)        # range / auto_fill / compact / zone
+
+    #: 规划策略：标签 → PlanWorker mode（1.0.0C 新增）
+    _STRATEGIES = (
+        ("区间装箱", "range"),
+        ("自动填满末端", "auto_fill"),
+        ("区间预密实化", "compact"),
+        ("按大小分区", "zone"),
+    )
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -98,6 +107,23 @@ class TargetPanel(QWidget):
         head.addWidget(self._window_badge, 0, Qt.AlignmentFlag.AlignVCenter)
         head.addStretch(1)
         column.addLayout(head)
+
+        # ---- 规划策略（1.0.0C 新增）----
+        strat_row = QHBoxLayout()
+        strat_row.setContentsMargins(0, 0, 0, 0)
+        strat_row.setSpacing(8)
+        strat_row.addWidget(cards.label("规划策略", "dim", holder), 0)
+        self._strategy_combo = cards.SoftComboBox(holder)
+        for _label, _mode in self._STRATEGIES:
+            self._strategy_combo.addItem(_label)
+        self._strategy_combo.currentIndexChanged.connect(self._on_strategy_changed)
+        strat_row.addWidget(self._strategy_combo, 1)
+        column.addLayout(strat_row)
+        self._strategy_hint = cards.label(
+            "「自动填满末端」按卷尾保留区自动挑选、无需区间；其余策略用上方目标区间。",
+            "caption", holder, True,
+        )
+        column.addWidget(self._strategy_hint)
 
         self._mode_switch = cards.SegmentedControl(["任意区间", "快捷"], 0, holder)
         self._mode_switch.changed.connect(self._on_mode_changed)
@@ -279,6 +305,22 @@ class TargetPanel(QWidget):
         index = 1 if mode == MODE_QUICK else 0
         self._mode_switch.set_current(index, emit=False)
         self._sync_mode_visual()
+
+    def strategy(self) -> str:
+        """当前规划策略对应的 PlanWorker mode。"""
+        index = self._strategy_combo.currentIndex()
+        if 0 <= index < len(self._STRATEGIES):
+            return self._STRATEGIES[index][1]
+        return "range"
+
+    def set_strategy(self, mode: str) -> None:
+        for i, (_label, m) in enumerate(self._STRATEGIES):
+            if m == mode:
+                self._strategy_combo.setCurrentIndex(i)
+                return
+
+    def _on_strategy_changed(self, _index: int) -> None:
+        self.strategyChanged.emit(self.strategy())
 
     def window(self) -> Tuple[int, int]:
         """当前目标区间 ``[start, end)``。"""
