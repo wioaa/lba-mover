@@ -235,6 +235,9 @@ class MainWindow(QMainWindow):
         self._index_payload = None
         self._feasibility: Optional[FeasibilityReport] = None
         self._has_pending = False            # 1.0.0D：是否存在未应用的配置修改
+        #: 1.0.0D：执行前选「先应用再执行」后，等新计划就绪时是否自动接续执行
+        #: （接续仍会再走 DangerConfirmDialog，不跳过人工确认）
+        self._resume_execute_after_plan = False
         # 1.0.0D：可行性后台计算的状态
         self._feasibility_worker: Optional[FeasibilityWorker] = None
         self._feasibility_seq = 0
@@ -1710,7 +1713,27 @@ class MainWindow(QMainWindow):
                 f"{len(plan.failures)} 个文件无法安排：{describe_failures(plan.failures)}"
             )
 
+        # ---- 1.0.0D 修复：「先应用再执行」的自动接续 ----
+        # 用户在执行模式下选了 apply：配置已提交、计划已按新参数重生成，
+        # 这里自动接续回 _start_move（它会再走一遍 DangerConfirmDialog，
+        # **不跳过人工确认**）；不满足条件时明确告知需手动点开始。
+        if self._resume_execute_after_plan:
+            self._resume_execute_after_plan = False
+            blocking = self._feasibility is not None and not self._feasibility.ok
+            if self._mode == MODE_EXECUTE and not plan.empty and not blocking:
+                self._log.info("计划已按新参数重新生成，自动接续执行流程（仍需人工确认）")
+                self._start_move()
+            else:
+                reason = "当前计划不可行" if blocking else "计划为空"
+                self._set_notice(
+                    f"配置已应用，计划已重新生成，但{reason}，请确认后手动点击开始迁移",
+                    "warning",
+                )
+                self._log.warn(f"自动接续未发生：{reason}")
+
     def _on_plan_failed(self, message: str) -> None:
+        # 标志不得悬挂：规划失败时清掉，避免下一次成功规划误触发执行
+        self._resume_execute_after_plan = False
         self._progress.set_indeterminate(False)
         self._progress.reset("规划失败")
         self._set_busy(False)
@@ -1726,11 +1749,22 @@ class MainWindow(QMainWindow):
         info = self._volume
         snapshot = self._snapshot
         plan = self._plan
-        if info is None or snapshot is None or plan is None:
+        # ---- 1.0.0D 修复：开头静默 return 补提示（用户不该"点了没反应"）----
+        if info is None or snapshot is None:
+            self._set_notice(
+                "当前卷或位图尚未就绪，请等待加载完成后再试", "warning"
+            )
+            self._log.warn("执行被忽略：卷或位图尚未就绪")
+            return
+        if plan is None:
+            self._set_notice("请先生成迁移计划，再执行真实迁移", "warning")
+            self._log.warn("执行被忽略：尚未生成迁移计划")
             return
         # ---- 1.0.0D：存在未应用配置时，先让用户明确选择 ----
-        # 「先应用再执行」= 提交配置 → 计划失效 → 重新生成（不许把不一致的
-        # 参数静默带进写盘流程）；「按现有计划执行」= 明确认知后继续。
+        # 「先应用再执行」= 提交配置 → 计划失效 → **自动重新规划并接续执行**
+        # （修复前这里只提示"请重新生成"就 return，标签承诺与实际行为不符：
+        # 用户感知为"点了执行却不执行"）；「按现有计划执行」= 明确认知后继续；
+        # 重新规划完成后仍会再走一遍 DangerConfirmDialog，**不跳过人工确认**。
         if self._has_pending:
             dialog = dialogs.ChoiceDialog(
                 "配置未应用",
@@ -1746,13 +1780,15 @@ class MainWindow(QMainWindow):
             if not dialog.exec():
                 return
             if dialog.choice == "apply":
+                self._resume_execute_after_plan = True
                 self._apply_pending()
                 # commit 会发出 windowChanged / profileChanged → 计划失效
                 self._set_notice(
-                    "配置已应用：当前计划已失效，请重新生成迁移计划后再执行。",
+                    "配置已应用，正在按新参数重新生成计划，完成后自动继续执行……",
                     "warning",
                 )
-                self._log.warn("执行前应用了待定配置，计划已失效，需重新生成")
+                self._log.info("执行前应用了待定配置：重新规划后将自动接续执行（仍需人工确认）")
+                self._generate_plan()
                 return
             if dialog.choice != "proceed":
                 return

@@ -61,6 +61,7 @@
   - **B-7（P3）文档/预览小修**：`pending_count` 文档改为「2 组」实际口径；quick-tail 预览的卷尾守卫改用 `_live_reserve_mb()`（待定的保留区修改立刻在预览可见，与面板 `_live_*` 回显一致）。
 
   - **C-1（P2，QA 对方案 D 的专项审计）进程被杀时 stage 文件残留且无人清理**：`staged_copy` 的 `os.remove(scratch_path)` 挪进 finally（句柄关闭后删，异常路径同样清现场，删除失败不掩盖原异常）；`BlockStreamWorker` 收尾改为「先删目录内全部 `.stage` 残留（跨文件积累的也一并清）→ 清空后 rmdir，非 stage 文件不动、目录保留」；开发期实证残留 `C:\.lba-tmp-scratch\o.bin.stage` 已清理并 rmdir 空目录。回归钉：注入 dst 写入中途异常断言 stage 被清、预置 `.stage` 残留 + 外来文件的 worker 收尾清场对拍。
+  - **执行前「先应用再执行」改为应用后自动重新规划并接续执行**：修复前该分支只提示"请重新生成迁移计划"就 return，按钮文字承诺"再执行"而实际一簇未搬，用户实机感知为「点了执行却不执行」；现改为「应用配置 → 自动 `_generate_plan()` → 新计划就绪后自动接续执行流程」（新增 `_resume_execute_after_plan` 标志，接续仍会再走 `DangerConfirmDialog`，**不跳过人工确认**；接续一次后复位，规划失败时清标志防悬挂）。同时补两处静默返回的提示：卷/位图尚未就绪、尚未生成迁移计划。回归钉 `tests/test_ui_execute_flow.py`（6 例）。
 - 版本号 `1.0.0C → 1.0.0D`。
 
 ---
