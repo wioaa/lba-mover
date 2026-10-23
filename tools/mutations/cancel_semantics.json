@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "变异清单：验证「取消语义」相关钉子是否真的会咬住行为退化（1.0.0E）。",
+    "用法：python tools/mutation_probe.py --manifest tools/mutations/cancel_semantics.json",
+    "expect 语义：fail = 该变异让测试变红（钉子咬住了）；pass = 测试仍绿（正当改动不该误红）。",
+    "M1~M5 期望 fail，M6 期望 pass —— 与原审计表逐格一致。"
+  ],
+  "copies": ["app", "tests"],
+  "timeout": 600,
+  "mutations": [
+    {
+      "name": "M1 删 mark_cancelled 调用（留 break）",
+      "file": "app/win32/mft_reader.py",
+      "old": "                    mark_cancelled(outcome)\n                    break\n",
+      "new": "                    break\n",
+      "test": "tests/test_cancel_semantics.py",
+      "expect": "fail"
+    },
+    {
+      "name": "M2 删 break（留调用）",
+      "file": "app/win32/mft_reader.py",
+      "old": "                    mark_cancelled(outcome)\n                    break\n",
+      "new": "                    mark_cancelled(outcome)\n",
+      "test": "tests/test_cancel_semantics.py",
+      "expect": "fail"
+    },
+    {
+      "name": "M3 break 前置（调用成死代码）",
+      "file": "app/win32/mft_reader.py",
+      "old": "                    mark_cancelled(outcome)\n                    break\n",
+      "new": "                    break\n                    mark_cancelled(outcome)\n",
+      "test": "tests/test_cancel_semantics.py",
+      "expect": "fail"
+    },
+    {
+      "name": "M4 调用包进 if False（不可达）",
+      "file": "app/win32/mft_reader.py",
+      "old": "                    mark_cancelled(outcome)\n                    break\n",
+      "new": "                    if False:\n                        mark_cancelled(outcome)\n                    break\n",
+      "test": "tests/test_cancel_semantics.py",
+      "expect": "fail"
+    },
+    {
+      "name": "M5 守卫改本地别名（AST 认名字，有意保留红）",
+      "file": "app/win32/mft_reader.py",
+      "old": "                if should_cancel is not None and (number % 512 == 0) and should_cancel():",
+      "new": "                probe = should_cancel\n                if probe is not None and (number % 512 == 0) and probe():",
+      "test": "tests/test_cancel_semantics.py",
+      "expect": "fail"
+    },
+    {
+      "name": "M6 新增第二个正确的取消分支（语义更好，不该误红）",
+      "file": "app/win32/mft_reader.py",
+      "old": "                stats.total_records += 1\n",
+      "new": "                if should_cancel is not None and should_cancel():\n                    mark_cancelled(outcome)\n                    break\n                stats.total_records += 1\n",
+      "test": "tests/test_cancel_semantics.py",
+      "expect": "pass"
+    }
+  ]
+}
