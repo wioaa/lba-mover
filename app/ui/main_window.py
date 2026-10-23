@@ -1080,7 +1080,14 @@ class MainWindow(QMainWindow):
         # ★ 1.0.0E（QA P2）：取消也是走 ``completed``（部分结果），必须与「扫描
         # 完成」区分 —— 否则用户按了取消却看到「扫描完成」+ 一份不完整列表，
         # 且提示零残留，会误以为某个文件不在本卷上。
-        cancelled = bool(getattr(self.sender(), "cancelled", False))
+        # ★ `sender()` 兜底（第 4 次踩同一个坑）：直调 / 换信号源时 ``sender()``
+        # 是 ``None``，若只读 sender 就会把「取消」静默当成「完成」，而直调式
+        # 测试还会假绿。``_scan_worker`` 在本行之后才置 None，此处仍可读到，
+        # 故用它兜底；两者都拿不到 → 按「非取消」处理（保守方向：宁可少报取消，
+        # 也不要无端把正常完成标成取消）。
+        cancelled = bool(getattr(self.sender(), "cancelled", False)) or bool(
+            getattr(self._scan_worker, "cancelled", False)
+        )
         self._flush_scan_buffer()
         items: List[FileEntry] = list(entries) if isinstance(entries, list) else []
         self._table.file_model.set_entries(items)
@@ -1228,7 +1235,11 @@ class MainWindow(QMainWindow):
     def _on_index_ready(self, payload: object) -> None:
         # ★ 1.0.0E：取消也走 ``ready``（部分索引）—— 部分归属表不能当作
         # 「就绪」使用，否则挡路者归属会缺项且用户毫不知情（与扫描取消同族）。
-        cancelled = bool(getattr(self.sender(), "cancelled", False))
+        # ★ `sender()` 兜底（同 `_on_scan_completed`）：必须在把
+        # ``_index_worker`` 置 None **之前**读，否则兜底失效。
+        cancelled = bool(getattr(self.sender(), "cancelled", False)) or bool(
+            getattr(self._index_worker, "cancelled", False)
+        )
         self._index_worker = None
         self._progress.set_indeterminate(False)
         self._set_busy(False)
@@ -1780,6 +1791,14 @@ class MainWindow(QMainWindow):
 
         Returns:
             本次规划完成后是否应自动接续执行流程。
+
+        Note:
+            **刻意不回落到 ``self._plan_worker``**（与 ``_on_scan_completed`` /
+            ``_on_index_ready`` 的兜底方向相反，理由如下）：接续意图是**一次性**
+            的，且它的误判后果是「无端弹出执行确认框 / 走执行流程」（危险方向），
+            而漏判的后果只是「少了一次自动接续、用户手动再点一次」（安全方向）。
+            ``_plan_worker`` 那一刻可能已是**新的**线程，读它的意图等于把上一轮
+            的意图错配给这一轮 —— 因此这里只认 sender 与窗口瞬时标志。
         """
         sender = worker if worker is not None else self.sender()
         intent = False

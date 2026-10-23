@@ -139,12 +139,12 @@ def test_mft_scan_worker_cancel_reports_completed_with_flag() -> None:
     entry = _fake_entry()
     original_channel = scanner_mod.build_scan_channel
     original_scan = mft_reader.scan_volume_mft
+    holder: dict = {}
 
     def _fake_scan(*_args, **_kwargs):
-        outcome = mft_reader.MftScanOutcome(
-            entries=[entry], notes=["扫描已取消（结果不完整）"]
-        )
-        outcome.cancelled = True
+        outcome = mft_reader.MftScanOutcome(entries=[entry])
+        mft_reader.mark_cancelled(outcome)          # 走真实留痕逻辑
+        holder["outcome"] = outcome
         return outcome
 
     scanner_mod.build_scan_channel = lambda *_a, **_kw: ("mft", "")
@@ -154,6 +154,7 @@ def test_mft_scan_worker_cancel_reports_completed_with_flag() -> None:
     fallback: list = []
     failed: list = []
     progress: list = []
+    found: list = []
     worker = scanner_mod.MftScanWorker(
         _fake_volume(),
         scanner_mod.ScanConfig(root="R:\\", min_size=1, max_matches=10),
@@ -162,6 +163,7 @@ def test_mft_scan_worker_cancel_reports_completed_with_flag() -> None:
     worker.completed.connect(completed.append)
     worker.fallback.connect(fallback.append)
     worker.failed.connect(failed.append)
+    worker.found.connect(found.append)
     worker.progress.connect(lambda _d, _t, text: progress.append(text))
     try:
         worker.run()                       # 直接跑 run：不建线程
@@ -169,14 +171,28 @@ def test_mft_scan_worker_cancel_reports_completed_with_flag() -> None:
         scanner_mod.build_scan_channel = original_channel
         mft_reader.scan_volume_mft = original_scan
 
+    outcome = holder["outcome"]
     assert len(completed) == 1, f"取消仍应发一次 completed（部分结果），实际 {completed}"
     assert fallback == [], "取消不是回退：不得发 fallback（修复前被误认为会发）"
     assert failed == [], "取消不是失败：不得发 failed"
     assert worker.cancelled is True, "worker 必须向 UI 暴露取消态"
     assert completed[0] == [entry], "已解析的部分结果要如数交给上层"
-    assert any("已取消" in text for text in progress), (
-        f"进度文案必须明说已取消，实际 {progress}"
+    assert len(found) == 1, "found 推送的部分结果不得丢失"
+
+    # ---- QA 8 条判据：1（文案互斥）/ 2（N 对齐）/ 3（不污染 fallback_code）----
+    text = " ".join(progress)
+    assert "已取消" in text, f"进度文案必须明说已取消，实际 {progress}"
+    assert "完成" not in text, f"取消文案不得出现「完成」，实际 {progress}"
+    assert f"已解析的 {len(completed[0]):,} 项" in text, (
+        f"提示里的 N 必须等于 completed 携带的条目数，实际 {progress}"
     )
+    # ---- 判据 3/4/6：不被当成回退、不降级通道、不写 fatal_error ----
+    assert outcome.fallback_code == "", (
+        f"取消不得污染 fallback_code（否则日志把用户取消记成通道失效），"
+        f"实际 {outcome.fallback_code!r}"
+    )
+    assert outcome.channel == "mft", "取消不是降级：channel 不得切成 handle"
+    assert outcome.stats.fatal_error == "", "fatal_error 只用于真实失败"
 
 
 # --------------------------------------------------------------------------- #
@@ -291,6 +307,47 @@ def test_ui_index_ready_normal_path_unchanged() -> None:
     joined = _messages(window)
     assert "归属索引就绪" in joined, f"正常路径口径不得改变，实际日志：{joined!r}"
     assert window._ownership is payload.index, "正常完成应设置归属索引"
+
+
+# --------------------------------------------------------------------------- #
+# ⑥ 直调兜底（第 4 次 `sender()` 陷阱的专用钉子）
+#     动机：`sender()` 只在信号派发期间有值；测试直调 / 换信号源时它是 None。
+#     若只读 sender，取消会被静默当成「完成 / 就绪」，而直调式测试还会假绿
+#     —— 所以两处都读 `_xxx_worker` 兜底。这两枚钉子专防第 4 次复发。
+# --------------------------------------------------------------------------- #
+def test_ui_scan_completed_direct_call_uses_worker_fallback() -> None:
+    window, _mw = _make_window()
+    built: list = []
+    window._build_index = lambda: built.append("index")
+    window._set_busy(True)
+    worker = _ScanSource()
+    worker.cancelled = True
+    window._scan_worker = worker               # 兜底来源（直调时 sender() 为 None）
+
+    window._on_scan_completed([_fake_entry()])  # 直调，不是信号驱动
+
+    joined = _messages(window)
+    assert "扫描完成" not in joined, f"直调也不得把取消报成完成，实际：{joined!r}"
+    assert "已取消" in joined, f"直调也必须报取消，实际：{joined!r}"
+    assert "已取消" in window._notice.text(), window._notice.text()
+    assert built == [], "取消路径不得建索引（直调同样）"
+    assert window._busy is False
+
+
+def test_ui_index_ready_direct_call_uses_worker_fallback() -> None:
+    window, _mw = _make_window()
+    window._set_busy(True)
+    worker = _ScanSource()
+    worker.cancelled = True
+    window._index_worker = worker              # 兜底来源（且必须在置 None 之前读）
+
+    window._on_index_ready(_fake_index_payload())   # 直调
+
+    joined = _messages(window)
+    assert "归属索引就绪" not in joined, f"直调也不得把取消索引报成就绪，实际：{joined!r}"
+    assert "归属索引已取消" in joined, f"直调也必须报取消，实际：{joined!r}"
+    assert window._ownership is None, "取消索引（直调）也不得写入归属表"
+    assert window._busy is False
 
 
 if __name__ == "__main__":
