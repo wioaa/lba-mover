@@ -50,13 +50,25 @@ MAX_BLOCKER_ROWS = 8
 
 
 class TargetPanel(QWidget):
-    """目标区间 + 可行性 + 挡路者 + 保留区。"""
+    """目标区间 + 可行性 + 挡路者 + 保留区。
+
+    1.0.0D 起采用「暂存—应用」语义：控件修改先进入**待定**态（只发
+    :attr:`pendingChanged`），点「应用配置」（:meth:`commit_pending`）才把
+    当前值落为已提交并一次性发出既有信号（``windowChanged`` /
+    ``strategyChanged`` / ``reserveChanged``）。这样**当前计划始终基于已提交
+    参数**。两条直通路径例外：
+
+    * 布局图拖选 → :meth:`set_window_committed`（程序性同步，立即生效）；
+    * 排除挡路者（``excludeChanged``）→ 保持即时直发，不进暂存。
+    """
 
     windowChanged = Signal()
     excludeChanged = Signal(object)      # FrozenSet[str]
     reserveChanged = Signal(int, int)    # 卷首 MB, 卷尾 MB
     modeChanged = Signal(str)            # MODE_ANY / MODE_QUICK
     strategyChanged = Signal(str)        # range / auto_fill / compact / zone
+    #: (是否待定, 变更组数)。变更组：目标区间 / 规划策略 / 保留区。
+    pendingChanged = Signal(bool, int)
 
     #: 规划策略：标签 → PlanWorker mode（1.0.0C 新增）
     _STRATEGIES = (
@@ -87,6 +99,95 @@ class TargetPanel(QWidget):
         layout.addWidget(self._build_blocker_block())
         # ================= 保留区 ================= #
         layout.addWidget(self._build_reserve_block())
+
+        # 暂存基线：初始控件值即为「已提交」（不发 pending）
+        self._committed = self._snapshot()
+
+    # ------------------------------------------------------------------ #
+    # 暂存层（1.0.0D）
+    # ------------------------------------------------------------------ #
+    def _snapshot(self) -> tuple:
+        """控件级快照：mode / 区间 / 策略 / 快捷参数 / 保留区。"""
+        return (
+            int(self._mode_switch.current_index),
+            *self._range_input.values(),
+            int(self._strategy_combo.currentIndex()),
+            int(self._quick_combo.currentIndex()),
+            int(self._quick_gb.value()),
+            int(self._quick_start.value()),
+            int(self._head_field.value()),
+            int(self._tail_field.value()),
+        )
+
+    def _rebase_committed(self) -> None:
+        """把「已提交」静默重置为当前控件值（程序性 setter 之后调用）。"""
+        self._committed = self._snapshot()
+        self.pendingChanged.emit(False, 0)
+
+    #: 快照分组：0..6 = 目标区间（mode + 任意区间 + 策略 + 快捷），7..8 = 保留区
+    _WINDOW_SLICE = slice(0, 7)
+    _STRATEGY_INDEX = 3
+    _RESERVE_SLICE = slice(7, 9)
+
+    def is_pending(self) -> bool:
+        """是否存在未应用的修改。"""
+        return self._snapshot() != self._committed
+
+    def pending_count(self) -> int:
+        """变更组数（目标区间 / 规划策略 / 保留区）。"""
+        current = self._snapshot()
+        count = 0
+        if current[self._WINDOW_SLICE] != self._committed[self._WINDOW_SLICE]:
+            count += 1
+        if current[self._RESERVE_SLICE] != self._committed[self._RESERVE_SLICE]:
+            count += 1
+        return count
+
+    def commit_pending(self) -> None:
+        """把当前控件值落为已提交，并按差异**一次性**发出既有信号。"""
+        current = self._snapshot()
+        if current == self._committed:
+            self.pendingChanged.emit(False, 0)
+            return
+        old = self._committed
+        self._committed = current
+        if old[self._WINDOW_SLICE] != current[self._WINDOW_SLICE]:
+            self.windowChanged.emit()
+        if old[self._STRATEGY_INDEX] != current[self._STRATEGY_INDEX]:
+            self.strategyChanged.emit(self.strategy())
+        if old[self._RESERVE_SLICE] != current[self._RESERVE_SLICE]:
+            self.reserveChanged.emit(current[7], current[8])
+        self.pendingChanged.emit(False, 0)
+
+    def discard_pending(self) -> None:
+        """把控件值恢复到已提交状态（**不发** window/strategy/reserve 信号）。"""
+        if not self.is_pending():
+            return
+        (
+            mode_index,
+            range_start,
+            range_end,
+            strategy_index,
+            quick_index,
+            quick_gb,
+            quick_start,
+            head_mb,
+            tail_mb,
+        ) = self._committed
+        self._guard = True
+        self._mode_switch.set_current(mode_index, emit=False)
+        self._range_input.set_range_values(range_start, range_end)
+        self._strategy_combo.setCurrentIndex(strategy_index)
+        self._quick_combo.setCurrentIndex(quick_index)
+        self._quick_gb.setValue(quick_gb)
+        self._quick_start.setValue(quick_start)
+        self._head_field.set_value(head_mb)
+        self._tail_field.set_value(tail_mb)
+        self._guard = False
+        self._sync_mode_visual()
+        self._refresh_window_badge()
+        self._refresh_reserve_hint()
+        self.pendingChanged.emit(False, 0)
 
     # ------------------------------------------------------------------ #
     # 构建
@@ -286,6 +387,8 @@ class TargetPanel(QWidget):
                 field.set_value(min(min_mb, max_mb))
         self._refresh_reserve_hint()
         self._refresh_window_badge()
+        # 程序性切换卷：暂存基线静默重置（换卷后旧待定态没有意义）
+        self._rebase_committed()
 
     def set_reserve_defaults(self, head_mb: int, tail_mb: int) -> None:
         """设置初始保留区（来自 ``safety.default_head_mb`` 等）。"""
@@ -294,6 +397,7 @@ class TargetPanel(QWidget):
         self._tail_field.set_value(max(1, int(tail_mb)))
         self._guard = False
         self._refresh_reserve_hint()
+        self._rebase_committed()
 
     # ------------------------------------------------------------------ #
     # 目标区间
@@ -307,8 +411,8 @@ class TargetPanel(QWidget):
         self._sync_mode_visual()
 
     def strategy(self) -> str:
-        """当前规划策略对应的 PlanWorker mode。"""
-        index = self._strategy_combo.currentIndex()
+        """**已提交**的规划策略对应的 PlanWorker mode。"""
+        index = self._committed[self._STRATEGY_INDEX]
         if 0 <= index < len(self._STRATEGIES):
             return self._STRATEGIES[index][1]
         return "range"
@@ -320,22 +424,45 @@ class TargetPanel(QWidget):
                 return
 
     def _on_strategy_changed(self, _index: int) -> None:
-        self.strategyChanged.emit(self.strategy())
+        if self._guard:
+            return
+        self._emit_pending()
+
+    def _emit_pending(self) -> None:
+        """控件变化 → 只报待定态，不动既有语义信号（等「应用配置」）。"""
+        self.pendingChanged.emit(True, self.pending_count())
 
     def window(self) -> Tuple[int, int]:
-        """当前目标区间 ``[start, end)``。"""
-        if self.mode() == MODE_QUICK:
-            window = self._quick_window()
+        """**已提交**的目标区间 ``[start, end)``（待定修改不进来）。"""
+        return self._window_of(self._committed)
+
+    def _live_window(self) -> Tuple[int, int]:
+        """控件当前指向的区间（本地回显 / 徽章预览用）。"""
+        return self._window_of(self._snapshot())
+
+    def _window_of(self, snap: tuple) -> Tuple[int, int]:
+        """从控件快照算出目标区间（``snap`` 见 :meth:`_snapshot`）。"""
+        if snap[0] == 1:  # 快捷模式
+            clusters = gb_to_clusters(snap[5], self._bytes_per_cluster)
+            if snap[4] == QUICK_TAIL:
+                tail_guard = (
+                    int(snap[8] * MB / self._bytes_per_cluster)
+                    if self._bytes_per_cluster > 0
+                    else 0
+                )
+                win = window_from_tail(self._total_clusters, clusters, tail_guard)
+            else:
+                win = window_from_length(snap[6], clusters, self._total_clusters)
+            start, end = win.start_lcn, win.end_lcn
         else:
-            start, end = self._range_input.values()
-            window = (start, end)
-        start, end = window
-        start = max(0, min(start, self._total_clusters))
-        end = max(start, min(end, self._total_clusters))
+            start, end = snap[1], snap[2]
+        start = max(0, min(int(start), self._total_clusters))
+        end = max(start, min(int(end), self._total_clusters))
         return start, end
 
     def set_window(self, start: int, end: int) -> None:
-        """程序性设置目标区间（布局图拖选 → 面板）。"""
+        """程序性设置目标区间（进入待定态；要立即生效用
+        :meth:`set_window_committed`）。"""
         start, end = int(start), int(end)
         if end < start:
             start, end = end, start
@@ -345,6 +472,15 @@ class TargetPanel(QWidget):
             self._mode_switch.set_current(0, emit=False)
             self._sync_mode_visual()
         self._refresh_window_badge()
+        self._emit_pending()
+
+    def set_window_committed(self, start: int, end: int) -> None:
+        """布局图拖选直通：程序性设置区间并**立即提交生效**（架构要求的
+        两条不走暂存的路径之一）。"""
+        self.set_window(start, end)
+        self._committed = self._snapshot()
+        self.windowChanged.emit()
+        self.pendingChanged.emit(False, 0)
 
     def _quick_window(self) -> Tuple[int, int]:
         clusters = gb_to_clusters(int(self._quick_gb.value()), self._bytes_per_cluster)
@@ -370,15 +506,14 @@ class TargetPanel(QWidget):
             f"= LCN {start:,} – {max(start, end - 1):,} · {clusters:,} 簇 ≈ {human_bytes(span)}"
         )
         self._refresh_window_badge()
-        if not self._guard:
-            self.windowChanged.emit()
+        self._emit_pending()
 
     def _on_mode_changed(self, _index: int) -> None:
         self._sync_mode_visual()
         if self.mode() == MODE_QUICK:
             self._recompute_quick()
-        self.modeChanged.emit(self.mode())
-        self.windowChanged.emit()
+        # 1.0.0D：模式切换也走暂存 —— 等「应用配置」才影响规划语义
+        self._emit_pending()
 
     def _sync_mode_visual(self) -> None:
         quick = self.mode() == MODE_QUICK
@@ -389,13 +524,13 @@ class TargetPanel(QWidget):
 
     def _on_range_input(self, _start: int, _end: int) -> None:
         self._refresh_window_badge()
-        self.windowChanged.emit()
+        self._emit_pending()
 
     def _refresh_window_badge(self) -> None:
         if self._total_clusters <= 0:
             self._window_badge.set_state("未设定", "neutral")
             return
-        start, end = self.window()
+        start, end = self._live_window()
         clusters = max(0, end - start)
         if clusters <= 0:
             self._window_badge.set_state("区间为空", "danger")
@@ -493,31 +628,36 @@ class TargetPanel(QWidget):
     # 保留区
     # ------------------------------------------------------------------ #
     def reserve_mb(self) -> Tuple[int, int]:
+        """**已提交**的保留区（卷首 MB, 卷尾 MB）。"""
+        return int(self._committed[7]), int(self._committed[8])
+
+    def _live_reserve_mb(self) -> Tuple[int, int]:
+        """控件当前的保留区（提示文案预览用）。"""
         return int(self._head_field.value()), int(self._tail_field.value())
 
     def reserve_head_clusters(self) -> int:
         if self._bytes_per_cluster <= 0:
             return 0
-        return int(self._head_field.value() * MB / self._bytes_per_cluster)
+        return int(self._committed[7] * MB / self._bytes_per_cluster)
 
     def reserve_tail_clusters(self) -> int:
         if self._bytes_per_cluster <= 0:
             return 0
-        return int(self._tail_field.value() * MB / self._bytes_per_cluster)
+        return int(self._committed[8] * MB / self._bytes_per_cluster)
 
     def _on_reserve_changed(self, _value: int) -> None:
         self._refresh_reserve_hint()
         if self._guard:
             return
-        head, tail = self.reserve_mb()
-        self.reserveChanged.emit(head, tail)
         if self.mode() == MODE_QUICK:
             self._recompute_quick()
+        self._emit_pending()
 
     def _refresh_reserve_hint(self) -> None:
-        head, tail = self.reserve_mb()
-        head_clusters = self.reserve_head_clusters()
-        tail_clusters = self.reserve_tail_clusters()
+        head, tail = self._live_reserve_mb()
+        bpc = self._bytes_per_cluster
+        head_clusters = int(head * MB / bpc) if bpc > 0 else 0
+        tail_clusters = int(tail * MB / bpc) if bpc > 0 else 0
         minimum = min_reserve_clusters(self._bytes_per_cluster)
         self._reserve_hint.setText(
             f"实际生效：卷首 {head_clusters:,} 簇 / 卷尾 {tail_clusters:,} 簇"
@@ -551,6 +691,7 @@ class TargetPanel(QWidget):
         self._tail_field.setEnabled(not busy)
 
     def has_window(self) -> bool:
+        """已提交的区间是否非空（主按钮启用判定用它）。"""
         start, end = self.window()
         return end - start > 0
 

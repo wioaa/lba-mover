@@ -433,3 +433,97 @@ class InfoDialog(QDialog):
         button.clicked.connect(self.accept)
         row.addWidget(button)
         layout.addLayout(row)
+
+
+class ChoiceDialog(QDialog):
+    """多选一确认框（与 ``DangerConfirmDialog`` / ``InfoDialog`` 同一视觉语言）。
+
+    用法::
+
+        dialog = ChoiceDialog(
+            "配置未应用",
+            "目标区间 / IO 配置有未应用的修改……",
+            choices=[("先应用再执行", "primary"), ("按现有计划执行", "danger"), ("取消", "secondary")],
+            kind="warn", parent=self,
+        )
+        if dialog.exec() and dialog.choice == "apply": ...
+
+    * 点任一按钮 → ``choice`` 记下对应代号并 ``accept()``；
+    * 按 Esc / 关闭 → ``reject()``（``choice`` 保持 ``None``）。
+    """
+
+    def __init__(
+        self,
+        title: str,
+        message: str,
+        choices: Sequence[Tuple[str, str]],
+        *,
+        kind: str = "warn",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setModal(True)
+        self.choice: Optional[str] = None
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        card = _ShadowCard(self)
+        outer.addWidget(card)
+
+        margin = _ShadowCard.MARGIN
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(margin + 24, margin + 22, margin + 24, margin + 20)
+        layout.setSpacing(14)
+
+        color_key = {"info": "accent", "warn": "warning", "error": "danger"}.get(kind, "warning")
+
+        class _Icon(QWidget):
+            def __init__(inner_self, name: str, key: str, owner: QWidget) -> None:  # noqa: N805
+                super().__init__(owner)
+                inner_self._name = name
+                inner_self._key = key
+                inner_self.setFixedSize(26, 26)
+
+            def paintEvent(inner_self, event) -> None:  # noqa: N805
+                painter = QPainter(inner_self)
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                icons.paint_icon(
+                    painter,
+                    inner_self._name,
+                    QRectF(0, 0, 26, 26),
+                    theme.color(inner_self._key),
+                )
+                painter.end()
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(12)
+        header_row.addWidget(_Icon("warning", color_key, card), 0,
+                             Qt.AlignmentFlag.AlignVCenter)
+        header_row.addWidget(cards.label(title, "h2", card), 1)
+        layout.addLayout(header_row)
+
+        body = cards.label(message, "dim", card, wrap=True)
+        body.setMinimumWidth(440)
+        layout.addWidget(body)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        for index, (text, role) in enumerate(choices):
+            button = QPushButton(text, card)
+            button.setProperty("role", role)
+            button.setMinimumWidth(118)
+            button.setMinimumHeight(36)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(  # type: ignore[arg-type]
+                lambda _checked=False, code=index: self._pick(code)
+            )
+            row.addWidget(button)
+        layout.addLayout(row)
+        self._codes = [code for code, _role in choices]
+
+    def _pick(self, index: int) -> None:
+        if 0 <= index < len(self._codes):
+            self.choice = self._codes[index]
+        self.accept()

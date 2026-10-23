@@ -76,10 +76,19 @@ SOURCE_TEXT = {
 
 
 class IoPanel(QWidget):
-    """执行引擎选择 + 介质徽章 + 各引擎的 IO 设置。"""
+    """执行引擎选择 + 介质徽章 + 各引擎的 IO 设置。
+
+    1.0.0D 起采用「暂存—应用」语义：控件修改先进入待定态（只发
+    :attr:`pendingChanged`），``profile()`` / ``engine()`` / ``stream_*()``
+    一律返回**已提交**值 —— 保证「当前计划基于应用前参数」。点
+    :meth:`commit_pending` 才把当前值落为已提交并发出
+    ``engineChanged`` / ``profileChanged``。
+    """
 
     profileChanged = Signal()
     engineChanged = Signal(str)
+    #: (是否待定, 变更项数)。变更项：引擎 / 缓冲 / 预热 / 流式缓存。
+    pendingChanged = Signal(bool, int)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -218,23 +227,103 @@ class IoPanel(QWidget):
         layout.addWidget(self._stream_box)
 
         self._refresh()
+        # 暂存基线：初始控件值即为「已提交」（不发 pending）
+        self._committed = self._snapshot()
+        self._stream_cache_dir.textChanged.connect(self._on_stream_dir_changed)
 
     # ------------------------------------------------------------------ #
-    # 接口
+    # 暂存层（1.0.0D）
+    # ------------------------------------------------------------------ #
+    def _snapshot(self) -> tuple:
+        """控件级快照：引擎 / 缓冲 / 预热 / 流式缓存配置。"""
+        return (
+            int(self._engine_switch.current_index),
+            int(self._buffer_switch.current_index),
+            int(self._custom_spin.value()),
+            bool(self._prewarm_switch.isChecked()),
+            int(self._stream_cache_switch.current_index),
+            self._stream_cache_dir.text().strip(),
+            int(self._stream_buffer_spin.value()),
+        )
+
+    def is_pending(self) -> bool:
+        """是否存在未应用的修改。"""
+        return self._snapshot() != self._committed
+
+    def pending_count(self) -> int:
+        """变更项数（引擎 / 缓冲 / 预热 / 流式缓存四组里发生变化的部分）。"""
+        current = self._snapshot()
+        count = 0
+        if current[0] != self._committed[0]:
+            count += 1
+        if current[1:4] != self._committed[1:4]:
+            count += 1
+        if current[4:7] != self._committed[4:7]:
+            count += 1
+        return count
+
+    def commit_pending(self) -> None:
+        """把当前控件值落为已提交，按差异一次性发出既有信号。"""
+        current = self._snapshot()
+        if current == self._committed:
+            self.pendingChanged.emit(False, 0)
+            return
+        old = self._committed
+        self._committed = current
+        if old[0] != current[0]:
+            self.engineChanged.emit(self.engine())
+        if old[1:4] != current[1:4]:
+            self.profileChanged.emit()
+        self.pendingChanged.emit(False, 0)
+
+    def discard_pending(self) -> None:
+        """把控件值恢复到已提交状态（不发 engine/profile 信号）。"""
+        if not self.is_pending():
+            return
+        (
+            engine_index,
+            buffer_index,
+            custom_value,
+            prewarm,
+            cache_index,
+            cache_dir,
+            buffer_blocks,
+        ) = self._committed
+        self._guard = True
+        self._engine_switch.set_current(engine_index, emit=False)
+        self._buffer_switch.set_current(buffer_index, emit=False)
+        self._custom_spin.setValue(custom_value)
+        self._prewarm_switch.set_checked_silent(prewarm)
+        self._stream_cache_switch.set_current(cache_index, emit=False)
+        self._stream_cache_dir.setText(cache_dir)
+        self._stream_buffer_spin.setValue(buffer_blocks)
+        self._guard = False
+        self._custom_row.setVisible(buffer_index == CUSTOM_INDEX)
+        self._stream_cache_dir.setEnabled(cache_index == 1)
+        self._apply_engine_visual(engine_index)
+        self._refresh()
+        self.pendingChanged.emit(False, 0)
+
+    # ------------------------------------------------------------------ #
+    # 接口（1.0.0D 起：一律返回**已提交**值）
     # ------------------------------------------------------------------ #
     def engine(self) -> str:
-        """当前执行引擎：``lba`` / ``stream``。"""
+        """已提交的执行引擎：``lba`` / ``stream``（待定的切换不算数）。"""
+        return ENGINE_STREAM if self._committed[0] == 1 else ENGINE_LBA
+
+    def pending_engine(self) -> str:
+        """控件当前指向的引擎（可能与已提交值不同）。"""
         return ENGINE_STREAM if self._engine_switch.current_index == 1 else ENGINE_LBA
 
     def stream_cache_mode(self) -> str:
-        """分块流式的缓存模式：``memory`` / ``disk``。"""
-        return "disk" if self._stream_cache_switch.current_index == 1 else "memory"
+        """已提交的分块流式缓存模式：``memory`` / ``disk``。"""
+        return "disk" if self._committed[4] == 1 else "memory"
 
     def stream_cache_dir(self) -> str:
-        return self._stream_cache_dir.text().strip()
+        return str(self._committed[5])
 
     def stream_buffer_blocks(self) -> int:
-        return int(self._stream_buffer_spin.value())
+        return int(self._committed[6])
 
 
     # ------------------------------------------------------------------ #
@@ -258,6 +347,16 @@ class IoPanel(QWidget):
         self._refresh()
 
     def buffer_mb(self) -> int:
+        """**已提交**的批次缓冲（MB）。"""
+        index = self._committed[1]
+        if index == CUSTOM_INDEX:
+            return int(self._committed[2])
+        if 0 <= index < len(BUFFER_PRESETS):
+            return int(BUFFER_PRESETS[index])
+        return 256
+
+    def _live_buffer_mb(self) -> int:
+        """控件当前的批次缓冲（预览用，可能与已提交值不同）。"""
         index = self._buffer_switch.current_index
         if index == CUSTOM_INDEX:
             return int(self._custom_spin.value())
@@ -266,10 +365,15 @@ class IoPanel(QWidget):
         return 256
 
     def prefer_prewarm(self) -> bool:
-        return bool(self._prewarm_switch.isChecked())
+        """**已提交**的预热开关。"""
+        return bool(self._committed[3])
 
     def profile(self) -> IoProfile:
-        """按当前 UI 状态构造 IO 策略（唯一可信来源）。"""
+        """按**已提交**配置构造 IO 策略（唯一可信来源）。
+
+        待定的控件修改不进来 —— 这样「当前计划基于应用前参数」这句话
+        在代码层面也成立。
+        """
         return IoProfile.build(
             self._probe.media,
             self.buffer_mb(),
@@ -293,17 +397,32 @@ class IoPanel(QWidget):
     # 内部
     # ------------------------------------------------------------------ #
     def _on_engine_changed(self, index: int) -> None:
-        """执行引擎切换：0 = LBA（簇级精确）/ 1 = 分块流式（用户态）。"""
+        """执行引擎切换：0 = LBA（簇级精确）/ 1 = 分块流式（用户态）。
+
+        1.0.0D：只更新**视觉预览**（盒子显隐 + 提示文案）并进入待定态；
+        ``engineChanged`` 等 :meth:`commit_pending` 才发。
+        """
+        self._apply_engine_visual(int(index))
+        self.pendingChanged.emit(True, self.pending_count())
+
+    def _apply_engine_visual(self, index: int) -> None:
         index = int(index)
         self._lba_box.setVisible(index == 0)
         self._stream_box.setVisible(index == 1)
-        self._engine_hint.setText(
-            _ENGINE_HINT.get(self.engine(), _ENGINE_HINT[ENGINE_LBA])
-        )
-        self.engineChanged.emit(self.engine())
+        engine = ENGINE_STREAM if index == 1 else ENGINE_LBA
+        self._engine_hint.setText(_ENGINE_HINT.get(engine, _ENGINE_HINT[ENGINE_LBA]))
 
     def _on_stream_cache_changed(self, index: int) -> None:
         self._stream_cache_dir.setEnabled(int(index) == 1)  # 1 = 硬盘缓存
+        self._emit_pending()
+
+    def _on_stream_dir_changed(self, _text: str) -> None:
+        self._emit_pending()
+
+    def _emit_pending(self) -> None:
+        if self._guard:
+            return
+        self.pendingChanged.emit(True, self.pending_count())
 
     def _refresh_stream_buffer_label(self, *_args) -> None:
         bpc = self._bytes_per_cluster or 4096
@@ -323,26 +442,33 @@ class IoPanel(QWidget):
     def _on_buffer_preset(self, index: int) -> None:
         self._custom_row.setVisible(index == CUSTOM_INDEX)
         self._refresh()
-        self.profileChanged.emit()
+        self._emit_pending()
 
     def _on_custom_value(self, _value: int) -> None:
         self._refresh()
-        self.profileChanged.emit()
+        self._emit_pending()
 
     def _on_prewarm_toggled(self, _checked: bool) -> None:
         self._refresh()
-        self.profileChanged.emit()
+        self._emit_pending()
 
     def _refresh(self) -> None:
         if self._guard:
             return
         self._guard = True
-        profile = self.profile()
+        # 预览用「控件当前值」：待定的修改也能看到实际生效值的变化
+        profile = IoProfile.build(
+            self._probe.media,
+            self._live_buffer_mb(),
+            self._bytes_per_cluster,
+            prefer_prewarm=bool(self._prewarm_switch.isChecked()),
+            window_clusters=self._window_clusters or None,
+        )
         media = profile.media
 
         # ---- 引擎提示 ----
         self._engine_hint.setText(
-            _ENGINE_HINT.get(self.engine(), _ENGINE_HINT[ENGINE_LBA])
+            _ENGINE_HINT.get(self.pending_engine(), _ENGINE_HINT[ENGINE_LBA])
         )
 
         # ---- 介质徽章（照实写）----
@@ -355,14 +481,14 @@ class IoPanel(QWidget):
         self._media_note.setText(note)
 
         # ---- 实际生效值（不美化）----
-        requested = self.buffer_mb()
+        requested = self._live_buffer_mb()
         self._effective_label.setText(
             f"请求 {requested} MB → {profile.cap_note}"
             f"（批次 {profile.batch_clusters:,} 簇 ≈ {human_bytes(profile.batch_bytes)}）"
         )
 
         # ---- 预读预热可用性 ----
-        allowed, reason = self._prewarm_availability(profile)
+        allowed, reason = self._prewarm_availability(profile, self._live_buffer_mb())
         self._prewarm_switch.setEnabled(allowed)
         if allowed:
             self._prewarm_hint.setText(
@@ -379,10 +505,11 @@ class IoPanel(QWidget):
         self._refresh_stream_buffer_label()
         self._guard = False
 
-    def _prewarm_availability(self, profile: IoProfile) -> tuple:
+    def _prewarm_availability(self, profile: IoProfile, buffer_mb: Optional[int] = None) -> tuple:
         """返回 ``(是否可用, 不可用原因)``。"""
         media = profile.media
-        buffer_mb = self.buffer_mb()
+        if buffer_mb is None:
+            buffer_mb = self.buffer_mb()
         if media == MEDIA_SSD:
             return False, (
                 "SSD 上额外的顺序读是纯成本、不减少任何寻道，已禁用预读预热。"
@@ -439,12 +566,21 @@ class PlanSummaryPanel(QWidget):
 
         self._note = cards.label("", "caption", self, True)
         layout.addWidget(self._note)
+        # 1.0.0D：配置待定态提示（「当前计划基于应用前的参数」）
+        self._pending_note = cards.label("", "warning", self, True)
+        self._pending_note.setVisible(False)
+        layout.addWidget(self._pending_note)
 
         self.clear()
 
     # ------------------------------------------------------------------ #
     def set_bytes_per_cluster(self, value: int) -> None:
         self._bytes_per_cluster = max(0, int(value))
+
+    def set_pending_note(self, text: str) -> None:
+        """配置待定期间的附加说明（空串隐藏）。"""
+        self._pending_note.setText(text)
+        self._pending_note.setVisible(bool(text))
 
     def clear(self) -> None:
         """回到未规划状态。"""

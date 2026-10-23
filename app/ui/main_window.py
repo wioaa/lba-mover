@@ -234,6 +234,7 @@ class MainWindow(QMainWindow):
         self._ownership = None                # OwnershipIndex
         self._index_payload = None
         self._feasibility: Optional[FeasibilityReport] = None
+        self._has_pending = False            # 1.0.0D：是否存在未应用的配置修改
 
         self._journal: Optional[MoveJournal] = None
         self._journal_path = ""
@@ -463,11 +464,37 @@ class MainWindow(QMainWindow):
 
         # --- 目标区间 + 可行性 + 挡路者 + 保留区 ---
         target_card = cards.Card(inner, padding=14, spacing=8)
+        # 1.0.0D：卡片头部的「应用配置 / 放弃」—— 两个面板共享同一暂存周期
+        pending_row = QWidget(target_card)
+        pending_layout = QHBoxLayout(pending_row)
+        pending_layout.setContentsMargins(0, 0, 0, 0)
+        pending_layout.setSpacing(6)
+        pending_layout.addWidget(
+            cards.label("待定修改", "dim", pending_row), 0, Qt.AlignmentFlag.AlignVCenter
+        )
+        pending_layout.addStretch(1)
+        self._discard_button = QPushButton("放弃", pending_row)
+        self._discard_button.setProperty("role", "ghost")
+        self._discard_button.setFixedHeight(26)
+        self._discard_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._discard_button.clicked.connect(self._discard_pending)
+        pending_layout.addWidget(self._discard_button)
+        self._apply_button = QPushButton("应用配置", pending_row)
+        self._apply_button.setProperty("role", "primary")
+        self._apply_button.setFixedHeight(26)
+        self._apply_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._apply_button.clicked.connect(self._apply_pending)
+        pending_layout.addWidget(self._apply_button)
+        pending_row.setVisible(False)
+        self._pending_row = pending_row
+        target_card.body().addWidget(pending_row)
+
         self._target_panel = TargetPanel(target_card)
         self._target_panel.windowChanged.connect(self._on_target_changed)
         self._target_panel.strategyChanged.connect(self._on_target_changed)
         self._target_panel.excludeChanged.connect(self._on_exclude_changed)
         self._target_panel.reserveChanged.connect(self._on_reserve_changed)
+        self._target_panel.pendingChanged.connect(self._on_pending_changed)
         target_card.body().addWidget(self._target_panel)
         column.addWidget(target_card, 0)
 
@@ -476,6 +503,7 @@ class MainWindow(QMainWindow):
         self._io_panel = IoPanel(io_card)
         self._io_panel.profileChanged.connect(self._on_profile_changed)
         self._io_panel.engineChanged.connect(lambda _engine: self._sync_buttons())
+        self._io_panel.pendingChanged.connect(self._on_pending_changed)
         io_card.body().addWidget(self._io_panel)
         column.addWidget(io_card, 0)
         self._stream_worker = None
@@ -488,6 +516,11 @@ class MainWindow(QMainWindow):
         column.addWidget(result_card, 0)
 
         # --- 模式与操作 ---
+        # 1.0.0D：常驻待定徽章（在模式卡上方，滚动也看得见）
+        self._pending_badge = cards.Badge("● 配置未应用", "warning", inner)
+        self._pending_badge.setVisible(False)
+        column.addWidget(self._pending_badge, 0)
+
         action = cards.Card(inner, padding=14, spacing=8)
         action.body().addWidget(
             cards.SectionHeader("模式与操作", "shield", "", action)
@@ -681,6 +714,8 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+R"), self, activated=self._start_scan)
         QShortcut(QKeySequence("Ctrl+E"), self, activated=self._on_primary_action)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._log.toggle_collapsed)
+        # 1.0.0D：Ctrl+Enter = 应用待定配置（干净时无效）
+        QShortcut(QKeySequence("Ctrl+Return"), self, activated=self._apply_pending)
 
     def keyPressEvent(self, event) -> None:  # noqa: D102
         if event.key() == Qt.Key.Key_Escape:
@@ -1246,10 +1281,10 @@ class MainWindow(QMainWindow):
         self._io_panel.set_window_clusters(max(0, end - start))
 
     def _on_window_selected(self, start: int, end: int) -> None:
-        """布局图拖选 → 目标区间面板（双向同步的一半）。"""
+        """布局图拖选 → 目标区间面板（直通路径：立即提交生效，不走暂存）。"""
         if self._busy:
             return
-        self._target_panel.set_window(start, end)
+        self._target_panel.set_window_committed(start, end)
         self._refresh_target_visual()
         self._on_target_changed()
 
@@ -1287,6 +1322,41 @@ class MainWindow(QMainWindow):
         self._plan_stale = True
         self._log.info(f"IO 策略：{self._io_panel.profile().summary}")
         self._sync_buttons()
+
+    # ================================================================== #
+    # 配置暂存（1.0.0D）：应用 / 放弃
+    # ================================================================== #
+    def _on_pending_changed(self, dirty: bool, count: int) -> None:
+        """两个面板共享同一暂存周期：任一 dirty 就整体进入待定态。"""
+        has_pending = bool(dirty) or self._target_panel.is_pending() or self._io_panel.is_pending()
+        self._has_pending = has_pending
+        self._pending_row.setVisible(has_pending)
+        self._pending_badge.setVisible(has_pending)
+        if has_pending:
+            total = self._target_panel.pending_count() + self._io_panel.pending_count()
+            self._apply_button.setText(f"应用配置（{max(1, total)} 项变更）")
+            self._summary.set_pending_note("配置已修改，当前计划基于应用前的参数")
+        else:
+            self._apply_button.setText("应用配置")
+            self._summary.set_pending_note("")
+        self._sync_buttons()
+
+    def _apply_pending(self) -> None:
+        """提交两个面板的待定修改（一次性发出各自的既有语义信号）。"""
+        if not self._has_pending:
+            return
+        self._log.info("应用待定配置：目标区间 / IO 设置已提交生效")
+        self._target_panel.commit_pending()
+        self._io_panel.commit_pending()
+        # pendingChanged(False, 0) 已在面板内发出 → _on_pending_changed 收尾
+
+    def _discard_pending(self) -> None:
+        """把控件恢复到已提交状态（不发语义信号，计划保持有效）。"""
+        if not self._has_pending:
+            return
+        self._log.info("放弃待定配置：控件已恢复为应用前的值")
+        self._target_panel.discard_pending()
+        self._io_panel.discard_pending()
 
     def _schedule_feasibility(self) -> None:
         self._feasibility_timer.start()
@@ -1401,6 +1471,9 @@ class MainWindow(QMainWindow):
         self._scan_panel.set_busy(busy)
         self._target_panel.set_busy(busy)
         self._io_panel.set_busy(busy)
+        # 1.0.0D：应用 / 放弃按钮随忙碌状态一并管理
+        self._apply_button.setEnabled(not busy and self._has_pending)
+        self._discard_button.setEnabled(not busy and self._has_pending)
         self._sync_buttons()
 
     def _sync_buttons(self) -> None:
@@ -1457,7 +1530,7 @@ class MainWindow(QMainWindow):
         会白白烧 CPU；勾选框变化 / 悬停重算都会走到 ``_sync_buttons``，
         这里记忆上次状态，三者全等时直接跳过。
         """
-        state = (desired[0], desired[1], enabled)
+        state = (desired[0], desired[1], enabled, self._has_pending)
         if state == self._button_state:
             return
         self._button_state = state
@@ -1600,6 +1673,35 @@ class MainWindow(QMainWindow):
         plan = self._plan
         if info is None or snapshot is None or plan is None:
             return
+        # ---- 1.0.0D：存在未应用配置时，先让用户明确选择 ----
+        # 「先应用再执行」= 提交配置 → 计划失效 → 重新生成（不许把不一致的
+        # 参数静默带进写盘流程）；「按现有计划执行」= 明确认知后继续。
+        if self._has_pending:
+            dialog = dialogs.ChoiceDialog(
+                "配置未应用",
+                "目标区间 / IO 配置有未应用的修改。当前计划基于修改前的参数。",
+                choices=[
+                    ("先应用再执行", "primary"),
+                    ("按现有计划执行", "danger"),
+                    ("取消", "secondary"),
+                ],
+                kind="warn",
+                parent=self,
+            )
+            if not dialog.exec():
+                return
+            if dialog.choice == "apply":
+                self._apply_pending()
+                # commit 会发出 windowChanged / profileChanged → 计划失效
+                self._set_notice(
+                    "配置已应用：当前计划已失效，请重新生成迁移计划后再执行。",
+                    "warning",
+                )
+                self._log.warn("执行前应用了待定配置，计划已失效，需重新生成")
+                return
+            if dialog.choice != "proceed":
+                return
+            self._log.warn("用户选择「按现有计划执行」：忽略未应用的配置修改")
         if not self._is_admin or not self._privilege_ok:
             self._set_notice(
                 "缺少管理员权限或 SE_MANAGE_VOLUME_NAME 特权，无法执行真实迁移。",
