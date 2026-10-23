@@ -33,16 +33,12 @@ from PySide6.QtGui import (
     QShortcut,
 )
 from PySide6.QtWidgets import (
-    QFileDialog,
     QHBoxLayout,
-    QLineEdit,
     QMainWindow,
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSpinBox,
     QSplitter,
-    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -79,7 +75,7 @@ from app.core.scanner import (
 from app.ui import cards, dialogs, theme
 from app.ui.disk_map import DiskMapWidget
 from app.ui.file_table import FileTableView
-from app.ui.io_panel import IoPanel, PlanSummaryPanel
+from app.ui.io_panel import ENGINE_STREAM, IoPanel, PlanSummaryPanel
 from app.ui.log_panel import LogPanel
 from app.ui.result_panel import RecoveryPanel
 from app.ui.scan_panel import CHANNEL_HANDLE, CHANNEL_MFT, ScanControlPanel
@@ -280,7 +276,6 @@ class MainWindow(QMainWindow):
         self._title_bar.maximizeRequested.connect(self._toggle_maximize)
         self._title_bar.closeRequested.connect(self.close)
         self._title_bar.themeToggleRequested.connect(self._toggle_theme)
-        self._title_bar.workModeChanged.connect(self._on_work_mode_changed)
         outer.addWidget(self._title_bar)
 
         content = QWidget(self._root)
@@ -295,7 +290,7 @@ class MainWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(12)
         splitter.addWidget(self._build_left_column(splitter))
-        splitter.addWidget(self._build_sidebar(splitter))
+        splitter.addWidget(self._build_right_panel(splitter))
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
         splitter.setSizes([900, 430])
@@ -471,8 +466,10 @@ class MainWindow(QMainWindow):
         io_card = cards.Card(inner, padding=14, spacing=8)
         self._io_panel = IoPanel(io_card)
         self._io_panel.profileChanged.connect(self._on_profile_changed)
+        self._io_panel.engineChanged.connect(lambda _engine: self._sync_buttons())
         io_card.body().addWidget(self._io_panel)
         column.addWidget(io_card, 0)
+        self._stream_worker = None
 
         # --- 执行与恢复 ---
         result_card = cards.Card(inner, padding=14, spacing=8)
@@ -520,196 +517,23 @@ class MainWindow(QMainWindow):
         scroll.setWidget(inner)
         return wrapper
 
-    # ---------------- 右栏：两种工作模式（LBA 迁移 / 分块流式）---------------- #
-    def _build_sidebar(self, parent: QWidget) -> QWidget:
-        """右栏 = 栈：page0 = LBA 迁移（既有面板），page1 = 分块流式。主 UI 不变。"""
-        stack = QStackedWidget(parent)
-        stack.setMinimumWidth(392)
-        stack.setMaximumWidth(468)
-        stack.addWidget(self._build_right_panel(stack))   # page 0
-        stack.addWidget(self._build_stream_panel(stack))   # page 1
-        self._sidebar_stack = stack
-        return stack
-
-    def _browse_dir(self, target: QLineEdit) -> None:
-        path = QFileDialog.getExistingDirectory(self, "选择目录", target.text() or "")
-        if path:
-            target.setText(path)
-
-    def _build_stream_panel(self, parent: QWidget) -> QWidget:
-        """分块流式搬迁侧栏（用户态 Read/Write 分块拷贝，file_io.copy_stream）。"""
-        wrapper = QWidget(parent)
-        holder = QVBoxLayout(wrapper)
-        holder.setContentsMargins(0, 0, 0, 0)
-        holder.setSpacing(0)
-
-        scroll = QScrollArea(wrapper)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.viewport().setAutoFillBackground(False)
-        holder.addWidget(scroll)
-
-        inner = QWidget(scroll)
-        inner.setAutoFillBackground(False)
-        column = QVBoxLayout(inner)
-        column.setContentsMargins(0, 0, 0, 0)
-        column.setSpacing(12)
-
-        head = cards.Card(inner, padding=14, spacing=8)
-        head.body().addWidget(cards.SectionHeader("分块流式搬迁", "drive", "", head))
-        column.addWidget(head, 0)
-
-        column.addWidget(cards.label(
-            "同卷内「前端 → 卷尾」搬迁的用户态实现：先按总大小**预填充一段（尽量连续）的簇**，"
-            "再**流式读出**前端文件、**在内存缓存**（65536 簇/块、缓冲按块倍数可调），"
-            "最后对这段**流式覆盖**——一个分块读完立马顶上下一块，缓解 HDD 半双工、整体直搬更快。"
-            "落点 LBA 由文件系统在空闲区分配（预分配保证连续、不保证精确 LCN）。"
-            "校验完整后才把源移入回收站（可恢复）。不走 FSCTL、不需管理卷特权，**无外部目的地**。",
-            "caption", inner, True,
-        ), 0)
-
-        # ---- 搬迁范围 + 目标（自洽情境：选了什么、搬到哪）----
-        scope_card = cards.Card(inner, padding=14, spacing=8)
-        scope_card.body().addWidget(
-            cards.SectionHeader("搬迁范围与目标", "folder", "", scope_card)
-        )
-        self._stream_scope = cards.label("未选择文件", "body", scope_card, False)
-        scope_card.body().addWidget(self._stream_scope)
-        self._stream_target = cards.label(
-            "流式处理默认只填充末端（卷尾保留区）", "body", scope_card, False
-        )
-        scope_card.body().addWidget(self._stream_target)
-        scope_card.body().addWidget(cards.label(
-            "先在卷尾预留一段连续簇，再把选中文件流式写入；落点由文件系统在空闲区分配。",
-            "caption", scope_card, True,
-        ))
-        column.addWidget(scope_card, 0)
-
-        # ---- 缓存 ----
-        cache_card = cards.Card(inner, padding=14, spacing=8)
-        cache_card.body().addWidget(cards.SectionHeader("缓存", "layers", "", cache_card))
-        self._stream_cache_switch = cards.SegmentedControl(
-            ["内存缓存", "硬盘缓存"], 0, cache_card
-        )
-        self._stream_cache_switch.changed.connect(self._on_stream_cache_changed)
-        cache_card.body().addWidget(self._stream_cache_switch)
-        cache_dir_row = QHBoxLayout()
-        cache_dir_row.setSpacing(8)
-        self._stream_cache_dir = QLineEdit(cache_card)
-        self._stream_cache_dir.setPlaceholderText("硬盘缓存的暂存目录（内存缓存可留空）")
-        self._stream_cache_dir.setEnabled(False)
-        cache_dir_row.addWidget(self._stream_cache_dir, 1)
-        cache_browse = QPushButton("浏览…", cache_card)
-        cache_browse.setProperty("role", "ghost")
-        cache_browse.setCursor(Qt.CursorShape.PointingHandCursor)
-        cache_browse.clicked.connect(lambda: self._browse_dir(self._stream_cache_dir))
-        cache_dir_row.addWidget(cache_browse, 0)
-        cache_card.body().addLayout(cache_dir_row)
-        buf_row = QHBoxLayout()
-        buf_row.setSpacing(8)
-        buf_row.addWidget(cards.label("缓冲（block 倍数）", "dim", cache_card), 0)
-        self._stream_buffer_spin = QSpinBox(cache_card)
-        self._stream_buffer_spin.setRange(1, 64)
-        self._stream_buffer_spin.setValue(2)
-        self._stream_buffer_spin.valueChanged.connect(self._refresh_stream_buffer_label)
-        buf_row.addWidget(self._stream_buffer_spin, 0)
-        buf_row.addStretch(1)
-        cache_card.body().addLayout(buf_row)
-        self._stream_buffer_label = cards.label("", "caption", cache_card, True)
-        cache_card.body().addWidget(self._stream_buffer_label)
-        column.addWidget(cache_card, 0)
-
-        # ---- 执行 ----
-        run_card = cards.Card(inner, padding=14, spacing=8)
-        self._stream_start = QPushButton("开始分块流式搬迁", run_card)
-        self._stream_start.setProperty("role", "danger")
-        self._stream_start.setMinimumHeight(44)
-        self._stream_start.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._stream_start.clicked.connect(self._start_stream_move)
-        run_card.body().addWidget(self._stream_start)
-        self._stream_notice = cards.label("", "warning", run_card, True)
-        self._stream_notice.setVisible(False)
-        run_card.body().addWidget(self._stream_notice)
-        column.addWidget(run_card, 0)
-
-        column.addStretch(1)
-        scroll.setWidget(inner)
-        self._stream_worker = None
-        self._refresh_stream_buffer_label()
-        self._refresh_stream_scope()
-        return wrapper
-
-    # ---- 分块流式：辅助 / 执行 ----
-    def _on_work_mode_changed(self, index: int) -> None:
-        self._sidebar_stack.setCurrentIndex(int(index))
-        if int(index) == 1:
-            self._refresh_stream_buffer_label()
-            self._refresh_stream_scope()
-        self._log.info("工作模式切换：" + ("分块流式搬迁" if int(index) == 1 else "LBA 迁移"))
-
-    def _on_stream_cache_changed(self, index: int) -> None:
-        self._stream_cache_dir.setEnabled(int(index) == 1)  # 1 = 硬盘缓存
-
-    def _refresh_stream_buffer_label(self, *_args) -> None:
-        info = self._volume
-        bpc = (info.bytes_per_cluster if info else 4096) or 4096
-        blocks = int(self._stream_buffer_spin.value())
-        clusters = blocks * 65536
-        self._stream_buffer_label.setText(
-            f"1 块 = 65536 簇 ≈ {human_bytes(65536 * bpc)}；"
-            f"缓冲 = {blocks}× 块 ≈ {human_bytes(clusters * bpc)}"
-        )
-
-    def _refresh_stream_scope(self) -> None:
-        """刷新分块流式侧栏的「搬迁范围」：选中文件数 / 大小 / 簇（自洽情境）。"""
-        if not hasattr(self, "_stream_scope"):
-            return
-        selected = self._table.file_model.checked_entries()
-        if not selected:
-            self._stream_scope.setText("未选择文件（请在左侧大文件列表勾选）")
-        else:
-            total_bytes = sum(e.size for e in selected)
-            total_clusters = sum(e.allocated_clusters for e in selected)
-            self._stream_scope.setText(
-                f"选中 {len(selected)} 个文件 · {human_bytes(total_bytes)} · {total_clusters:,} 簇"
-            )
-        # 目标：卷尾保留区（流式处理默认只填充末端）
-        if hasattr(self, "_stream_target"):
-            info = self._volume
-            total = int(info.total_clusters) if info else 0
-            reserve = 0
-            if hasattr(self, "_target_panel"):
-                try:
-                    reserve = int(self._target_panel.reserve_tail_clusters())
-                except Exception:  # noqa: BLE001
-                    reserve = 0
-            if total > 0 and reserve > 0:
-                floor = max(0, total - reserve)
-                self._stream_target.setText(
-                    f"流式处理默认只填充末端 · 卷尾保留区 LCN [{floor:,}, {total:,})"
-                )
-            else:
-                self._stream_target.setText("流式处理默认只填充末端（卷尾保留区）")
-
+    # ---------------- 右栏：LBA 迁移（分块流式已并入 IoPanel 执行引擎）---------------- #
     def _start_stream_move(self) -> None:
+        """分块流式引擎：同卷「前端 → 卷尾」，免规划，按 IoPanel 配置执行。"""
         entries = self._table.file_model.checked_entries()
         if not entries:
-            self._stream_notice.setText("请先勾选要搬迁的文件")
-            self._stream_notice.setVisible(True)
+            self._set_notice("请先勾选要搬迁的文件", "warning")
             return
-        mode = "disk" if self._stream_cache_switch.current_index == 1 else "memory"
-        cache_dir = self._stream_cache_dir.text().strip() or None
+        mode = self._io_panel.stream_cache_mode()
+        cache_dir = self._io_panel.stream_cache_dir() or None
         if mode == "disk" and not cache_dir:
-            self._stream_notice.setText("硬盘缓存需设定暂存目录")
-            self._stream_notice.setVisible(True)
+            self._set_notice("硬盘缓存需设定暂存目录", "warning")
             return
 
         info = self._volume
         bpc = (info.bytes_per_cluster if info else 4096) or 4096
         dialog = dialogs.DangerConfirmDialog(
-            volume_name="分块流式搬迁（前端 → 卷尾，同卷内）",
+            volume_name="分块流式迁移（前端 → 卷尾，同卷内）",
             files=list(entries),
             total_clusters=sum(e.allocated_clusters for e in entries),
             bytes_per_cluster=bpc,
@@ -718,12 +542,12 @@ class MainWindow(QMainWindow):
         if not dialog.exec():
             return
 
-        self._stream_notice.setVisible(False)
+        self._set_notice("", "warning")
         worker = BlockStreamWorker(
             entries,
             mode=mode,
             cache_dir=cache_dir,
-            buffer_blocks=int(self._stream_buffer_spin.value()),
+            buffer_blocks=self._io_panel.stream_buffer_blocks(),
             bytes_per_cluster=bpc,
             parent=self,
         )
@@ -734,10 +558,10 @@ class MainWindow(QMainWindow):
         self._stream_worker = worker
         self._set_busy(True)
         self._progress.set_indeterminate(True)
-        self._progress.set_state(0, 1, "分块流式搬迁中", "")
+        self._progress.set_state(0, 1, "分块流式迁移中", "")
         self._log.info(
-            f"开始分块流式搬迁：{len(entries)} 个文件（前端 → 卷尾，同卷内；"
-            f"{mode} 缓存，缓冲 {self._stream_buffer_spin.value()}× 块）"
+            f"开始分块流式迁移：{len(entries)} 个文件（前端 → 卷尾，同卷内；"
+            f"{mode} 缓存，缓冲 {self._io_panel.stream_buffer_blocks()}× 块）"
         )
         worker.start()
 
@@ -753,28 +577,28 @@ class MainWindow(QMainWindow):
     def _on_stream_completed(self, summary: object) -> None:
         self._set_busy(False)
         self._progress.set_indeterminate(False)
-        self._progress.reset("分块流式搬迁完成")
+        self._progress.reset("分块流式迁移完成")
         self._stream_worker = None
         data = summary if isinstance(summary, dict) else {}
         moved, failed = data.get("moved", 0), data.get("failed", 0)
         self._log.success(
-            f"分块流式搬迁完成：搬走 {moved} 个（{data.get('clusters', 0):,} 簇）/ "
+            f"分块流式迁移完成：搬走 {moved} 个（{data.get('clusters', 0):,} 簇）/ "
             f"失败 {failed} 个（源已移回收站，可恢复）"
         )
-        self._stream_notice.setText(
-            f"完成：搬走 {moved} 个，失败 {failed} 个（源已移回收站，可恢复）"
+        self._set_notice(
+            f"分块流式迁移完成：搬走 {moved} 个，失败 {failed} 个"
+            f"（源已移回收站，可恢复）",
+            "warning",
         )
-        self._stream_notice.setVisible(True)
         self._sync_buttons()
 
     def _on_stream_failed(self, message: str) -> None:
         self._set_busy(False)
         self._progress.set_indeterminate(False)
-        self._progress.reset("分块流式搬迁失败")
+        self._progress.reset("分块流式迁移失败")
         self._stream_worker = None
         self._log.error(message)
-        self._stream_notice.setText(message)
-        self._stream_notice.setVisible(True)
+        self._set_notice(message, "danger")
         self._sync_buttons()
 
     # ---------------- 底部 ---------------- #
@@ -1205,7 +1029,6 @@ class MainWindow(QMainWindow):
             )
             self._table.file_model.set_checked_rows(True)
             self._annotate_front_half(items)
-            self._refresh_stream_scope()
 
         if self._scan_panel.channel() == CHANNEL_HANDLE:
             # 句柄通道没有 MFT 健康度，统计条只报能报的
@@ -1336,7 +1159,6 @@ class MainWindow(QMainWindow):
         )
         self._plan_stale = True
         self._update_summary()
-        self._refresh_stream_scope()
         self._refresh_disk_preview()
         self._schedule_feasibility()
         self._sync_buttons()
@@ -1561,6 +1383,15 @@ class MainWindow(QMainWindow):
         self._select_all_button.setEnabled(not self._busy and has_volume)
         self._invert_button.setEnabled(not self._busy and has_volume)
 
+        if self._io_panel.engine() == ENGINE_STREAM:
+            # 分块流式引擎：免规划，选中文件即可执行（用户态，不要求卷特权）
+            self._action_button.setText("开始分块流式迁移")
+            cards.set_role(self._action_button, "danger")
+            self._action_button.setEnabled(
+                selected > 0 and self._snapshot is not None and not self._busy
+            )
+            return
+
         if self._mode == MODE_PREVIEW:
             self._action_button.setText("生成迁移计划")
             cards.set_role(self._action_button, "primary")
@@ -1592,6 +1423,10 @@ class MainWindow(QMainWindow):
     # ================================================================== #
     def _on_primary_action(self) -> None:
         if self._busy:
+            return
+        if self._io_panel.engine() == ENGINE_STREAM:
+            # 分块流式引擎：不走规划流程，直接按选中文件执行
+            self._start_stream_move()
             return
         if self._mode == MODE_EXECUTE and self._plan is not None and not self._plan_stale:
             self._start_move()

@@ -15,7 +15,10 @@ from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QFileDialog,
     QHBoxLayout,
+    QLineEdit,
+    QPushButton,
     QSizePolicy,
     QSpinBox,
     QVBoxLayout,
@@ -37,6 +40,24 @@ from app.win32.storage import MediaProbe
 BUFFER_PRESETS = (64, 256, 1024)
 CUSTOM_INDEX = 3
 
+#: 执行引擎
+ENGINE_LBA = "lba"          # FSCTL_MOVE_FILE，簇级精确
+ENGINE_STREAM = "stream"    # 用户态分块流式（落点由文件系统在空闲区分配）
+
+ENGINE_TEXT = {
+    ENGINE_LBA: "LBA 引擎",
+    ENGINE_STREAM: "分块流式引擎",
+}
+
+#: 各引擎的一句话说明（``_refresh`` 统一渲染，避免两处维护）
+_ENGINE_HINT = {
+    ENGINE_LBA: "FSCTL_MOVE_FILE 簇级精确迁移：需要管理员与卷管理特权，落点簇精确可控。",
+    ENGINE_STREAM: (
+        "用户态分块流式：同卷「前端 → 卷尾」，流式处理默认只填充末端（卷尾保留区），"
+        "无外部目的地；不走 FSCTL、不需卷特权。"
+    ),
+}
+
 MEDIA_TEXT = {
     MEDIA_HDD: "HDD（旋转介质）",
     MEDIA_SSD: "SSD",
@@ -55,9 +76,10 @@ SOURCE_TEXT = {
 
 
 class IoPanel(QWidget):
-    """介质徽章 + 缓冲预设 + 预读预热开关 + 诚实边界说明。"""
+    """执行引擎选择 + 介质徽章 + 各引擎的 IO 设置。"""
 
     profileChanged = Signal()
+    engineChanged = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -70,31 +92,50 @@ class IoPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
 
-        # ---------------- 介质 ---------------- #
+        # ---------------- 执行引擎 ---------------- #
         head = QHBoxLayout()
         head.setContentsMargins(0, 0, 0, 0)
         head.setSpacing(8)
         head.addWidget(cards.IconLabel("drive", 16, "accent"), 0,
                        Qt.AlignmentFlag.AlignVCenter)
-        head.addWidget(cards.label("IO 加速", "h2"), 0, Qt.AlignmentFlag.AlignVCenter)
+        head.addWidget(cards.label("执行引擎与 IO", "h2"), 0, Qt.AlignmentFlag.AlignVCenter)
         self._media_badge = cards.Badge(MEDIA_TEXT[MEDIA_UNKNOWN], "warning", self)
         head.addWidget(self._media_badge, 0, Qt.AlignmentFlag.AlignVCenter)
         head.addStretch(1)
         layout.addLayout(head)
 
+        engine_row = QHBoxLayout()
+        engine_row.setContentsMargins(0, 0, 0, 0)
+        engine_row.setSpacing(8)
+        self._engine_switch = cards.SegmentedControl(
+            ["LBA 簇级迁移（精确）", "分块流式迁移（用户态）"], 0, self
+        )
+        self._engine_switch.changed.connect(self._on_engine_changed)
+        engine_row.addWidget(self._engine_switch, 1)
+        layout.addLayout(engine_row)
+
+        self._engine_hint = cards.label("", "caption", self, True)
+        layout.addWidget(self._engine_hint)
+
+        # ---------------- 介质 ---------------- #
         self._media_note = cards.label("", "caption", self, True)
         layout.addWidget(self._media_note)
 
-        # ---------------- 缓冲 ---------------- #
-        layout.addWidget(cards.Divider())
-        layout.addWidget(cards.label("批次缓冲", "dim", self))
+        # ---------------- LBA 引擎设置 ---------------- #
+        self._lba_box = QWidget(self)
+        lba = QVBoxLayout(self._lba_box)
+        lba.setContentsMargins(0, 0, 0, 0)
+        lba.setSpacing(8)
+
+        lba.addWidget(cards.Divider())
+        lba.addWidget(cards.label("批次缓冲", "dim", self._lba_box))
         self._buffer_switch = cards.SegmentedControl(
-            [f"{value} MB" for value in BUFFER_PRESETS] + ["自定义"], 1, self
+            [f"{value} MB" for value in BUFFER_PRESETS] + ["自定义"], 1, self._lba_box
         )
         self._buffer_switch.changed.connect(self._on_buffer_preset)
-        layout.addWidget(self._buffer_switch)
+        lba.addWidget(self._buffer_switch)
 
-        self._custom_row = QWidget(self)
+        self._custom_row = QWidget(self._lba_box)
         custom_layout = QHBoxLayout(self._custom_row)
         custom_layout.setContentsMargins(0, 0, 0, 0)
         custom_layout.setSpacing(8)
@@ -109,26 +150,92 @@ class IoPanel(QWidget):
         custom_layout.addWidget(self._custom_spin, 0)
         custom_layout.addStretch(1)
         self._custom_row.setVisible(False)
-        layout.addWidget(self._custom_row)
+        lba.addWidget(self._custom_row)
 
-        self._effective_label = cards.label("", "caption", self, True)
-        layout.addWidget(self._effective_label)
+        self._effective_label = cards.label("", "caption", self._lba_box, True)
+        lba.addWidget(self._effective_label)
 
-        # ---------------- 预读预热 ---------------- #
-        self._prewarm_switch = widgets.ToggleSwitch("预读预热", self)
+        self._prewarm_switch = widgets.ToggleSwitch("预读预热", self._lba_box)
         self._prewarm_switch.set_checked_silent(True)
         self._prewarm_switch.toggled.connect(self._on_prewarm_toggled)
-        layout.addWidget(self._prewarm_switch, 0, Qt.AlignmentFlag.AlignLeft)
-        self._prewarm_hint = cards.label("", "caption", self, True)
-        layout.addWidget(self._prewarm_hint)
+        lba.addWidget(self._prewarm_switch, 0, Qt.AlignmentFlag.AlignLeft)
+        self._prewarm_hint = cards.label("", "caption", self._lba_box, True)
+        lba.addWidget(self._prewarm_hint)
 
-        self._honest_note = cards.label("", "caption", self, True)
+        self._honest_note = cards.label("", "caption", self._lba_box, True)
         self._honest_note.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum
         )
-        layout.addWidget(self._honest_note)
+        lba.addWidget(self._honest_note)
+        layout.addWidget(self._lba_box)
+
+        # ---------------- 分块流式引擎设置 ---------------- #
+        self._stream_box = QWidget(self)
+        stream = QVBoxLayout(self._stream_box)
+        stream.setContentsMargins(0, 0, 0, 0)
+        stream.setSpacing(8)
+
+        stream.addWidget(cards.label("缓存", "dim", self._stream_box))
+        self._stream_cache_switch = cards.SegmentedControl(
+            ["内存缓存", "硬盘缓存（暂存盘）"], 0, self._stream_box
+        )
+        self._stream_cache_switch.changed.connect(self._on_stream_cache_changed)
+        stream.addWidget(self._stream_cache_switch)
+
+        scratch_row = QHBoxLayout()
+        scratch_row.setSpacing(8)
+        self._stream_cache_dir = QLineEdit(self._stream_box)
+        self._stream_cache_dir.setPlaceholderText("硬盘缓存的暂存目录（内存缓存可留空）")
+        self._stream_cache_dir.setEnabled(False)
+        scratch_row.addWidget(self._stream_cache_dir, 1)
+        scratch_browse = QPushButton("浏览…", self._stream_box)
+        scratch_browse.setProperty("role", "ghost")
+        scratch_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        scratch_browse.clicked.connect(self._browse_stream_cache_dir)
+        scratch_row.addWidget(scratch_browse, 0)
+        stream.addLayout(scratch_row)
+
+        buf_row = QHBoxLayout()
+        buf_row.setSpacing(8)
+        buf_row.addWidget(cards.label("缓冲（block 倍数）", "dim", self._stream_box), 0)
+        self._stream_buffer_spin = QSpinBox(self._stream_box)
+        self._stream_buffer_spin.setRange(1, 64)
+        self._stream_buffer_spin.setValue(2)
+        self._stream_buffer_spin.valueChanged.connect(self._refresh_stream_buffer_label)
+        buf_row.addWidget(self._stream_buffer_spin, 0)
+        buf_row.addStretch(1)
+        stream.addLayout(buf_row)
+        self._stream_buffer_label = cards.label("", "caption", self._stream_box, True)
+        stream.addWidget(self._stream_buffer_label)
+
+        stream.addWidget(cards.label(
+            "同卷内「前端 → 卷尾」：先预填充一段连续簇，再流式读出 + 内存缓存 + 流式覆盖；"
+            "校验完整后源移回收站（可恢复）、改回原路径。落点由文件系统在空闲区分配"
+            "（保证连续、不保证精确 LCN）。无外部目的地。",
+            "caption", self._stream_box, True,
+        ))
+        self._stream_box.setVisible(False)
+        layout.addWidget(self._stream_box)
 
         self._refresh()
+
+    # ------------------------------------------------------------------ #
+    # 接口
+    # ------------------------------------------------------------------ #
+    def engine(self) -> str:
+        """当前执行引擎：``lba`` / ``stream``。"""
+        return ENGINE_STREAM if self._engine_switch.current_index == 1 else ENGINE_LBA
+
+    def stream_cache_mode(self) -> str:
+        """分块流式的缓存模式：``memory`` / ``disk``。"""
+        return "disk" if self._stream_cache_switch.current_index == 1 else "memory"
+
+    def stream_cache_dir(self) -> str:
+        return self._stream_cache_dir.text().strip()
+
+    def stream_buffer_blocks(self) -> int:
+        return int(self._stream_buffer_spin.value())
+
 
     # ------------------------------------------------------------------ #
     # 接口
@@ -172,13 +279,47 @@ class IoPanel(QWidget):
         )
 
     def set_busy(self, busy: bool) -> None:
+        self._engine_switch.setEnabled(not busy)
         self._buffer_switch.setEnabled(not busy)
         self._custom_spin.setEnabled(not busy)
         self._prewarm_switch.setEnabled(not busy)
+        self._stream_cache_switch.setEnabled(not busy)
+        self._stream_cache_dir.setEnabled(
+            not busy and self._stream_cache_switch.current_index == 1
+        )
+        self._stream_buffer_spin.setEnabled(not busy)
 
     # ------------------------------------------------------------------ #
     # 内部
     # ------------------------------------------------------------------ #
+    def _on_engine_changed(self, index: int) -> None:
+        """执行引擎切换：0 = LBA（簇级精确）/ 1 = 分块流式（用户态）。"""
+        index = int(index)
+        self._lba_box.setVisible(index == 0)
+        self._stream_box.setVisible(index == 1)
+        self._engine_hint.setText(
+            _ENGINE_HINT.get(self.engine(), _ENGINE_HINT[ENGINE_LBA])
+        )
+        self.engineChanged.emit(self.engine())
+
+    def _on_stream_cache_changed(self, index: int) -> None:
+        self._stream_cache_dir.setEnabled(int(index) == 1)  # 1 = 硬盘缓存
+
+    def _refresh_stream_buffer_label(self, *_args) -> None:
+        bpc = self._bytes_per_cluster or 4096
+        blocks = int(self._stream_buffer_spin.value())
+        self._stream_buffer_label.setText(
+            f"1 块 = 65536 簇 ≈ {human_bytes(65536 * bpc)}；"
+            f"缓冲 = {blocks}× 块 ≈ {human_bytes(blocks * 65536 * bpc)}"
+        )
+
+    def _browse_stream_cache_dir(self) -> None:
+        path = QFileDialog.getExistingDirectory(
+            self, "选择暂存目录", self._stream_cache_dir.text() or ""
+        )
+        if path:
+            self._stream_cache_dir.setText(path)
+
     def _on_buffer_preset(self, index: int) -> None:
         self._custom_row.setVisible(index == CUSTOM_INDEX)
         self._refresh()
@@ -198,6 +339,11 @@ class IoPanel(QWidget):
         self._guard = True
         profile = self.profile()
         media = profile.media
+
+        # ---- 引擎提示 ----
+        self._engine_hint.setText(
+            _ENGINE_HINT.get(self.engine(), _ENGINE_HINT[ENGINE_LBA])
+        )
 
         # ---- 介质徽章（照实写）----
         self._media_badge.set_state(MEDIA_TEXT.get(media, MEDIA_TEXT[MEDIA_UNKNOWN]),
@@ -228,6 +374,9 @@ class IoPanel(QWidget):
         self._prewarm_hint.setToolTip(reason if reason else "")
 
         self._honest_note.setText(profile.honest_note)
+
+        # ---- 分块流式缓冲标签（跟随卷簇大小）----
+        self._refresh_stream_buffer_label()
         self._guard = False
 
     def _prewarm_availability(self, profile: IoProfile) -> tuple:
