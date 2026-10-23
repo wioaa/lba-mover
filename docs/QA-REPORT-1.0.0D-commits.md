@@ -317,3 +317,235 @@ app/ui/main_window.py:1748  if dialog.choice != "proceed": return  ← 永远 Tr
 **d2be150 通过。** 9.2（悬挂 + 意外弹框）与 9.3（取消卡死）两条均已闭环，且都有实测与钉子守住；接续仍走 DangerConfirmDialog、无二次执行、无回归。
 
 **「先应用再执行」链路至此完整可用。1.0.0D 系列（12 个本地 commit）QA 侧无未决阻断项**，仅剩 10.3 的测试预算建议（P3）。
+
+---
+
+## 11. 定向复验 d2be150 + 856704a（主理人指定的 5 项）
+
+取证：`qa_work/d5_resume_flag_check.py`（19 项）、**`qa_work/d6_nail_falsify.py`（16 项，新增加强证伪）**、`tests/test_ui_execute_flow.py`（13/13）、testflow **322 passed / 0 failed**（44.0s）。HEAD = `856704a`。
+
+### 11.1 ② 悬挂残留证伪 —— 全部无残留
+
+| 情形 | 结果 |
+|---|---|
+| `_on_plan_ready` 收到**非 MovePlan** 早退 → 再收到有效计划 | 不误接续（`moves=[]`）✓ |
+| **连续两次 apply**（均撞非法区间） | 两次后 `flag` 均 False，不累积 ✓ |
+| apply → 改回不合法区间 → 点「生成计划」 | DangerConfirmDialog **0 次** ✓ |
+| 反面对照：真的带意图（**真 Qt 信号** emit） | 恰弹 **1 次**，且 worker/窗口意图双清 ✓ |
+
+### 11.2 ③ `_on_plan_worker_finished` 幂等性 —— 正确
+
+| 情形 | 结果 |
+|---|---|
+| 正常收尾（`_plan_worker is None`）后调用 | **no-op**，`_busy` 保持 True（不误清别的任务）✓ |
+| **旧任务**（已被替换）发 finished | 不误清新槽位、不误退忙碌态 ✓（必须用真信号 emit，直接调槽 `sender()` 为 None 会绕过该守卫——这是测试写法问题，非缺陷） |
+| 两次规划：第 1 次取消 → 第 2 次正常 | 取消后 `busy=False/plan_worker=None/意图作废`；第 2 次完成后同样回到干净态 ✓ |
+
+### 11.3 ④ 钉子反证 —— 有效
+
+- **摘掉 `finished` 连接**（把 `_on_plan_worker_finished` 换 no-op）→ UI 层取消后**确实卡死**（`busy=True`、`_plan_worker` 非空）→ 证明钉⑩ 能抓住该回归。
+- **把 `_take_resume_intent` 改回"只读窗口标志"**（忽略 `worker.resume_after`）→ 带意图的规划完成后**不再接续**（`moves=[]`）→ 证明行为确实依赖 worker 上的意图，钉⑧ 守住的是这条路径。
+
+### 11.4 ⑤ 核对「其余 worker 取消都会发终态信号」
+
+**结论：成立，但需精确一处。** 逐类读 `scanner.py`：
+
+| Worker | 取消后的出口 | 是否会卡死 |
+|---|---|---|
+| BitmapWorker | `failed.emit("位图读取已取消")` | 否 |
+| ScanWorker | `_run_handle_scan` 两处 `completed.emit(results)`；MFT 路径取消 → 回退句柄 → 最终完成 | 否 |
+| IndexWorker | `ready` 或 `failed` 必发一个 | 否 |
+| MftScanWorker | `completed.emit(entries)` | 否（但用户主动取消可能显示成"通道已回退"，P3 文案歧义，工程师已承认未动） |
+| MoveWorker / RollbackWorker / BlockStreamWorker | `completed.emit(outcome)` | 否 |
+| **FeasibilityWorker** | **也是裸 return**（`if self._cancel: return` ×3） | 否——UI 早已连 `finished`（`_on_feasibility_finished`）且它不参与 `_busy` |
+| **PlanWorker** | 裸 return | 已由 `_on_plan_worker_finished` 兜底修复 |
+
+所以精确表述是「**只有 PlanWorker 需要新增 finished 兜底**」成立；「仅 PlanWorker 是裸 return」严格说不成立（FeasibilityWorker 同为裸 return，只是已有兜底）。
+
+### 11.5 新发现（P3，不阻塞）
+
+`_on_plan_worker_finished` 在 **`sender() is None`**（被直接调用而非信号触发）时会走"接管收尾"分支，把当前槽位清掉。真实 Qt 路径不可达（`finished` 必由信号触发），但若将来有人直接调它做手动收尾就会误清。建议加一行 `if worker is None: return`。
+
+### 11.6 放行结论
+
+**放行通过。** d2be150 的两条修复（意图绑 worker、finished 兜底）经加强证伪后均无残留，13 例钉子有效（变异后确实变红），testflow 322/0。工程侧另把性能预算从 600ms 调到 1200ms（`tests/test_blockers_perf.py`，工作区改动未提交）——采纳了我的建议，方向正确。
+
+**1.0.0D 系列 QA 侧无未决阻断项；「先应用再执行」链路完整可用。** 仅余 3 条 P3：性能预算改动待提交、`MftScanWorker` 取消文案歧义、`_on_plan_worker_finished` 对 `sender() is None` 的防御性。
+
+---
+
+## 12. 追加：取消语义复核（原 P3 升级为 P2）+ 性能预算定稿意见
+
+HEAD = `3c9692d`（工作区干净，除本报告）。
+
+### 12.1 性能预算 1200ms：认同定稿
+
+工程师实测独占跑三次 529.8 / 433.7 / 606.9 ms（旧 600ms 预算下 1/3 概率假红），我复现了量级。另按同一场景构造做「同 run 内三档」测量（`qa_work/d7_ratio_probe.py`，每档 3 次取最优）：
+
+```
+25,000 extent → 12,500 blockers， 82.2 ms
+50,000 extent → 25,000 blockers，193.2 ms
+100,000 extent → 50,000 blockers，391.1 ms
+   100k / 25k = 4.76× ；100k / 50k = 2.02×
+```
+
+**结论：1200ms 定稿可接受。** 依据：观测上限 606.9ms → 约 2× 余量；真回归的对拍基线 11,532 ms 高一个数量级，必红。补充数据说明「改相对比较」收益有限——4× 规模只带来 4.76× 耗时，说明当前耗时主体是 O(E) 的 Blocker 构造而非 E×R 裁剪，比值断言的余量同样约 2×，仅换来"免疫机器速度"，不构成必须项。
+
+### 12.2 扫描/索引取消语义：P3 → **P2**（三处落点）
+
+工程师原描述「取消 → `scan_volume_mft` 返回非 ok → `_emit_fallback` → UI 显示通道已回退」**与代码不符**，实测（`qa_work/d8_mft_cancel_probe.py`）证明：
+
+1. 取消分支只 `outcome.notes.append("扫描已取消（结果不完整）"); break`（`mft_reader.py:502-504`），**不设 `fallback_code`**；
+2. `MftScanOutcome.ok = not fallback_code`（`mft_reader.py:72-73`）→ 取消后 **`ok is True`**；
+3. `MftScanWorker.run` 的 `if not outcome.ok: _emit_fallback(...)` 不成立 → 走**成功**分支；
+4. 桩测：`completed=1`、`fallback=[]`、`failed=[]`；
+5. `run()` 从未把 `outcome.notes` 传给任何信号 → 那句"扫描已取消（结果不完整）"**永远不会显示**。
+
+**实际后果**：用户按取消，UI 得到「扫描完成」+ 一份**不完整的文件列表**，无任何提示。这不是文案问题而是语义丢失：用户可能据此认为某些文件不在该卷上，进而做出错误的迁移选择（无数据破坏，但结论错误）。
+
+**补充第三处落点**（工程师与主理人逐行核对后确认）：`_on_index_ready` —— `IndexWorker` 取消后仍 `ready.emit(payload)` 且 `ok` 可能为 True，UI 会打印「归属索引就绪」，把**部分归属表**当完整索引使用；此外 `_on_scan_completed` 取消后仍**无条件 `_build_index()`**，会拿部分数据建一次全卷索引（白跑）。
+
+**建议修法**：`MftScanOutcome` 增 `cancelled` 标记（或专用 `FALLBACK_CANCELLED`）；`MftScanWorker.run` 在 cancelled 时照常 emit 已解析的 `found`，但完成态文案改为「扫描已取消，仅显示已解析的 N 项」。**同一问题也存在于 `ScanWorker._run_handle_scan`**（两处 `completed.emit(results)`），建议一并处理。
+
+### 12.3 建议
+
+P2 推迟到 1.0.0E 修复（不阻塞当前放行：不卡死、不误启动写盘、不影响已有数据的正确性），但应记入 1.0.0E 待办，并且**在"扫描"这条链路上加一枚钉子**：取消后 UI 文案必须含「已取消」。
+
+---
+
+## 13. 1.0.0D 发布核对 + 1.0.0E 验收判据
+
+### 13.1 发布核对（可验证项）
+
+| 项 | 结果 |
+|---|---|
+| 代码基线 | 本地 `HEAD` = `3c9692d`（06:33:51），工作区干净（除本报告） |
+| 打包产物 | `dist/LBA-Tail-Mover.exe`（47,044,920 B，构建于 06:35:29，晚于最后一次源码改动 06:29） |
+| 版本资源 | `ProductVersion = 1.0.0D`、`FileVersion = 1.0.0.0`、`ProductName = LBA Tail Mover` ✓ |
+| 远端 main | **已证实 = `3c9692d`**（主理人侧 `GET /repos/wioaa/lba-mover/git/ref/heads/main` 返回 `3c9692db7…`，最近 3 个 commit 逐条与本地一致）。本机早前看到 `origin/main=40d7d28 / ahead 16` 系 **local tracking 残留**（推送经 Git Data API 完成，不会自动更新 tracking ref）；`git update-ref` 对齐后本机 `git branch -vv` 显示 `main 3c9692d [origin/main]`、无 ahead（QA 已复核） |
+
+推送方式说明（记录）：本机到 `github.com` 的 git 主机不可达（`Connection reset`），本次及此前数次推送均走 **Git Data API 兜底**（blobs/tree/commits + PATCH refs），重建 SHA 与本地逐字一致，故远端内容与本地等价。
+
+### 13.2 1.0.0E 验收判据（扫描取消语义，待实现后逐条验证）
+
+对 `MftScanWorker` 与 `ScanWorker._run_handle_scan` 各一组：
+
+1. **文案**：取消后状态/提示必须含「已取消」，且**不得**出现「完成」字样（两者互斥）。
+2. **计数一致**：提示里的「已解析 N 项」必须等于本次 `completed` 携带的条目数（不虚报、不少报）。
+3. **`fallback_code` 不被污染**：取消后 `fallback_code` 为空或专用取消码；**不得**等于 `not_ntfs` / `no_privilege` / `mft_runlist_unavailable` / `structure_invalid` / `bounds_violation` / `sample_mismatch` 等真实降级码（否则日志与统计会把"用户取消"记成"通道失效"）。
+4. **不被当作降级**：取消后 `channel` 应保持 `"mft"`（MFT 路径）/ 保持句柄通道原语义，**不得**因取消而切成 `"handle"`。
+5. **部分结果可用**：取消前已 `found` 的条目仍应出现在表格里（不丢已解析结果）；表格内容 = 已解析集合，不得混入未解析的占位。
+6. **不误设 `fatal_error`**：取消后 `stats.fatal_error` 应为空（`fatal_error` 只用于真实失败）。
+7. **回归钉**：至少一枚断言「取消 → 文案含已取消 + `fallback_code` 未被污染 + 计数与条目数一致」，防止再次退化。
+8. **若同批修 P3-1**（`_on_plan_worker_finished` 的 `sender() is None` 守卫）：`test_plan_cancel_fallback_clears_busy` 与 `test_plan_finished_is_noop_after_terminal_signal` 必须改为**真 Qt 信号驱动**，并新增一枚「直调该槽为 no-op」的契约钉子。
+
+验证脚本计划：`qa_work/e1_scan_cancel_check.py`（桩 `scan_volume_mft` 返回取消态 outcome + 桩 `ScanWorker` 的扫描结果，逐条断言上述 1–6），配合 testflow 全量。
+
+---
+
+## 14. 1.0.0E 在途实现验收（工作区快照，非提交版）
+
+> 状态说明：本节结果针对**未提交的工作区**（`app/core/scanner.py`、`app/ui/main_window.py`、`app/win32/mft_reader.py`、`tests/test_ui_execute_flow.py` 均为 M）。提交后需重跑。
+
+脚本：`qa_work/e1_scan_cancel_check.py`（11 项断言），结果 **10 绿 / 1 红**。
+
+### 14.1 已达标
+
+**MftScanWorker（8/8）**：`progress = "扫描已取消，仅显示已解析的 1 项"`；`completed` 条目数 1；`fallback=[]`；`fallback_code=''`；`channel='mft'`；`found=1`；`fatal_error=''`。
+即 §13.2 的 1/2/3/3b/4/5/6 全部满足。
+
+**ScanWorker + UI（2/3）**：`cancelled` 只读属性存在、`request_cancel()` 后为 True；真信号驱动下 notice =「扫描已取消：仅显示已解析的 1 项，可重新扫描获取完整列表」，且不含「扫描完成」。
+
+### 14.2 新发现（P3）：`_on_scan_completed` 的 `sender()` 直调陷阱
+
+```python
+cancelled = bool(getattr(self.sender(), "cancelled", False))
+```
+直调该槽（测试/复用/换信号源）时 `sender()` 为 None → **取消被静默当成「完成」**，实测 `notice=''`。生产路径是信号驱动故当前无碍，但会让"直调式测试"假绿（只断言表格条数就过，取消文案从未被验证）。
+
+**建议**：追加 `or bool(getattr(self._scan_worker, "cancelled", False))` 兜底（`_scan_worker` 在该行之后才置 None，可读）。采纳后 e1 第 10 条应由红转绿，列为 1.0.0E 必过项。
+
+> 这是本项目第 4 次踩到"依赖 `sender()` 的槽被直调/替身驱动"的坑（工程师 1 次、QA 2 次、本次 1 次）。建议在回归方法论里固定一条：**凡读 `sender()` 的槽，测试必须用真 Qt 信号驱动，或实现侧提供非 `sender()` 兜底**。
+
+---
+
+## 15. 基线校准（本节为最终口径）
+
+| 项 | 最终状态 |
+|---|---|
+| 1.0.0D 代码基线 | `3c9692d`；**远端 main = `3c9692d` 已证实**（GitHub API `git/ref/heads/main`）；本机 `git branch -vv` = `main 3c9692d [origin/main]`、无 ahead（local tracking 残留已由 `update-ref` 对齐） |
+| 打包产物 | `dist/LBA-Tail-Mover.exe` 47,044,920 B，`ProductVersion=1.0.0D` |
+| testflow | 322 passed / 0 failed（`3c9692d`） |
+| §11 的"性能预算未提交" | **作废**，以 §12 为准（1200ms 已入库） |
+| §12.2 的 P2 范围 | 三处落点：`_on_scan_completed`（取消仍报完成 + 无条件 `_build_index()`）、`_on_index_ready`（取消仍报"就绪"、部分归属表当完整用）、三个 Worker 缺 `cancelled` 标识 |
+| 1.0.0E 第一批 | ①P3-1 `worker is None` 守卫 + 两枚钉子改真信号；②P2 扫描/索引取消语义（上述三处）+ `ScanWorker._run_handle_scan` 两处同源；③"只有 PlanWorker 是裸 return"文案订正；④版本 1.0.0E 三处同步 |
+
+### 15.1 e1 验收脚本现状（针对**未提交**工作区快照）
+
+`qa_work/e1_scan_cancel_check.py`：**16 项断言，14 绿 / 2 红**。
+
+- ① MftScanWorker 取消语义 **8/8 绿**（文案、N 一致、`fallback_code` 未污染、channel 未切、部分结果不丢、`fatal_error` 空）；
+- ② ScanWorker：`cancelled` 属性 ✓、真信号路径 UI 文案 ✓；
+- ③ IndexWorker/UI：取消不写 `_ownership` ✓、调用 `set_blockers_unavailable` ✓、退忙碌态 ✓、非取消路径未误杀 ✓；
+- **2 红同源**：`_on_scan_completed`（第 10 条）与 `_on_index_ready`（第 13 条）在**直调**（`sender() is None`）时取消被当成"完成/就绪"。修法：两处各加 `or bool(getattr(self._<x>_worker, "cancelled", False))` 兜底。**这两条为 1.0.0E 必过项。**
+
+> 已请工程师自查本批**所有** `sender()` 读取点（含 `_on_plan_ready` / `_on_plan_failed` / `_on_plan_worker_finished` / `_on_feasibility_ready` / `_on_scan_completed` / `_on_index_ready`），凡无 `_xxx_worker` 兜底者一并补。
+
+---
+
+## 16. 1.0.0E 第一批 + 第二批 正式验收（基线 `f1b4a80`）
+
+取证：`qa_work/e1_scan_cancel_check.py`（**18 项断言全绿**）、`qa_work/d9_e1_extra_falsify.py`、testflow、离屏冒烟。工作区仅 `tests/test_cancel_semantics.py` 有未提交改动（+41 行，调用点钉子，见 16.4）。
+
+### 16.1 上轮两个红点：已转绿
+
+| 断言 | 结果 |
+|---|---|
+| ⑩ `_on_scan_completed` **直调** → notice 含「已取消」 | PASS（`扫描已取消：仅显示已解析的 1 项，可重新扫描获取完整列表`） |
+| ⑬ `_on_index_ready` **直调** → `_ownership is None` | PASS |
+| ⑬ 隐含验证「兜底读取必须在 `_index_worker = None` 之前」 | PASS —— 直调时 `sender()` 为 None，若顺序颠倒则读到的 `cancelled` 必为 False，⑬ 必红。故 ⑬ 同时是**顺序契约钉子** |
+
+### 16.2 新增实现细节证伪
+
+| 项 | 结果 |
+|---|---|
+| `_on_scan_cancelled` 自行 `_set_busy(False)` | PASS（9c：取消后 `_busy is False`）——取消不建索引，不自己退会重演 P1 卡死 |
+| 非取消路径**不得**误调 `_on_scan_cancelled` | PASS（9d：spy 为空） |
+| 索引取消走 `set_blockers_unavailable` 而非静默 | PASS（11b：调用 1 次；11：`_ownership is None`；11c：退忙碌 + 槽位清空） |
+| 非取消索引路径未误杀 | PASS（12：`_ownership` 正常写入） |
+| `cancelled` 与 `ok` 语义不冲突 | PASS（③ `fallback=[]`、③b `fallback_code=''`、④ `channel='mft'`、⑥ `fatal_error=''`，即取消时 `ok` 仍 True、不污染降级码） |
+
+### 16.3 反向验证（我独立执行，非引用其自述）
+
+| 变异 | 结果 |
+|---|---|
+| `mft_reader.mark_cancelled` 置 no-op | `test_cancel_semantics.py` → **2 枚钉子变红**（`test_mft_reader_marks_cancel_on_outcome`、`test_mft_scan_worker_cancel_reports_completed_with_flag`）→ 证实「原先无钉子覆盖取消置位」的说法成立 |
+| 把 `query` 换成 O(N) 全表扫（复杂度退化模拟） | 比值 **0.94 → 6.17**，越过阈值 4.0 → ownership 的比值断言**确有区分力**（现状 0.94~1.81，阈值 4.0，退化 6.17；线性真退化会更接近 10） |
+| 调用点钉子（工作区新增）：把 `scan_volume_mft` 换成「取消分支只 break 不 mark」 | 钉子**变红**；还原后**通过** → 该钉子真实锚定「调用点是否接线」 |
+
+### 16.4 `sender()` 六处清点表：三处「不加兜底」的判断我全部认同
+
+| 槽 | 判定 | 我的意见 |
+|---|---|---|
+| `_on_scan_completed` | 加 `_scan_worker` 兜底 | 对（直调会把取消当完成） |
+| `_on_index_ready` | 加 `_index_worker` 兜底，且**在置 None 之前** | 对（顺序错了就失效，⑬ 可证） |
+| `_on_plan_worker_finished` | `is None → return`（不兜底） | **对**。兜底会清掉"可能仍在跑"的槽位 → 双重规划线程，比不兜底危险 |
+| `_take_resume_intent` | 只认 sender + 窗口瞬时标志 | **对**。误判方向不对称：误判 → 无端弹执行确认框（危险）；漏判 → 少一次自动接续（安全）。且 `_plan_worker` 可能已是新线程，读它会把上一轮意图错配给新一轮 |
+| `_on_feasibility_ready/_failed` | 用 `seq` 代次 | **对**。代次天然区分新旧，比身份比对更可靠（且能处理"同一 worker 重投"场景） |
+
+判定原则可归纳为一条，建议写进方法论：**兜底只在"兜底对象代表同一逻辑任务"时成立；否则按误判方向的危害选择失败方向**。
+
+### 16.5 收尾数据
+
+| 项 | 结果 |
+|---|---|
+| testflow（工作区，含调用点钉子） | **335 passed / 0 failed**（45.2s） |
+| testflow（`f1b4a80` 提交版） | 334 passed / 0 failed |
+| 版本 | `display_version() == "1.0.0E"` |
+| 写路径隔离 | `MOVER_CLEAN`；初始 `_plan_worker=None / _busy=False` |
+
+### 16.6 放行结论
+
+**放行，可打包推送。** 生产代码侧（`fadad65` + `f1b4a80`）已达标：取消不再被报成完成、不自动勾选、不建残索引、不卡忙碌态、`fallback_code` 与 `ok` 语义未被污染；两处直调兜底与顺序契约均生效。
+
+**唯一待办**：第三个 commit（仅测试，+41 行调用点钉子）仍未提交——它不改变运行时行为，所以不阻塞打包；但**必须提交**，否则"取消分支被删掉调用行"这一层永远没有钉子看守（我已实测该钉子在变异下会红、还原后通过）。
