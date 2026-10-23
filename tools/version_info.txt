@@ -1,0 +1,43 @@
+# -*- coding: utf-8 -*-
+# Windows 资源版本信息（PyInstaller EXE(..., version=...) 使用）。
+# 约定：FileVersion 用三段号转成的数字四元组（1.0.0.0），修订字母只出现在
+# 产品字符串 ProductVersion（"1.0.0A"）里——可与 app/__init__.py 的
+# __version__ / __revision__ 反查对齐。
+VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=(1, 0, 0, 0),
+        prodvers=(1, 0, 0, 0),
+        mask=0x3F,
+        flags=0x0,
+        OS=0x00040004,
+        fileType=0x1,
+        subtype=0x0,
+        date=(0, 0),
+    ),
+    kids=[
+        StringFileInfo(
+            [
+                StringTable(
+                    "040904B0",
+                    [
+                        StringStruct("CompanyName", "yohaq"),
+                        StringStruct(
+                            "FileDescription",
+                            "LBA Tail Mover — 大文件末端 LBA 迁移工具",
+                        ),
+                        StringStruct("FileVersion", "1.0.0.0"),
+                        StringStruct("InternalName", "LBA-Tail-Mover"),
+                        StringStruct(
+                            "LegalCopyright",
+                            "Use at your own risk. Back up important data first.",
+                        ),
+                        StringStruct("OriginalFilename", "LBA-Tail-Mover.exe"),
+                        StringStruct("ProductName", "LBA Tail Mover"),
+                        StringStruct("ProductVersion", "1.0.0A"),
+                    ],
+                )
+            ]
+        ),
+        VarFileInfo([VarStruct("Translation", [0x0409, 0x04B0])]),
+    ],
+)

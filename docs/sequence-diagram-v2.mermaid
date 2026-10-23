@@ -1,0 +1,154 @@
+%% LBA Mover v2 关键调用序列
+%% 场景：① 区间规划（含挡路者识别与依赖排序） ② 真实执行（含双校验/预热/流水）
+
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant MW as MainWindow
+    participant MS as MftScanWorker(QThread)
+    participant MF as core/mft
+    participant MR as win32/mft_reader
+    participant GD as SafetyGuard
+    participant PW as PlanWorker(QThread)
+    participant PL as planner
+    participant SF as safety
+    participant PK as packer
+    participant OW as OwnershipIndex
+    participant IO as io_profile
+    participant SC as scheduler
+    participant MWk as MoveWorker(QThread)
+    participant MV as mover
+    participant W32 as win32/api + volume
+
+    rect rgb(240, 253, 244)
+    Note over U,W32: ⓪ 扫描阶段（N5 双通道，严格只读）
+    U->>MW: 选择卷 + 扫描模式（MFT 快速 / 句柄兼容）
+    MW->>MW: build_scan_channel(info, prefer_mft) → "mft" / "handle"
+    alt 通道 = mft
+        MW->>MS: start(info, config, sample_size=32)
+        MS->>MF: open_mft_stream(letter, info)
+        MF->>W32: CreateFile("C:\\$MFT", FILE_READ_ATTRIBUTES)
+        W32-->>MF: 文件句柄
+        MF->>W32: FSCTL_GET_RETRIEVAL_POINTERS（$MFT 自身 runlist）
+        W32-->>MF: extents（MFT 可能碎片化，不可假设连续）
+        MF->>MF: 组装 MftStream + 构造 MftSpanGuard
+        loop 每批 512 条记录
+            MS->>MR: read(record_no * record_size, record_size)
+            MR->>MF: guard.check(aligned_offset, aligned_length)
+            alt 越界
+                MF-->>MS: raise MftBoundsError
+                MS-->>MW: fallback("bounds_violation")（中止，不截断）
+            else 正常
+                MR->>W32: SetFilePointerEx + ReadFile（扇区对齐，GENERIC_READ）
+                W32-->>MR: 记录原始字节
+                MR-->>MS: bytes
+                MS->>MF: apply_fixup(bytearray, record_size)
+                Note over MF: USA 还原必须最先做<br/>否则跨扇区属性全错
+                MS->>MF: parse_record() → 属性链 → decode_runlist()
+                MF-->>MS: MftRecord（含 (vcn,lcn,clusters)）
+                MS->>MF: record_to_entry() + rebuild_path()（深度 64 + 环检测）
+                MS->>OW: 顺带灌入归属索引（N4 协同，省掉二次全卷扫描）
+            end
+        end
+        MS->>MF: sample_pick() + compare_extents()（抽样复核）
+        alt 不一致率 > 5%
+            MS-->>MW: fallback("sample_mismatch")
+        else 可接受
+            MS-->>MW: stats(MftScanStats) + completed(entries)
+        end
+    else 通道 = handle
+        MW->>MW: v1 句柄通道（完整保留，逐行未改）
+    end
+    MW->>MW: 显示扫描统计 caption（耗时/有效/跳过/异常/抽样）
+    MW-->>U: 文件列表（含来源标记 mft/handle、路径未知标记）
+    end
+
+    rect rgb(238, 242, 247)
+    Note over U,W32: ① 规划阶段（只读，不写盘）
+    U->>MW: 选中文件 + 设定目标区间/保留区/缓冲
+    MW->>MW: clamp_reserve_mb() 夹紧用户输入（下限不可为 0）
+    MW->>PW: start(window, safety, io_profile, ownership)
+    PW->>SF: forbidden_runs() → 禁区集合
+    PW->>PK: assess(entries, window, allowed, free_runs, ownership)
+    PK->>OW: query(window.start, window.end) 反查挡路者归属
+    OW-->>PK: [(path, extent 切片)]
+    PK->>PK: 第一轮 fdd_pack（仅用区间内空闲簇）
+    alt 全部落位
+        PK-->>PW: verdict = direct
+    else 未全部落位
+        PK->>PK: 挡路者成本排序 + 第二轮虚拟腾空 fdd_pack
+        PK->>PK: build_evictions()（区间之后 → 之前 → 其余）
+        PK-->>PW: verdict = needs_eviction / impossible（含量化差额）
+    end
+    PW->>PK: detect_self_overlap() 逐文件
+    PW->>SC: build_tasks + build_dependencies
+    SC->>SC: order_elevator()（Kahn + 最小堆 = 拓扑下的电梯单向序）
+    opt 存在依赖环
+        SC->>SC: tarjan_scc() + break_cycles()（relay 中转，上限 3 轮）
+    end
+    PW->>IO: merge_segments(batch_clusters) 批次窗口合并
+    PW->>SF: assert_target_allowed() 逐段（规划期第一道校验）
+    Note over SF: 越界/跨保留区 → 抛 SafetyViolation
+    PW-->>MW: completed(MovePlan)，含 feasibility / tasks / stats
+    MW->>MW: 刷新布局图（目标区间 / 挡路簇 / 驱逐目标）
+    MW-->>U: 可行性徽章 + 摘要 + 挡路清单（可排除）
+    end
+
+    rect rgb(254, 233, 233)
+    Note over U,W32: ② 执行阶段（唯一写盘路径）
+    U->>MW: 执行模式 → 开始迁移 → 危险确认对话框
+    MW->>MWk: start(plan, safety, io_profile, journal)
+    MWk->>W32: 重新打开卷 + FSCTL_GET_NTFS_VOLUME_DATA
+    W32-->>MWk: volume_serial / total_clusters
+    alt 序列号或总簇数不一致
+        MWk-->>MW: failed("卷状态已变化，拒绝执行")
+        Note over MWk: 全程零写调用
+    else 一致
+        MWk->>GD: 构造 SafetyGuard(policy, snapshot)
+        loop 按 plan.tasks 顺序（evict → place → relay）
+            opt 该文件首次出现且 prewarm 启用
+                MWk->>MV: prewarm_file(path, limit, chunk)
+                MV->>W32: CreateFileW(FILE_FLAG_SEQUENTIAL_SCAN) + 大块顺序读
+                MV-->>MWk: 预热字节数（失败返回 0，不阻塞）
+            end
+            MWk->>MV: execute_task(vh, task, guard, policy, journal)
+            loop task.segments（已按批次合并）
+                MV->>GD: allow(dst_lcn, clusters)
+                alt 拒绝
+                    GD-->>MV: (False, 原因)
+                    MV-->>MWk: MoveFailure（不调用 FSCTL）
+                else 允许
+                    MV->>W32: DeviceIoControl(FSCTL_MOVE_FILE, MOVE_FILE_DATA 32B)
+                    W32-->>MV: 成功 / Win32Error
+                    MV->>GD: reserve(dst_lcn, clusters)
+                    MV->>MV: journal.append(JournalEntry) + flush
+                end
+            end
+            MWk-->>MW: progress(done, total, path) / file_result(path, ok, msg)
+        end
+        MWk-->>MW: completed(MoveOutcome)
+        MW->>MW: 重读位图；失败则显示「尝试回滚 N 段」
+        opt 用户选择回滚
+            MW->>MWk: start(mode="rollback", journal)
+            MWk->>MV: rollback_segments()（逆序 + src↔dst 互换）
+            MV-->>MWk: MoveOutcome（回滚本身也可能失败，如实报告）
+        end
+    end
+    end
+
+    rect rgb(244, 247, 251)
+    Note over U,W32: ③ 可选：全卷归属索引（N4 精确找挡路者）
+    U->>MW: 点击「建立全卷归属索引」
+    alt 扫描通道 = mft
+        Note over MW,OW: 无需额外操作 —— ⓪ 阶段已顺带产出 OwnershipIndex（免费）
+    else 扫描通道 = handle
+        MW->>MWk: IndexWorker.start(ScanConfig(min_size=1))
+        loop 每个文件
+            IndexWorker->>W32: FSCTL_GET_RETRIEVAL_POINTERS
+            IndexWorker->>OW: 增量灌入 extents（紧凑数组，省内存）
+            IndexWorker-->>MW: progress(scanned, extents, path)
+        end
+        IndexWorker-->>MW: ready(OwnershipIndex)
+    end
+    MW->>PW: 重新 assess()（此时挡路者归属可知）
+    end

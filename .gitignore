@@ -1,0 +1,33 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.testflow/
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+env/
+
+# ---- PyInstaller 构建产物（可在任意 Windows + PySide6 机器上重建）----
+build/
+dist/
+
+# ---- 操作系统 / 编辑器 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- 日志 ----
+*.log
+
+# ---- QA 过程脚本 / 缓存 / 原始输出（内部 scratch，不入库）----
+qa_work/

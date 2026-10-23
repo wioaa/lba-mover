@@ -1,0 +1,360 @@
+%% LBA Mover v2 增量类图（仅新增/变更部分）
+%% 说明：models.py 里既有类保持不变，这里列出扩展字段与新增类
+
+classDiagram
+    direction LR
+
+    class VolumeInfo {
+        +str letter
+        +str root
+        +int total_clusters
+        +int bytes_per_cluster
+        +int mft_zone_start
+        +int mft_zone_end
+        +int mft_start_lcn
+        +int mft2_start_lcn
+        +int bytes_per_file_record
+        +str media_kind
+        +int disk_start_offset
+    }
+
+    class Extent {
+        +int vcn
+        +int lcn
+        +int clusters
+        +bool is_sparse
+        +int lcn_end
+        +overlaps(start, end) bool
+    }
+
+    class FileEntry {
+        +str path
+        +str name
+        +int size
+        +List~Extent~ extents
+        +bool movable
+        +str reason
+        +str status
+        +int attributes
+        +bool is_compressed
+        +bool is_encrypted
+        +int record_no
+        +int link_count
+        +bool path_known
+        +str source
+        +allocated_clusters() int
+        +fragments() int
+        +first_lcn() int
+        +last_lcn() int
+    }
+
+    class BitmapSnapshot {
+        +bytes bits
+        +int total_clusters
+        +int bytes_per_cluster
+        +is_free(lcn) bool
+        +range_is_free(start, clusters) bool
+        +range_is_free_fast(start, clusters) bool
+    }
+
+    class TargetWindow {
+        +int start_lcn
+        +int end_lcn
+        +clusters() int
+        +contains(lcn, clusters) bool
+        +clipped(total_clusters) TargetWindow
+    }
+
+    class SafetyPolicy {
+        +int total_clusters
+        +int bytes_per_cluster
+        +int head_reserve_clusters
+        +int tail_reserve_clusters
+        +int mft_zone_start
+        +int mft_zone_end
+        +int mft_start_lcn
+        +int mft2_start_lcn
+        +int mft_guard_clusters
+        +bool protect_mft_zone
+        +bool guard_metadata
+        +forbidden_runs() List~Tuple~
+        +is_range_allowed(lcn, clusters) bool
+        +describe() str
+    }
+
+    class SafetyGuard {
+        +SafetyPolicy policy
+        +BitmapSnapshot snapshot
+        +List~Tuple~ reserved
+        +allow(lcn, clusters) Tuple
+        +reserve(lcn, clusters) None
+        +release(lcn, clusters) None
+    }
+
+    class IoProfile {
+        +str media
+        +int buffer_mb
+        +int bytes_per_cluster
+        +str sweep
+        +bool coalesce
+        +bool elevator
+        +bool prewarm
+        +int batch_clusters
+        +build(media, buffer_mb, bpc) IoProfile
+        +summary() str
+        +badge() Tuple
+    }
+
+    class OwnershipIndex {
+        +build(entries) OwnershipIndex
+        +query(start, end) List~Tuple~
+        +covered(start, end) int
+    }
+
+    class SpaceLedger {
+        -List~Tuple~ _runs
+        +allocate(clusters, near) int
+        +release(start, clusters) None
+        +free_clusters() int
+        +runs() List~Tuple~
+    }
+
+    class FeasibilityReport {
+        +str verdict
+        +int window_clusters
+        +int usable_clusters
+        +int selected_clusters
+        +int free_in_window
+        +int blocked_clusters
+        +int evictable_clusters
+        +int unknown_owner_clusters
+        +int largest_file_clusters
+        +int shortfall_clusters
+        +List~Blocker~ blockers
+        +List~str~ reasons
+        +List~str~ suggestions
+        +headline() str
+    }
+
+    class Blocker {
+        +str path
+        +str name
+        +int total_clusters
+        +int clusters_in_window
+        +List~Extent~ extents_in_window
+        +int fragments_in_window
+        +float cost
+        +bool excluded
+        +str reason
+    }
+
+    class MoveSegment {
+        +int vcn
+        +int src_lcn
+        +int dst_lcn
+        +int clusters
+        +dst_end() int
+    }
+
+    class PlanItem {
+        +FileEntry entry
+        +str role
+        +int target_lcn
+        +int clusters
+        +List~MoveSegment~ segments
+        +str skipped_reason
+        +needs_move() bool
+        +move_clusters() int
+    }
+
+    class MoveTask {
+        +int order
+        +str phase
+        +int item_index
+        +str path
+        +List~MoveSegment~ segments
+    }
+
+    class PlanStats {
+        +int place_files
+        +int place_clusters
+        +int evict_files
+        +int evict_clusters
+        +int relay_files
+        +int relay_clusters
+        +int unknown_owner_clusters
+        +total_clusters() int
+    }
+
+    class MovePlan {
+        +List~PlanItem~ items
+        +List~PlanFailure~ failures
+        +int total_clusters
+        +int reserve_clusters
+        +int tail_floor_lcn
+        +str note
+        +TargetWindow window
+        +List~PlanItem~ evictions
+        +List~MoveTask~ tasks
+        +FeasibilityReport feasibility
+        +SafetyPolicy safety
+        +IoProfile io_profile
+        +PlanStats stats
+        +int version
+        +movable_items() List
+        +all_items() List
+        +total_move_clusters() int
+        +needs_relay() bool
+    }
+
+    class MoveJournal {
+        +Path path
+        +append(entry) None
+        +load(path) List
+        +rollback_segments() List
+        +moved_clusters() int
+    }
+
+    class JournalEntry {
+        +str ts
+        +str phase
+        +str path
+        +int vcn
+        +int src_lcn
+        +int dst_lcn
+        +int clusters
+        +str result
+        +int winerror
+    }
+
+    class MoveOutcome {
+        +int moved_clusters
+        +int moved_files
+        +bool cancelled
+        +List~MoveFailure~ failures
+    }
+
+    %% ================= N5 · MFT 直读扫描通道 =================
+    class MftStream {
+        +List~Extent~ extents
+        +int valid_length
+        +int record_size
+        +int bytes_per_cluster
+        +int bytes_per_sector
+        +locate(offset, length) List~Tuple~
+        +record_offset(record_no) int
+        +record_count() int
+    }
+
+    class MftSpanGuard {
+        +int volume_bytes
+        +int mft_valid_bytes
+        +int record_size
+        +int sector_size
+        +normalize(offset, length) Tuple
+        +check(offset, length) None
+    }
+
+    class AttrHeader {
+        +int type
+        +int length
+        +bool non_resident
+        +int flags
+        +int value_length
+        +int value_offset
+        +int start_vcn
+        +int last_vcn
+        +int run_offset
+        +int compression_unit
+        +int data_size
+    }
+
+    class MftRecord {
+        +int record_no
+        +bool in_use
+        +bool is_directory
+        +int base_record_ref
+        +List~AttrHeader~ attributes
+        +int parent_ref
+        +str name
+        +int namespace
+        +int file_attributes
+        +int data_flags
+        +List~Extent~ extents
+        +bool resident
+        +bool has_attribute_list
+        +int link_count
+        +List~str~ warnings
+    }
+
+    class MftScanStats {
+        +int record_size
+        +int total_records
+        +int in_use_records
+        +int file_records
+        +int skipped_metadata
+        +int bad_fixup
+        +int bad_attribute
+        +int bad_runlist
+        +int attr_list_skipped
+        +int resident_data
+        +int path_unknown
+        +int read_error
+        +str fatal_error
+        +float elapsed_seconds
+        +int sampled
+        +int sample_mismatch
+        +healthy() bool
+        +summary_line() str
+    }
+
+    class MftReader {
+        +int handle
+        +MftStream stream
+        +MftSpanGuard guard
+        +read(offset, length) bytes
+        +iter_records(start, end, batch) Iterator
+        +close() None
+    }
+
+    class MftBoundsError {
+        <<exception>>
+    }
+
+    %% ---- 关系 ----
+    VolumeInfo "1" --> "1" SafetyPolicy : build_policy()
+    VolumeInfo "1" ..> "1" IoProfile : media_kind
+    Extent "*" --> "1" FileEntry
+    FileEntry "*" --> "0..1" OwnershipIndex : 建索引
+    BitmapSnapshot ..> SafetyGuard
+    SafetyPolicy --> SafetyGuard
+    SafetyPolicy --> TargetWindow : 禁区裁剪
+    OwnershipIndex ..> Blocker : query() 反查归属
+    FeasibilityReport "1" *-- "*" Blocker
+    SpaceLedger "1" ..> TargetWindow : 分配范围
+    SpaceLedger ..> Blocker : 驱逐目标
+    FileEntry "*" --> "*" PlanItem
+    PlanItem "1" *-- "*" MoveSegment
+    PlanItem "1" --> "*" MoveTask : 顺序化
+    MovePlan "1" *-- "*" PlanItem
+    MovePlan "1" *-- "*" MoveTask
+    MovePlan "1" *-- "1" FeasibilityReport
+    MovePlan "1" --> "1" SafetyPolicy
+    MovePlan "1" --> "1" IoProfile
+    MovePlan "1" *-- "1" PlanStats
+    MoveJournal "1" *-- "*" JournalEntry
+    MoveTask ..> MoveOutcome : execute_task()
+    SafetyGuard ..> MoveOutcome : 每次 FSCTL 前 allow()
+
+    %% ---- N5 关系 ----
+    MftStream "1" *-- "*" Extent : $MFT 自身 runlist
+    MftSpanGuard "1" --> "1" MftStream : 边界校验唯一入口
+    MftReader "1" --> "1" MftStream
+    MftReader "1" --> "1" MftSpanGuard
+    MftReader ..> MftBoundsError : 越界即抛（中止，不截断）
+    MftRecord "1" *-- "*" AttrHeader
+    MftRecord "1" *-- "*" Extent : decode_runlist()
+    MftRecord ..> FileEntry : record_to_entry()
+    MftScanStats ..> FileEntry : 计数字段对齐（source/record_no/path_known）
+    FileEntry "*" --> "1" MftScanStats : source=="mft"
+    OwnershipIndex ..> MftRecord : 扫描时顺带产出（N4 协同）
