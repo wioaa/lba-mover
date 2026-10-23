@@ -215,3 +215,105 @@ app/ui/main_window.py:1748  if dialog.choice != "proceed": return  ← 永远 Tr
 **放行到下一阶段（UI 集成 / 发布流程）：通过。**
 
 附注（不阻塞）：① 前一阶段 v2 引擎报告 `docs/QA-REPORT-v2-engine.md` 的 5 项引擎级问题（陈旧位图/属性列表空壳/relay 死代码/path_known/decode 上界）与本报告相互独立，若尚未修复应在进入真实执行前闭环；② `_feasibility_memo_snapshot` 强引用在多卷缓存场景需重估（单卷无虑）。
+
+---
+
+## 9. 800f4a4 复核（「先应用再执行」接续执行修复）
+
+取证：`qa_work/d5_resume_flag_check.py`（14 项断言全过，输出 `d5_output.txt`）、`tests/test_ui_execute_flow.py`（6/6）、testflow **315 passed / 0 failed**、离屏冒烟 `MOVER_CLEAN` + `resume_flag_init=False / busy=False / _plan_worker=None`。
+
+### 9.1 主理人指定 5 点
+
+| # | 审查点 | 结论 |
+|---|---|---|
+| 1 | **标志悬挂** | **失败（P2）**：3 条真实路径悬挂，另 1 条边缘路径。详见 9.2 |
+| 2 | **接续仍弹确认框** | **通过**：`_on_plan_ready` 中 `_set_busy(False)`/`_plan_worker=None` 在函数最顶部、resume 块在末尾 → 接续时 `busy=False`、`plan_worker=None`（实测 C1/C2）；DangerConfirmDialog **恰好实例化 1 次**（C3） |
+| 3 | **不二次执行** | **通过**：标志在 resume 块入口即复位；连续三次 `_on_plan_ready` 只接续 1 次（D1） |
+| 4 | **钉子反向验证** | **部分有效**：旧 apply 写法下钉子①（apply 置标志+重规划）与钉子⑥（静默 return 提示）变红，②③④⑤仍绿 —— 覆盖了本次两处实质改动，**但未覆盖悬挂路径** |
+| 5 | testflow + 冒烟 | **通过**：315/0；`MOVER_CLEAN`；初始 `resume_flag=False / busy=False / plan_worker=None` |
+
+### 9.2 缺陷 1（P2）：`_resume_execute_after_plan` 悬挂 → 下次普通规划意外弹危险框
+
+成立悬挂的路径（全部实测）：
+
+| 路径 | 触发方式 | 实测 |
+|---|---|---|
+| A2 feasibility 不可行 | apply → `_generate_plan` 命中 `if self._feasibility ... not ok: return` | flag=True 悬挂 ✓ |
+| A3 目标区间非法 | pending 把区间改空 → apply → `end <= start: return` | flag=True 悬挂 ✓ |
+| A4 未勾选文件 | apply → `not selected: return` | flag=True 悬挂 ✓ |
+| A5 规划返回非 MovePlan | `_on_plan_ready` 的 `not isinstance(plan, MovePlan): return` 不清标志 | flag=True 悬挂 ✓ |
+| A1 卷/位图未就绪 | `_start_move` 在 apply 分支**之前**就 return | flag=False，**不可达，无风险** |
+
+**后果实测（B1）**：悬挂后用户把条件改好、只是正常"生成计划"，`_on_plan_ready` 末尾的 resume 块被触发 → **DangerConfirmDialog 意外实例化 1 次**（用户没请求执行却弹执行确认框）。因确认框仍是人工闸门，不会无确认写盘，故定 P2 而非 P1；但"点生成计划却弹出执行确认"违背最小意外。
+
+**修法建议**：把 resume 意图绑定到**本次规划**而不是窗口全局状态 ——
+`_generate_plan` 里 `worker.resume_after = self._resume_execute_after_plan; self._resume_execute_after_plan = False`，`_on_plan_ready/_on_plan_failed` 从 `self.sender()`（或传入的 worker）读取该属性。这样任何 early-return 都不可能留下悬挂（标志只活在 worker 上）。
+
+### 9.3 缺陷 2（P1，既存但被本修复放大）：规划中按 Esc → UI 永久 busy
+
+`PlanWorker.run` 在 `self._cancel` 为真时 **`return`**，既不 emit `completed` 也不 emit `failed`；而 `_plan_worker` **只连了 completed/failed，没有 finished 兜底**（`main_window.py` 中 `worker.finished` 只给 FeasibilityWorker 接过）。实测 F1：`request_cancel()` 后 `start()`+`wait()`，两个信号 **events=[]**。
+
+后果：`_set_busy(False)` 永不执行、`_plan_worker` 永不置 None → 进度条一直 indeterminate、按钮全禁用，用户只能关窗口；同时 `_resume_execute_after_plan` 保持 True（下次任何规划成功仍会后置误弹框）。
+
+这是 800f4a4 之前就存在的缺陷，但本修复把"apply → 自动开始规划"变成高频路径：用户点了「先应用再执行」看到"正在重新生成计划…"后按 Esc 想反悔，就会撞上。
+
+**修法建议**：`_plan_worker.finished.connect(self._on_plan_worker_finished)`，在槽里统一 `_set_busy(False)` + `_plan_worker=None` + 清 resume 标志（若本次规划没有产出结果）。同类问题也存在于 ScanWorker/IndexWorker 的取消路径，建议一并核。
+
+### 9.4 其他确认（无问题）
+
+- 接续路径仍完整走 admin 检查、plan 非空、跨卷拦截、DangerConfirmDialog —— 未跳过任何人工闸门。
+- 两处静默 return 补提示（卷/位图未就绪、缺计划）文案准确（钉子⑥）。
+- `proceed` 分支不置标志（钉子④）；`_on_plan_failed` 清标志（钉子⑤ + 代码）。
+- 切分块流式引擎：规划期间 `io_panel.set_busy(True)` 禁用，切不了；**但**若已悬挂且用户随后切到 stream 引擎，`_on_plan_ready` 的 resume 会调 `_start_move()`（LBA 路径）而不是流式路径——属悬挂的次生后果，修好 9.2 即消失。
+- 连续两次 apply：`_has_pending` 已 False，第二次点执行走正常 `_start_move`，不重复置标志，无重复执行风险。
+
+### 9.5 放行判断
+
+**有条件通过**：9.2（P2，标志悬挂 + 意外弹框）建议本次修掉（改动小）；9.3（P1，Esc 卡死）建议同批修 `finished` 兜底——它虽是既存缺陷，但会让"先应用再执行"这条刚修好的链路变成死路。两者修完我做 5 分钟定向复验（`d5` 全绿 + testflow）。
+
+---
+
+## 10. d2be150 复核（9.2 悬挂 / 9.3 取消卡死 两条修复）
+
+取证：`qa_work/d5_resume_flag_check.py`（**19 项断言全过**，`d5_output.txt`）、`tests/test_ui_execute_flow.py`（**13/13**）、testflow **322 passed / 0 failed**（独占跑，40.2s）。
+
+### 10.1 修法审查（读 diff）
+
+**① 意图悬挂（P2）→ 改为「意图随本次规划生灭」**
+- `_generate_plan` **入口第一件事**摘意图（`resume_after = self._resume_execute_after_plan; self._resume_execute_after_plan = False`），随后挂到 `worker.resume_after` → 4 处 early-return 都不可能在窗口上留下悬挂。
+- `_take_resume_intent(worker=None)`：优先读 `sender()`（或显式 worker），**消费即清**（worker 与窗口标志都清），回落窗口标志覆盖"刚被 apply 置上、还没交给 worker"的瞬时值。
+- `_on_plan_ready` **首行**即消费意图（在 `not isinstance(plan, MovePlan)` 那处 return 之前）——这正是 9.2 里我列的第 4 条路径。
+- early-return 统一走 `_blocked()`：若本次原本要自动接续，提示追加「（配置已应用，自动执行已取消，请调整后手动点击开始迁移）」+ warn 日志 → 不再"静默取消"。
+
+**② 取消卡死（P1）→ finished 兜底**
+- `worker.finished.connect(self._on_plan_worker_finished)`。
+- 兜底槽有两道 no-op 守卫：`worker is not self._plan_worker → return`（旧任务已被替换）、`pending is None → return`（completed/failed 已收尾）。只在"线程结束但无终态信号"时接管：清 `_plan_worker`、作废意图（含 worker 上的）、reset 进度、退忙碌、notice、`_sync_buttons()`。
+- `scanner.py` 把"取消后 completed/failed 都不发、调用方必须用 finished 兜底"写成契约注释 —— 这个雷点显式化是有价值的（我 9.3 提过同模式的 ScanWorker/IndexWorker，工程师核后确认它们都会 emit 终态，只有 PlanWorker 是裸 return）。
+
+### 10.2 实测（19/19 全过）
+
+| 组 | 断言 | 修复前 | 修复后 |
+|---|---|---|---|
+| A2 | feasibility 不可行早退 | flag=True（悬挂） | **False** ✓ |
+| A3 | 目标区间为空早退 | flag=True | **False** ✓ |
+| A4 | 未勾选文件早退 | flag=True | **False** ✓ |
+| A5 | `_on_plan_ready` 收到非 MovePlan | flag=True | **False** ✓ |
+| A1 | 卷/位图未就绪 | 不可达（无风险） | 同 |
+| B1 | 悬挂后普通规划完成 | DangerConfirmDialog **1 次**（意外） | **0 次** ✓ |
+| C1–C3 | 正常接续 | busy=False / plan_worker=None / 确认框 1 次 | 同（未回归）✓ |
+| D1 | 连续三次 `_on_plan_ready` | 只接续 1 次 | 同 ✓ |
+| E1–E3 | 反向验证旧写法 | 钉子①⑥变红、②绿 | 同 ✓ |
+| F1 | worker 层取消不发终态信号 | events=[] | 同（契约，UI 侧兜底）✓ |
+| G1–G5 | **UI 层取消不卡死**（真实 PlanWorker：start→cancel→wait→processEvents） | 永久 busy | `_plan_worker=None`、`_busy=False`、意图两处均 False、notice="规划已取消，可调整参数后重新生成计划" ✓ |
+
+### 10.3 测试稳定性问题（P3，非产品缺陷）
+
+`tests/test_blockers_perf.py::test_find_blockers_scale_is_sublinear` 的 600ms 预算是**紧贴实测值**的：我单跑三次为 **501.2 / 584.1 / 506.1 ms**（余量 3%~17%）。我在并发跑其他验证时它确实红过一次（testflow 报 `tests-failed · 1 failed / 321 passed`）；独占重跑即 PASS。建议把预算提到 **1200ms**，或把基准规模减半并改相对比较——否则 CI 会持续偶发红，且难以与真实性能回归区分。
+
+另：本轮第一次 testflow 报 `INVALID (source-changed)`，原因是验证期间仓库仍有写动作（06:28–06:29 的文件 mtime）；随后 `git status` 干净（`tests/test_ui_execute_flow.py` 与 `CHANGELOG.md` 的 `M` 经 `git diff HEAD` 确认为空 diff，仅行尾/stat 抖动），独占重跑得到 322/0。
+
+### 10.4 放行结论
+
+**d2be150 通过。** 9.2（悬挂 + 意外弹框）与 9.3（取消卡死）两条均已闭环，且都有实测与钉子守住；接续仍走 DangerConfirmDialog、无二次执行、无回归。
+
+**「先应用再执行」链路至此完整可用。1.0.0D 系列（12 个本地 commit）QA 侧无未决阻断项**，仅剩 10.3 的测试预算建议（P3）。
