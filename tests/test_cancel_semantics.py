@@ -119,41 +119,76 @@ def test_mft_outcome_cancel_is_not_failure() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# ①c 调用点钉子：`scan_volume_mft` 的取消分支**必须真的调用** mark_cancelled
+# ①c 调用点钉子：`scan_volume_mft` 的**每一处**取消分支都必须真的接线
 #     动机（QA 提的第 5 次同类漏洞，上移一层）：①b 钉的是函数本身，如果调用点
 #     被删掉（`break` 留着），函数钉子仍全绿而取消语义又丢了。事件型分支的
 #     "有没有接线"只能靠调用点钉子 —— 用 AST 精确锚定，不用设备、成本极低。
+#
+#     钉「接线 + 顺序」，不钉「分支数量」（QA 6 组变异审计后重写，`3d2aa27` 那版
+#     有两个假绿 + 一个假红）：
+#       * 用**直接子语句**而不是 `ast.walk` —— 嵌套结构一律不算接线，于是
+#         `if False:` / `while False:` 包住的调用（行为上不可达）会被判红；
+#       * 比较**下标顺序** —— `mark_cancelled` 排在 `break` 之后（死代码）判红；
+#       * 不要求分支唯一 —— 将来在采样 / 路径重建阶段再加一个**正确**的取消分支
+#         不该红，要防的是「没接线」而不是「只许一个分支」；
+#       * 别名重写（`probe = should_cancel`）会红 —— 这是**有意的**：AST 认名字，
+#         跟随不了别名；失败方向是「响」而非「哑」，符合我们的取舍（按误判方向的
+#         危害选择失败方向）。**改结构时必须同步改这枚钉子，别把它删掉。**
 # --------------------------------------------------------------------------- #
+def _cancel_branches(tree: ast.AST) -> list:
+    """所有「test 里出现 `should_cancel`」的 ``if`` 节点（不限制数量）。"""
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(sub, ast.Name) and sub.id == "should_cancel"
+            for sub in ast.walk(node.test)
+        )
+    ]
+
+
+def _first_index(body: list, predicate) -> int | None:
+    """返回 ``body`` 里第一个满足 ``predicate`` 的**直接子语句**下标。"""
+    return next((index for index, stmt in enumerate(body) if predicate(stmt)), None)
+
+
+def _is_mark_cancelled_call(stmt: ast.AST) -> bool:
+    """该**直接子语句**是不是一次 ``mark_cancelled(...)`` 调用。"""
+    return (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        and getattr(stmt.value.func, "id", "") == "mark_cancelled"
+    )
+
+
 def test_scan_volume_mft_cancel_branch_calls_mark_cancelled() -> None:
     source = textwrap.dedent(inspect.getsource(mft_reader.scan_volume_mft))
     tree = ast.parse(source)
 
-    hits = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.If):
-            continue
-        guards_should_cancel = any(
-            isinstance(sub, ast.Name) and sub.id == "should_cancel"
-            for sub in ast.walk(node.test)
-        )
-        if not guards_should_cancel:
-            continue
-        calls_mark = any(
-            isinstance(sub, ast.Call)
-            and isinstance(sub.func, ast.Name)
-            and sub.func.id == "mark_cancelled"
-            for stmt in node.body
-            for sub in ast.walk(stmt)
-        )
-        breaks = any(isinstance(stmt, ast.Break) for stmt in node.body)
-        if calls_mark and breaks:
-            hits.append(node)
-
-    assert len(hits) == 1, (
-        "`scan_volume_mft` 的取消分支（`if should_cancel(...)`）必须同时"
-        "「调用 mark_cancelled(...)」和「break」——只 break 不置位会让 UI 把"
-        f"用户取消当成扫描完成。实际命中 {len(hits)} 处。"
+    branches = _cancel_branches(tree)
+    assert branches, (
+        "`scan_volume_mft` 里找不到任何以 `should_cancel` 为守卫的取消分支"
+        "——取消能力被整体删掉，或守卫改名/被抽走（AST 认名字，跟不了别名，"
+        "见本钉子 docstring）"
     )
+
+    for node in branches:
+        call_at = _first_index(node.body, _is_mark_cancelled_call)
+        break_at = _first_index(node.body, lambda stmt: isinstance(stmt, ast.Break))
+        line = getattr(node, "lineno", "?")
+        assert call_at is not None, (
+            f"取消分支（第 {line} 行起）没有**直接**调用 `mark_cancelled(...)`："
+            "只 break 不置位会让 UI 把用户取消当成扫描完成；"
+            "注意包在 `if False:` / 嵌套块里的调用不算接线（行为上不可达）"
+        )
+        assert break_at is not None, (
+            f"取消分支（第 {line} 行起）没有 `break` —— 取消后不会真的中断解析"
+        )
+        assert call_at < break_at, (
+            f"取消分支（第 {line} 行起）里 `mark_cancelled(...)` 排在 `break` 之后，"
+            "是死代码（永远执行不到）"
+        )
 
 
 # --------------------------------------------------------------------------- #
