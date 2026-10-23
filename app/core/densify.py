@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from app.core.models import (
@@ -306,3 +307,77 @@ def plan_size_zones(
         placed.update(got)
         unplaced.extend(entry for entry, _reason in miss)
     return placed, unplaced, zones
+
+
+# ---------------------------------------------------------------- 卷前半大文件扫描
+
+
+@dataclass(frozen=True)
+class FrontHalfFile:
+    """一个在卷前半有占用的大文件——搬到末端即可腾直前部连续空间的候选。"""
+
+    entry: FileEntry
+    front_clusters: int   # 位于前半 [0, boundary) 的簇数
+    back_clusters: int    # 位于后半的簇数
+
+    @property
+    def total_clusters(self) -> int:
+        return self.front_clusters + self.back_clusters
+
+    @property
+    def mostly_front(self) -> bool:
+        """是否主要位于前半（≥ 一半簇在前半）。"""
+        return self.front_clusters * 2 >= self.total_clusters
+
+
+@dataclass
+class FrontHalfReport:
+    """卷前半大文件扫描结果。"""
+
+    boundary_lcn: int                 # 前半 / 后半分界 = total // 2
+    total_clusters: int
+    files: List[FrontHalfFile]        # 前半有占用的大文件，按 front_clusters 降序
+    front_occupied: int               # 这些文件占用的前半簇总数
+    movable_front: int                # 其中可移动文件的前半簇数
+
+
+def front_half_report(
+    entries: Sequence[FileEntry],
+    total_clusters: int,
+    *,
+    min_clusters: int = 0,
+) -> FrontHalfReport:
+    """卷前半大文件扫描：把扫描到的大文件按「前半卷」归类。
+
+    前半 = ``[0, total_clusters // 2)``。一个文件只要在前半有占用簇即入选
+    （它正是「应搬到末端以腾空前部连续空间」的候选）；跨中线的文件按前半占比
+    计入 ``front_clusters``。``min_clusters`` 用于过滤小文件。纯函数，可离线单测。
+    """
+    boundary = max(0, int(total_clusters) // 2)
+    files: List[FrontHalfFile] = []
+    front_occupied = 0
+    movable_front = 0
+    for entry in entries:
+        if entry.allocated_clusters <= 0 or entry.allocated_clusters < min_clusters:
+            continue
+        front = 0
+        for extent in entry.allocated_extents:
+            s = max(int(extent.lcn), 0)
+            e = min(int(extent.lcn_end), boundary)
+            if e > s:
+                front += e - s
+        if front <= 0:
+            continue
+        back = entry.allocated_clusters - front
+        files.append(FrontHalfFile(entry=entry, front_clusters=front, back_clusters=back))
+        front_occupied += front
+        if entry.movable:
+            movable_front += front
+    files.sort(key=lambda f: (-f.front_clusters, f.entry.path))
+    return FrontHalfReport(
+        boundary_lcn=boundary,
+        total_clusters=int(total_clusters),
+        files=files,
+        front_occupied=front_occupied,
+        movable_front=movable_front,
+    )

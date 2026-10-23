@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.core.densify import (  # noqa: E402
     auto_fill_tail,
     compact_range,
+    front_half_report,
     plan_size_zones,
 )
 from app.core.models import Extent, FileEntry  # noqa: E402
@@ -222,6 +223,45 @@ def test_plan_size_zones_single_class_is_plain_pack() -> None:
     assert zones == [(0, 100)]
     assert placed == {"R:\\a": 0, "R:\\b": 30}
     assert not unplaced
+
+
+# --------------------------------------------------------------------------- #
+# 卷前半大文件扫描
+# --------------------------------------------------------------------------- #
+def test_front_half_report_classifies() -> None:
+    """按前半/后半归类；跨中线文件只把前半占比计入。"""
+    a = _entry("R:\\a.bin", [(100, 40)])      # 全在前半 front=40
+    b = _entry("R:\\b.bin", [(600, 30)])      # 全在后半 → 不入选
+    c = _entry("R:\\c.bin", [(490, 40)])      # 跨中线：前 10 / 后 30
+    report = front_half_report([a, b, c], 1000)
+    assert report.boundary_lcn == 500
+    assert [f.entry.path for f in report.files] == ["R:\\a.bin", "R:\\c.bin"]  # front 降序
+    assert report.files[0].mostly_front is True
+    assert report.files[1].mostly_front is False   # 跨中线、主要在后半
+    assert report.front_occupied == 50             # 40 + 10
+    assert report.movable_front == 50
+
+
+def test_front_half_report_min_clusters_filter() -> None:
+    big = _entry("R:\\big.bin", [(100, 50)])
+    small = _entry("R:\\small.bin", [(200, 3)])
+    report = front_half_report([big, small], 1000, min_clusters=10)
+    assert [f.entry.path for f in report.files] == ["R:\\big.bin"]
+
+
+def test_front_half_report_movable_split() -> None:
+    mv = _entry("R:\\mv.bin", [(100, 40)])
+    locked = _entry("R:\\locked.bin", [(300, 40)], movable=False, reason="被独占")
+    report = front_half_report([mv, locked], 1000)
+    assert report.front_occupied == 80
+    assert report.movable_front == 40   # 只计可移动文件的前半簇
+
+
+def test_front_half_report_empty() -> None:
+    only_back = _entry("R:\\back.bin", [(600, 30)])
+    report = front_half_report([only_back], 1000)
+    assert report.files == []
+    assert report.front_occupied == 0
 
 
 if __name__ == "__main__":

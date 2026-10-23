@@ -64,6 +64,7 @@
 - **策略③ 按文件大小分区段**（`densify.plan_size_zones`）：把区间按尺寸类切成连续区段（需求优先、从大到小），同尺寸的文件聚在同一段里密实排布；区间超发时优先保住大文件。
 - 三者为**纯规划函数**（新模块 `app/core/densify.py`），只算目标布局，搬运顺序 / 中转交由既有 `scheduler`；新增 `tests/test_densify.py`（11 例）。
 - **用户态分块流式搬迁模式**（新模块 `app/core/block_stream.py` + `app/win32/file_io.py`）：以 **65536 簇为 block**，可调缓存按 block 的**倍数**积攒；双阶段流水线（`load`：源→暂存 / `store`：暂存→目的）重叠推进，一个分块走了立马顶上，缓解 HDD 半双工，数据经文件系统落地、源簇读出即被重占用。两种**缓存模式**经 `file_io.copy_stream(mode=..., cache_dir=...)` 统一入口：`memory`（内存分配缓存，块在 RAM 中转）与 `disk`（设定缓存目录的硬盘缓存，块落暂存盘再读出）。新增 `tests/test_block_stream.py`（12 例）+ `tests/test_file_io.py`（4 例，对临时文件真实读写）。
+- **卷前半大文件扫描**（`densify.front_half_report`）：把扫描到的大文件按前半卷 `[0, total//2)` 归类，挑出占前部、应搬末端以腾出连续空间的候选（跨中线按前半占比计），`min_clusters` 过滤小文件，统计 `front_occupied` / `movable_front`。`tests/test_densify.py` 增 4 例。
 - README 增加「代码由 AI 助手生成、维护者不具备审查能力」的来源声明。
 - 本版**仅改源码 + 离线测试**，未重新打包（`dist/` EXE 仍为 1.0.0B，待收工再打包）。
 - 版本号 `1.0.0B → 1.0.0C`。
