@@ -573,9 +573,10 @@ class MainWindow(QMainWindow):
             return
         mode = self._io_panel.stream_cache_mode()
         cache_dir = self._io_panel.stream_cache_dir() or None
+        # 1.0.0D 方案 D：disk 模式暂存目录可为空 —— 默认暂存在源文件所在卷根
+        # （.lba-tmp-scratch，卷根不可写回落 %TEMP%），由 BlockStreamWorker 解析。
         if mode == "disk" and not cache_dir:
-            self._set_notice("硬盘缓存需设定暂存目录", "warning")
-            return
+            self._log.info("硬盘缓存未指定暂存目录：默认使用源文件所在卷根的 .lba-tmp-scratch")
 
         info = self._volume
         bpc = (info.bytes_per_cluster if info else 4096) or 4096

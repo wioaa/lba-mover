@@ -57,6 +57,27 @@ MAX_INDEX_EXTENTS = 4_000_000
 #: 连续失败多少段视为致命错误（设计 §3.7）
 MAX_CONSECUTIVE_FAILURES = 8
 
+
+def force_fsync_journal(journal) -> None:
+    """把执行流水**强制刷盘**（1.0.0D 方案 A）。
+
+    ``append()`` 的 fsync 是批量的（断电最多丢 32 行/2 秒），因此凡是在
+    「清单完整性」成为硬要求的时点都必须显式刷盘：
+
+    * 执行 worker 结束（正常 / 取消 / 异常失败）——之后用户可能立刻回滚；
+    * **任何回滚流程启动前** —— 回滚清单必须完整。
+
+    ``journal`` 可能为 ``None``（未启用流水）或测试桩，缺方法则跳过。
+    """
+    if journal is None:
+        return
+    force = getattr(journal, "force_fsync", None)
+    if callable(force):
+        try:
+            force()
+        except OSError:
+            pass
+
 #: 执行期局部核验的余量（簇）。每段执行前只重读
 #: ``[min(区间) - margin, max(区间) + margin)`` 这一片位图，
 #: 4096 簇 ≈ 16 MB（4K 簇），足够覆盖对齐误差与相邻簇的边界效应。
@@ -1340,6 +1361,10 @@ class MoveWorker(QThread):
                 )
             )
 
+        # 1.0.0D 方案 A：流水批量 fsync —— 结束（含取消/异常）时强制刷盘，
+        # 保证用户随后看到的回滚清单是完整的。
+        force_fsync_journal(self._journal)
+
         self.completed.emit(outcome)
 
 
@@ -1392,6 +1417,10 @@ class RollbackWorker(QThread):
         if not self._segments:
             self.failed.emit("没有可回滚的段（本次会话没有成功写入的流水）")
             return
+
+        # ★ 1.0.0D 方案 A：回滚流程启动前必须把流水强制刷盘 ——
+        # 回滚清单的完整性是硬要求（append 的批量 fsync 可能还压着尾部几行）。
+        force_fsync_journal(self._journal)
 
         # ---- 1) 回滚前重读位图，构造新鲜守卫 ----
         snapshot = BitmapSnapshot()
@@ -1488,6 +1517,9 @@ class RollbackWorker(QThread):
         finally:
             volume_handle.close()
 
+        # 1.0.0D 方案 A：回滚流水同样批量 fsync，结束时强制刷盘
+        force_fsync_journal(self._journal)
+
         self.completed.emit(outcome)
 
 
@@ -1574,6 +1606,25 @@ class BlockStreamWorker(QThread):
         moved = failed = 0
         moved_clusters = 0
         done = 0
+
+        # 1.0.0D 方案 D：disk 缓存未指定目录 → 默认暂存在**首文件所在卷根**
+        # （同卷，避免暂存在另一块盘上来回搬）；目录由本 worker 创建并在结束时
+        # 清理（卷根不可写时 file_io 会回落 %TEMP%）。
+        scratch_dir = self._cache_dir
+        owned_scratch = False
+        if self._mode == "disk" and not scratch_dir and self._entries:
+            first = next(
+                (
+                    entry.path
+                    for entry in self._entries
+                    if entry.movable and entry.allocated_clusters > 0
+                ),
+                None,
+            )
+            if first:
+                scratch_dir = file_io.default_scratch_dir(first)
+                owned_scratch = True
+
         for entry in self._entries:
             if self._cancel:
                 break
@@ -1592,7 +1643,7 @@ class BlockStreamWorker(QThread):
                 written, nblocks = file_io.copy_stream(
                     src, tmp,
                     mode=self._mode,
-                    cache_dir=self._cache_dir,
+                    cache_dir=scratch_dir,
                     buffer_blocks=self._buffer_blocks,
                     bytes_per_cluster=self._bpc,
                     block_clusters=self._block_clusters,
@@ -1614,6 +1665,12 @@ class BlockStreamWorker(QThread):
                     pass
                 failed += 1
                 self.file_result.emit(entry.path, False, f"{type(exc).__name__}: {exc}")
+        # 1.0.0D 方案 D：默认暂存目录用完即清（只删空目录；有残留文件时静默保留）
+        if owned_scratch and scratch_dir:
+            try:
+                os.rmdir(scratch_dir)
+            except OSError:
+                pass
         self.completed.emit(
             {"moved": moved, "failed": failed, "clusters": moved_clusters}
         )

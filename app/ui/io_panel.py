@@ -194,7 +194,9 @@ class IoPanel(QWidget):
         scratch_row = QHBoxLayout()
         scratch_row.setSpacing(8)
         self._stream_cache_dir = QLineEdit(self._stream_box)
-        self._stream_cache_dir.setPlaceholderText("硬盘缓存的暂存目录（内存缓存可留空）")
+        self._stream_cache_dir.setPlaceholderText(
+            "硬盘缓存的暂存目录（留空 = 默认暂存在源文件所在卷根）"
+        )
         self._stream_cache_dir.setEnabled(False)
         scratch_row.addWidget(self._stream_cache_dir, 1)
         scratch_browse = QPushButton("浏览…", self._stream_box)
@@ -203,6 +205,10 @@ class IoPanel(QWidget):
         scratch_browse.clicked.connect(self._browse_stream_cache_dir)
         scratch_row.addWidget(scratch_browse, 0)
         stream.addLayout(scratch_row)
+        # 1.0.0D 方案 D：写放大提示（照实说，不美化）
+        stream.addWidget(cards.label(
+            "暂存盘会多一倍写入，内存充足时建议内存缓存。", "caption", self._stream_box, True,
+        ))
 
         buf_row = QHBoxLayout()
         buf_row.setSpacing(8)

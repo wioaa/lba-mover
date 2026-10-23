@@ -1,8 +1,17 @@
 """操作流水（append-only JSONL）+ 逆序回滚段构造。
 
 为什么需要它：``FSCTL_MOVE_FILE`` **没有内核级事务**，逐段提交。一旦中途崩溃，
-必须能回答「哪些段真的搬了」。因此每段成功/失败都写一行并立即 ``flush()``，
-断电最多丢最后一行。
+必须能回答「哪些段真的搬了」。因此每段成功/失败都写一行并立即 ``flush()``
+（OS 页缓存接住，进程崩溃不丢行）。
+
+**fsync 批量化（1.0.0D 方案 A）**：``os.fsync`` 每行一次会把执行期变成
+「搬一段 → 等一次刷盘」，HDD 上这是可测的吞吐损失。改为批量：攒满
+:data:`JOURNAL_FSYNC_EVERY` 行（默认 32）或距上次 fsync 超过
+:data:`JOURNAL_FSYNC_SECONDS` 秒（默认 2.0）才真正 ``os.fsync``。
+**语义**：断电最多丢「页缓存里未 fsync 的尾部」，即最多 N 段日志记录
+（默认 32）——**数据本身不受影响**（FSCTL 已完成），受影响的是回滚清单的
+完整性。因此凡是要**启动回滚**、或 worker 结束/异常时，必须先
+:meth:`MoveJournal.force_fsync` 把清单钉在盘上。
 
 回滚不做自动执行（见设计 §3.7）：本模块只负责产出「逆序 + src↔dst 互换」的
 段列表，由 UI 在用户确认后交给 mover 反向搬运。
@@ -13,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +32,14 @@ from app.core.models import MoveSegment
 
 RESULT_OK = "ok"
 RESULT_FAIL = "fail"
+
+#: 批量 fsync：攒满多少行才真正 ``os.fsync`` 一次（模块级常量，测试可覆盖）。
+#: 断电窗口 = 未 fsync 的尾部行数；数据不受影响，影响的是回滚清单完整性。
+JOURNAL_FSYNC_EVERY = 32
+
+#: 批量 fsync 的时间上限（秒）：即使没攒满行数，超过该时长也刷一次，
+#: 把「长时间低频写入」场景的断电窗口限制住。
+JOURNAL_FSYNC_SECONDS = 2.0
 
 
 @dataclass(slots=True)
@@ -80,6 +98,9 @@ class MoveJournal:
         self._handle = None
         self._closed = False
         self._count = 0
+        # ---- 1.0.0D 方案 A：批量 fsync 状态 ---- #
+        self._since_fsync = 0
+        self._last_fsync = time.monotonic()
         if self.path.parent and not self.path.parent.exists():
             self.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -90,7 +111,15 @@ class MoveJournal:
         return self._handle
 
     def append(self, entry: JournalEntry) -> None:
-        """追加一行并立即 flush（断电最多丢一行）。"""
+        """追加一行并立即 ``flush()``；``os.fsync`` **批量**执行（1.0.0D 方案 A）。
+
+        * 每行 ``write + flush``：OS 页缓存接住，**进程崩溃不丢行**；
+        * ``fsync`` 攒批：``_since_fsync >= JOURNAL_FSYNC_EVERY`` 或距上次
+          fsync ≥ ``JOURNAL_FSYNC_SECONDS`` 才真正刷盘；
+        * **语义**：断电最多丢 N 段日志记录（默认 32）——数据本身不受影响
+          （FSCTL 已完成），影响的是**回滚清单完整性**；凡要启动回滚前必须
+          先调用 :meth:`force_fsync`。
+        """
         if self._closed:
             raise RuntimeError("流水已关闭，无法继续写入")
         if not entry.ts:
@@ -98,12 +127,32 @@ class MoveJournal:
         handle = self._ensure_open()
         handle.write(entry.to_json() + "\n")
         handle.flush()
+        self._since_fsync += 1
+        if (
+            self._since_fsync >= JOURNAL_FSYNC_EVERY
+            or (time.monotonic() - self._last_fsync) >= JOURNAL_FSYNC_SECONDS
+        ):
+            self.force_fsync()
+        self._count += 1
+
+    def force_fsync(self) -> None:
+        """无条件 ``os.fsync`` 并重置批量计数/计时。
+
+        ★ **回滚前强制**：回滚清单的完整性是硬要求 —— 回滚流程启动前、执行
+        worker 正常结束或异常失败时都必须调用，把「页缓存里还没落盘的尾部」
+        钉到盘上，保证断电后 ``load()`` 能读到完整清单。
+        """
+        if self._handle is None or self._handle.closed:
+            self._since_fsync = 0
+            self._last_fsync = time.monotonic()
+            return
         try:
-            os.fsync(handle.fileno())
+            os.fsync(self._handle.fileno())
         except OSError:
             # 某些文件系统 / 设备不支持 fsync，flush 已经足够
             pass
-        self._count += 1
+        self._since_fsync = 0
+        self._last_fsync = time.monotonic()
 
     def record(
         self,
@@ -134,7 +183,12 @@ class MoveJournal:
         return entry
 
     def close(self) -> None:
-        """关闭文件句柄（幂等）。"""
+        """关闭文件句柄（幂等）；关闭前强制 fsync（清单完整性兜底）。"""
+        if not self._closed:
+            try:
+                self.force_fsync()
+            except Exception:  # noqa: BLE001 - 关闭路径绝不抛
+                pass
         self._closed = True
         if self._handle is not None and not self._handle.closed:
             self._handle.close()

@@ -1,4 +1,8 @@
-"""T02 验收：操作流水 ``app/core/journal.py``（设计文档 §6 T02 验收 4）。"""
+"""T02 验收：操作流水 ``app/core/journal.py``（设计文档 §6 T02 验收 4）。
+
+1.0.0D 方案 A 增补：``append()`` 的 fsync 批量化（攒满 32 行或超 2 秒才刷），
+``force_fsync()`` 强制刷盘。fsync 计数用**假 os 模块**计数（不打真盘）。
+"""
 
 from __future__ import annotations
 
@@ -6,12 +10,15 @@ import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.core import journal as journal_mod  # noqa: E402
 from app.core.journal import (  # noqa: E402
+    JOURNAL_FSYNC_EVERY,
+    JOURNAL_FSYNC_SECONDS,
     RESULT_FAIL,
     RESULT_OK,
     JournalEntry,
@@ -19,6 +26,35 @@ from app.core.journal import (  # noqa: E402
     default_journal_path,
     group_by_path,
 )
+
+
+class _FakeOS:
+    """替身 os 模块：计数 fsync 调用，其余透传给真实 os。"""
+
+    def __init__(self) -> None:
+        self._real = os
+        self.fsync_calls = 0
+
+    def fsync(self, fileno) -> None:
+        self.fsync_calls += 1
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _FsyncSandbox:
+    """把 ``journal_mod.os`` 换成计数替身，用完恢复（with 语法）。"""
+
+    def __init__(self) -> None:
+        self.fake = _FakeOS()
+        self._original = journal_mod.os
+
+    def __enter__(self) -> "_FsyncSandbox":
+        journal_mod.os = self.fake
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        journal_mod.os = self._original
 
 
 def _tmp_path(name: str = "journal.jsonl") -> Path:
@@ -179,6 +215,79 @@ def test_entry_json_roundtrip() -> None:
     extra = JournalEntry.from_dict({"path": "x", "unknown": 1})
     assert extra.path == "x"
     assert journal_mod.RESULT_OK == "ok"
+
+
+# --------------------------------------------------------------------------- #
+# 1.0.0D 方案 A：fsync 批量化 + force_fsync
+# --------------------------------------------------------------------------- #
+def test_fsync_constants_are_module_level() -> None:
+    """常量在模块级且语义正确（测试覆盖入口）。"""
+    assert JOURNAL_FSYNC_EVERY == 32
+    assert JOURNAL_FSYNC_SECONDS == 2.0
+
+
+def test_append_batches_fsync() -> None:
+    """写 1 行 fsync 0 次；攒满 32 行恰好 1 次；隔 T 秒后第 33 行触发第 2 次。"""
+    path = _tmp_path("batch.jsonl")
+    with _FsyncSandbox() as sandbox:
+        journal = MoveJournal(path)
+
+        def write_line(index: int) -> None:
+            journal.record(
+                phase="place", path=f"D:\\f{index}.bin", vcn=0,
+                src_lcn=index, dst_lcn=1000 + index, clusters=1, ok=True,
+            )
+
+        write_line(0)
+        assert sandbox.fake.fsync_calls == 0, "写 1 行不应触发 fsync（页缓存接住）"
+        for index in range(1, JOURNAL_FSYNC_EVERY):
+            write_line(index)
+        assert sandbox.fake.fsync_calls == 1, (
+            f"攒满 {JOURNAL_FSYNC_EVERY} 行应恰好 fsync 1 次，实际 {sandbox.fake.fsync_calls}"
+        )
+        assert journal._since_fsync == 0
+
+        # 时间触发：把上次 fsync 时间拨回 3 秒前，下一行立即触发第 2 次
+        journal._last_fsync = time.monotonic() - (JOURNAL_FSYNC_SECONDS + 1.0)
+        write_line(999)
+        assert sandbox.fake.fsync_calls == 2, "超时后下一行应触发第 2 次 fsync"
+        journal.close()
+        # close 兜底 force_fsync（无条件 +1）
+        assert sandbox.fake.fsync_calls == 3
+    # 批量 fsync 不影响内容：32+1 行全部可读回
+    assert len(MoveJournal.load(path)) == JOURNAL_FSYNC_EVERY + 1
+
+
+def test_force_fsync_is_immediate() -> None:
+    """``force_fsync`` 无条件刷盘并重置计数/计时。"""
+    with _FsyncSandbox() as sandbox:
+        journal = MoveJournal(_tmp_path("force.jsonl"))
+        journal.record(phase="place", path="A", vcn=0, src_lcn=1, dst_lcn=2, clusters=1, ok=True)
+        assert sandbox.fake.fsync_calls == 0
+        journal.force_fsync()
+        assert sandbox.fake.fsync_calls == 1
+        assert journal._since_fsync == 0
+        # 重置后：即使没写满 32 行，只要超时也会再触发
+        journal._last_fsync = time.monotonic() - (JOURNAL_FSYNC_SECONDS + 1.0)
+        journal.record(phase="place", path="B", vcn=0, src_lcn=3, dst_lcn=4, clusters=1, ok=True)
+        assert sandbox.fake.fsync_calls == 2
+        # close 兜底 +1；未打开句柄后 force_fsync 是安全的空操作
+        journal.close()
+        assert sandbox.fake.fsync_calls == 3
+        journal.force_fsync()
+        assert sandbox.fake.fsync_calls == 3
+
+
+def test_append_still_flushes_every_line() -> None:
+    """批量 fsync 不改变 flush 语义：未 fsync 的行也必须立刻可读（进程崩溃不丢行）。"""
+    path = _tmp_path("flush.jsonl")
+    with _FsyncSandbox() as sandbox:
+        journal = MoveJournal(path)
+        for index in range(5):        # 远小于 32 → 一次 fsync 都不会发生
+            journal.record(phase="place", path="A", vcn=0, src_lcn=index,
+                           dst_lcn=100 + index, clusters=1, ok=True)
+        assert sandbox.fake.fsync_calls == 0
+    assert len(MoveJournal.load(path)) == 5, "没有 fsync 也要能立刻读到（flush 兜底）"
 
 
 if __name__ == "__main__":

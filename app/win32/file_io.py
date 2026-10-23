@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import ctypes
 import os
-from typing import Optional, Tuple
+import tempfile
+from typing import List, Optional, Tuple
 
 from app.core.block_stream import (
     BLOCK_CLUSTERS,
@@ -134,6 +135,17 @@ def copy_block(src: int, dst: int, offset: int, length: int) -> int:
     return write_at(dst, offset, data)
 
 
+def _contiguous_runs(indices) -> "List[List[int]]":
+    """把升序的块下标序列切成连续段（``[2,3,4,7]`` → ``[[2,3,4],[7]]``）。"""
+    runs: List[List[int]] = []
+    for index in indices:
+        if runs and index == runs[-1][-1] + 1:
+            runs[-1].append(index)
+        else:
+            runs.append([index])
+    return runs
+
+
 def staged_copy(
     src_path: str,
     scratch_path: str,
@@ -149,6 +161,11 @@ def staged_copy(
     按 :func:`block_stream.stream_schedule` 推进；暂存盘同时驻留块数 ≤
     ``buffer_blocks``。``preallocate_dst=True`` 时先按总大小预填充一段（尽量连续）
     的簇再流式覆盖。返回 ``(写入目的字节数, 块数)``。
+
+    **暂存写合并（1.0.0D 方案 D）**：``load`` 不再逐 block 写暂存盘，而是攒满
+    ``buffer_blocks`` 个 block（或流末尾、或 store 需要）后，把**连续的块区间
+    拼成单次顺序写**落盘 —— 功能输出不变（dst 内容逐字节一致），显著降低
+    WriteFile syscall 次数与暂存盘碎片。
     """
     total = os.path.getsize(src_path)
     blocks = plan_blocks(total, bytes_per_cluster, block_clusters)
@@ -164,24 +181,48 @@ def staged_copy(
     src = open_read(src_path)
     scratch = open_readwrite(scratch_path)
     dst = open_write(dst_path, truncate=not preallocate_dst)
+
+    pending: dict = {}          # 块下标 -> bytes（攒批，待合并落盘）
+
+    def _flush_pending() -> None:
+        """把攒住的块按**连续段**合并写进暂存盘（一段一次 write_at）。"""
+        nonlocal pending
+        if not pending:
+            return
+        for run in _contiguous_runs(sorted(pending)):
+            data = b"".join(pending[index] for index in run)
+            offset = blocks[run[0]].offset
+            write_at(scratch, offset, data)
+        pending = {}
+
+    result: Tuple[int, int] = (0, 0)
     try:
         written = 0
         for kind, index in stream_schedule(len(blocks), buffer_blocks):
             block = blocks[index]
             if kind == "load":
-                write_at(scratch, block.offset, read_at(src, block.offset, block.length))
+                pending[index] = read_at(src, block.offset, block.length)
+                if len(pending) >= max(1, buffer_blocks):
+                    _flush_pending()
             else:  # store
+                if index in pending:
+                    # 保险：目标块还没落盘（时序异常时兜底），先强制落盘
+                    _flush_pending()
                 written += write_at(dst, block.offset, read_at(scratch, block.offset, block.length))
-        # 搬运完成：清理暂存盘（硬盘缓存用完即还）
-        try:
-            os.remove(scratch_path)
-        except OSError:
-            pass
-        return written, len(blocks)
+        _flush_pending()
+        result = (written, len(blocks))
     finally:
         close(src)
         close(scratch)
         close(dst)
+    # 搬运完成：清理暂存盘（硬盘缓存用完即还）。
+    # ★ 必须在句柄关闭**之后**删 —— Windows 上删除一个以 share=0 打开的文件
+    # 会失败（早期版本在句柄还开着时就删，暂存文件会残留在缓存目录里）。
+    try:
+        os.remove(scratch_path)
+    except OSError:
+        pass
+    return result
 
 
 def memory_copy(
@@ -233,6 +274,44 @@ CACHE_MODE_MEMORY = "memory"
 #: 设定缓存目录的硬盘缓存模式
 CACHE_MODE_DISK = "disk"
 
+#: disk 缓存未指定目录时的默认暂存目录名（位于**源文件所在卷根**下）
+DEFAULT_SCRATCH_DIRNAME = ".lba-tmp-scratch"
+
+
+def _volume_root_of(path: str) -> str:
+    """源路径所在卷根（如 ``R:\\``）；取不到返回空串（测试可通过替换本函数模拟）。"""
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    return drive + os.sep if drive else ""
+
+
+def default_scratch_dir(src_path: str) -> str:
+    """disk 缓存未指定目录时的默认暂存目录（1.0.0D 方案 D）。
+
+    取**源文件所在卷根**下的 ``.lba-tmp-scratch\\``（同卷暂存，避免暂存盘在
+    另一块盘上造成来回搬运）；卷根不可写时回落到 ``%TEMP%\\lba-scratch``。
+
+    Returns:
+        已创建、且探测过可写的目录路径（不抛异常）。
+    """
+    root = _volume_root_of(src_path)
+    if root:
+        candidate = os.path.join(root, DEFAULT_SCRATCH_DIRNAME)
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            probe = os.path.join(candidate, ".write-probe")
+            with open(probe, "w", encoding="utf-8") as handle:
+                handle.write("1")
+            os.remove(probe)
+            return candidate
+        except OSError:
+            pass  # 卷根不可写（只读介质 / 权限）→ 回落 TEMP
+    fallback = os.path.join(tempfile.gettempdir(), "lba-scratch")
+    try:
+        os.makedirs(fallback, exist_ok=True)
+    except OSError:
+        pass
+    return fallback
+
 
 def copy_stream(
     src_path: str,
@@ -248,8 +327,11 @@ def copy_stream(
     """统一入口：按缓存模式做分块流式搬运。
 
     * ``mode="memory"``：内存分配缓存——块在 RAM 中转，最快、占内存；
-    * ``mode="disk"``：设定缓存目录的硬盘缓存——块落 ``cache_dir`` 暂存盘再读出，
-      占磁盘、可缓冲更大（``buffer_blocks`` 仍按 65536 簇 block 的倍数可调）。
+    * ``mode="disk"``：硬盘缓存——块落 ``cache_dir`` 暂存盘再读出，占磁盘、
+      可缓冲更大（``buffer_blocks`` 仍按 65536 簇 block 的倍数可调）。
+      ``cache_dir`` 为空时**默认暂存在源文件所在卷根**的
+      ``.lba-tmp-scratch\\``（同卷；卷根不可写回落 ``%TEMP%``）——
+      注意暂存盘会多一倍写入，内存充足时建议内存缓存。
     * ``preallocate_dst=True``：先按总大小**预填充一段（尽量连续）的簇**，再流式覆盖
       （「预先填充 → 流式覆盖」，实现前端→后端整体直搬；落点 LBA 由文件系统在空闲区
       分配，预分配保证连续性）。
@@ -267,7 +349,7 @@ def copy_stream(
         )
     if mode == CACHE_MODE_DISK:
         if not cache_dir:
-            raise ValueError("disk 缓存模式需指定 cache_dir（缓存目录）")
+            cache_dir = default_scratch_dir(src_path)   # 1.0.0D 方案 D：同卷默认暂存
         os.makedirs(cache_dir, exist_ok=True)
         scratch = os.path.join(cache_dir, os.path.basename(dst_path) + ".stage")
         return staged_copy(
