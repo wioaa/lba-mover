@@ -570,6 +570,19 @@ class MainWindow(QMainWindow):
             "caption", inner, True,
         ), 0)
 
+        # ---- 搬迁范围 + 目标（自洽情境：选了什么、搬到哪）----
+        scope_card = cards.Card(inner, padding=14, spacing=8)
+        scope_card.body().addWidget(
+            cards.SectionHeader("搬迁范围与目标", "folder", "", scope_card)
+        )
+        self._stream_scope = cards.label("未选择文件", "body", scope_card, False)
+        scope_card.body().addWidget(self._stream_scope)
+        scope_card.body().addWidget(cards.label(
+            "目标：同卷内 前端 → 卷尾空闲区（先预填充一段连续簇，落点由文件系统在空闲区分配）",
+            "caption", scope_card, True,
+        ))
+        column.addWidget(scope_card, 0)
+
         # ---- 缓存 ----
         cache_card = cards.Card(inner, padding=14, spacing=8)
         cache_card.body().addWidget(cards.SectionHeader("缓存", "layers", "", cache_card))
@@ -621,6 +634,7 @@ class MainWindow(QMainWindow):
         scroll.setWidget(inner)
         self._stream_worker = None
         self._refresh_stream_buffer_label()
+        self._refresh_stream_scope()
         return wrapper
 
     # ---- 分块流式：辅助 / 执行 ----
@@ -628,6 +642,7 @@ class MainWindow(QMainWindow):
         self._sidebar_stack.setCurrentIndex(int(index))
         if int(index) == 1:
             self._refresh_stream_buffer_label()
+            self._refresh_stream_scope()
         self._log.info("工作模式切换：" + ("分块流式搬迁" if int(index) == 1 else "LBA 迁移"))
 
     def _on_stream_cache_changed(self, index: int) -> None:
@@ -641,6 +656,20 @@ class MainWindow(QMainWindow):
         self._stream_buffer_label.setText(
             f"1 块 = 65536 簇 ≈ {human_bytes(65536 * bpc)}；"
             f"缓冲 = {blocks}× 块 ≈ {human_bytes(clusters * bpc)}"
+        )
+
+    def _refresh_stream_scope(self) -> None:
+        """刷新分块流式侧栏的「搬迁范围」：选中文件数 / 大小 / 簇（自洽情境）。"""
+        if not hasattr(self, "_stream_scope"):
+            return
+        selected = self._table.file_model.checked_entries()
+        if not selected:
+            self._stream_scope.setText("未选择文件（请在左侧大文件列表勾选）")
+            return
+        total_bytes = sum(e.size for e in selected)
+        total_clusters = sum(e.allocated_clusters for e in selected)
+        self._stream_scope.setText(
+            f"选中 {len(selected)} 个文件 · {human_bytes(total_bytes)} · {total_clusters:,} 簇"
         )
 
     def _start_stream_move(self) -> None:
@@ -1155,6 +1184,7 @@ class MainWindow(QMainWindow):
             )
             self._table.file_model.set_checked_rows(True)
             self._annotate_front_half(items)
+            self._refresh_stream_scope()
 
         if self._scan_panel.channel() == CHANNEL_HANDLE:
             # 句柄通道没有 MFT 健康度，统计条只报能报的
@@ -1285,6 +1315,7 @@ class MainWindow(QMainWindow):
         )
         self._plan_stale = True
         self._update_summary()
+        self._refresh_stream_scope()
         self._refresh_disk_preview()
         self._schedule_feasibility()
         self._sync_buttons()
