@@ -215,13 +215,14 @@ def staged_copy(
         close(src)
         close(scratch)
         close(dst)
-    # 搬运完成：清理暂存盘（硬盘缓存用完即还）。
-    # ★ 必须在句柄关闭**之后**删 —— Windows 上删除一个以 share=0 打开的文件
-    # 会失败（早期版本在句柄还开着时就删，暂存文件会残留在缓存目录里）。
-    try:
-        os.remove(scratch_path)
-    except OSError:
-        pass
+        # ★ C-1：清理暂存盘必须放在 **finally**（异常路径也要清现场）——
+        # 早期版本只在正常路径可达，进程/写入中途失败时 `.stage` 文件残留。
+        # ★ 必须在句柄关闭**之后**删 —— Windows 上删除一个以 share=0 打开的
+        # 文件会失败。删除失败不掩盖原异常（包 except 静默）。
+        try:
+            os.remove(scratch_path)
+        except OSError:
+            pass
     return result
 
 

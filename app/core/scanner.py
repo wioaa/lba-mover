@@ -1665,9 +1665,17 @@ class BlockStreamWorker(QThread):
                     pass
                 failed += 1
                 self.file_result.emit(entry.path, False, f"{type(exc).__name__}: {exc}")
-        # 1.0.0D 方案 D：默认暂存目录用完即清（只删空目录；有残留文件时静默保留）
+        # 1.0.0D / C-1：默认暂存目录用完即清 —— 先删目录内**所有** `.stage`
+        # 残留（含进程曾被杀 / 异常路径留下的），清空后再 rmdir；
+        # 目录里还有非 stage 文件时保留目录（不动别人的东西）。
         if owned_scratch and scratch_dir:
             try:
+                for name in os.listdir(scratch_dir):
+                    if name.endswith(".stage"):
+                        try:
+                            os.remove(os.path.join(scratch_dir, name))
+                        except OSError:
+                            pass
                 os.rmdir(scratch_dir)
             except OSError:
                 pass

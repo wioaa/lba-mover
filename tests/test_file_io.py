@@ -194,6 +194,89 @@ def test_staged_copy_merge_with_large_buffer() -> None:
             assert written == len(_DATA) and nblocks == _NBLOCKS
 
 
+def test_staged_copy_removes_stage_on_failure() -> None:
+    """C-1：dst 写入中途抛异常 → stage 文件**仍被清理**，异常原样上抛。"""
+    with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as cache:
+        src = _write_src(work)
+        dst = os.path.join(work, "dst.bin")
+        scratch_path = os.path.join(cache, os.path.basename(dst) + ".stage")
+
+        original_write = file_io.write_at
+        state = {"calls": 0}
+
+        def failing_write(handle: int, offset: int, data: bytes) -> int:
+            state["calls"] += 1
+            if state["calls"] >= 2:      # 第 2 次写（dst 的第一块）中途炸
+                raise OSError("模拟 dst 写入失败")
+            return original_write(handle, offset, data)
+
+        file_io.write_at = failing_write
+        try:
+            try:
+                file_io.staged_copy(
+                    src, scratch_path, dst, buffer_blocks=2,
+                    bytes_per_cluster=_BPC, block_clusters=_BLOCK_CLUSTERS,
+                )
+            except OSError as exc:
+                assert "模拟 dst 写入失败" in str(exc)
+            else:
+                raise AssertionError("注入的写入异常应当上抛")
+        finally:
+            file_io.write_at = original_write
+
+        assert not os.path.exists(scratch_path), (
+            "异常路径 stage 文件也必须被清理（C-1：remove 在 finally 里）"
+        )
+
+
+def test_block_stream_worker_cleans_stage_residue() -> None:
+    """C-1：worker 收尾先删目录内全部 `.stage` 残留，清空后才 rmdir；
+    非 stage 文件不动（目录保留）。"""
+    from PySide6.QtWidgets import QApplication
+
+    from app.core.models import Extent, FileEntry
+    from app.core.scanner import BlockStreamWorker
+
+    _ = QApplication.instance() or QApplication([])
+    with tempfile.TemporaryDirectory() as d:
+        data = os.urandom(5000)
+        path = os.path.join(d, "a.bin")
+        with open(path, "wb") as fh:
+            fh.write(data)
+        entries = [
+            FileEntry(path=path, name="a.bin", size=len(data),
+                      extents=[Extent(vcn=0, lcn=0, clusters=10)], movable=True),
+        ]
+        scratch_dir = os.path.join(d, file_io.DEFAULT_SCRATCH_DIRNAME)
+        os.makedirs(scratch_dir, exist_ok=True)
+        # 预置两类残留：本 worker 的 `.stage` 残留（模拟进程曾被杀）+ 别人的文件
+        stale_stage = os.path.join(scratch_dir, "b.bin.stage")
+        with open(stale_stage, "wb") as fh:
+            fh.write(b"stale")
+        foreign = os.path.join(scratch_dir, "keep.txt")
+        with open(foreign, "w", encoding="utf-8") as fh:
+            fh.write("not ours")
+
+        original_root = file_io._volume_root_of
+        file_io._volume_root_of = lambda _p: d + os.sep
+        try:
+            worker = BlockStreamWorker(
+                entries, mode="disk", cache_dir=None,
+                buffer_blocks=2, bytes_per_cluster=512, block_clusters=4,
+            )
+            worker.run()  # 同步执行
+        finally:
+            file_io._volume_root_of = original_root
+
+        # `.stage` 残留（含预置的）全部被清
+        assert not os.path.exists(stale_stage), "目录内的 .stage 残留应被收尾清理"
+        stages = [n for n in os.listdir(scratch_dir) if n.endswith(".stage")]
+        assert stages == []
+        # 非 stage 文件不动 → 目录未空 → rmdir 失败 → 目录保留
+        assert os.path.exists(foreign), "非 .stage 文件不许动"
+        assert os.path.isdir(scratch_dir), "目录非空时应保留（不 rmdir）"
+
+
 def test_block_stream_worker_default_scratch_dir() -> None:
     """BlockStreamWorker：disk + cache_dir=None → 自建默认暂存目录并用完清理。"""
     from PySide6.QtWidgets import QApplication

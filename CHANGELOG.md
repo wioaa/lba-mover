@@ -59,7 +59,8 @@
   - **B-5（P3）性能基准口径**：`test_blockers_perf.py` 标注场景命中率（50% 挡路者 + 50% 陈旧索引）与 QA 的 100% 命中场景实测（431ms）不可直接对比；预算按 QA 数字放宽为 600ms。
   - **B-6（P3）可行性记忆键 `id(snapshot)` 地址复用风险**：memo 同时持有 snapshot **强引用**（`_feasibility_memo_snapshot`），memo 存活期间地址不可能被复用；签名本身去掉 `id` 项。
   - **B-7（P3）文档/预览小修**：`pending_count` 文档改为「2 组」实际口径；quick-tail 预览的卷尾守卫改用 `_live_reserve_mb()`（待定的保留区修改立刻在预览可见，与面板 `_live_*` 回显一致）。
-  - **B-2（P3）死信号清理**：移除无发射点无订阅者的 `modeChanged` 声明。
+
+  - **C-1（P2，QA 对方案 D 的专项审计）进程被杀时 stage 文件残留且无人清理**：`staged_copy` 的 `os.remove(scratch_path)` 挪进 finally（句柄关闭后删，异常路径同样清现场，删除失败不掩盖原异常）；`BlockStreamWorker` 收尾改为「先删目录内全部 `.stage` 残留（跨文件积累的也一并清）→ 清空后 rmdir，非 stage 文件不动、目录保留」；开发期实证残留 `C:\.lba-tmp-scratch\o.bin.stage` 已清理并 rmdir 空目录。回归钉：注入 dst 写入中途异常断言 stage 被清、预置 `.stage` 残留 + 外来文件的 worker 收尾清场对拍。
 - 版本号 `1.0.0C → 1.0.0D`。
 
 ---
