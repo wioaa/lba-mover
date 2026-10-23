@@ -682,29 +682,71 @@ M7 是我在 §17 之后自己构造的第七个形态，明确**不塞进**这�
 
 | 项 | 实测 |
 |---|---|
-| `e2`（`1d1d01c`） | 基线绿；M1~M5 红、M6 绿；`无假绿、无假红` |
+| `e2` v2（影子副本，`1d1d01c`） | 基线绿；M1~M5 红、M6 绿；`无假绿、无假红` |
 | `e2b` | 已改为**历史对照**（`3d2aa27` vs 加固版），现行判据以 `e2` 为准 |
-| testflow（`1d1d01c`） | **335 passed / 0 failed / 0 errors / 0 skipped**（46.7s，`reason=ok`） |
+| testflow（`1d1d01c`） | **335 passed / 0 failed / 0 errors / 0 skipped**（46.7s，`reason=ok`；工程师侧 78.2s，机器负载差异） |
 | testflow（`1990122`） | 335/0（59.7s） |
 | 用例数 | `test_cancel_semantics.py` 12、`test_ui_execute_flow.py` 14 |
-| 真源 sha256 | `b99186c4…`（每次变异后均校验还原） |
+| 真源完整性 | `git hash-object app/win32/mft_reader.py` = `e5d63669…` = `git rev-parse HEAD:app/win32/mft_reader.py`；`git status app/` 前后均为空 |
 
-> 过程插曲：在 `1990122` 上首跑 testflow 得到 `INVALID (source-changed)`，原因是工程师**并发**在改 `tests/test_cancel_semantics.py`（mtime 落在本次运行窗口内，且改完内容与 HEAD 相同）。这是 §17 已定性的设计行为，重跑即 PASS，**不记为缺陷**。
-> 但它暴露了变异探针的真实风险：**就地改真源**会与并发工作互相干扰。为此我验证了「影子副本」方案（§18.6）。
+> 过程插曲 1：在 `1990122` 上首跑 testflow 得到 `INVALID (source-changed)`，原因是工程师**并发**在改 `tests/test_cancel_semantics.py`（mtime 落在本次运行窗口内，且改完内容与 HEAD 相同）。这是 §17 已定性的设计行为，重跑即 PASS，**不记为缺陷**。
+>
+> 过程插曲 2（**我的方法缺陷，已修正**）：team-lead 在 `git status` 里看到过一次 `M app/win32/mft_reader.py`，专门让工程师确认"产品代码是否被改坏"。查明是**我的 v1 变异探针**在两个变异之间的瞬时态（写进真源 → 跑 → 还原）。产品代码在静止态从未偏离 HEAD（blob 校验一致），但"中途可见 + 崩溃会残留"是真实缺陷，故 v2 改为影子副本（§18.6）。此后再不会出现该类误报，无需靠"开跑前打招呼"这类人际约定。
 
-### 18.6 变异探针的改进方案（已验证，建议采纳）
+### 18.6 变异探针 v2：影子副本（已落地，非仅建议）
 
-`qa_work/e2c_shadow_mutation_probe.py`：把 `app/` + `tests/` 拷到临时目录 → 改**副本** → 在副本里跑测试。实测：
+v1 的「写进真源 → 跑 → 还原 → 校验 sha256」有两个真实缺点：①与并发工作互相干扰（本次已造成一次 `INVALID`、一次误报）；②还原属**事后**检测，进程被杀仍留脏。
+
+v2（`qa_work/e2_callpoint_nail_audit.py` 现版本）：把 `app/` + `tests/` 拷到临时目录 → **只改副本** → 在副本里跑钉子 → 真仓库全程只读。先以 `qa_work/e2c_shadow_mutation_probe.py` 验证可行性，再整体重写 `e2`，六格结论与 v1 逐格相同：
 
 ```
-影子副本基线：调用点钉子=绿
-影子副本 M1：调用点钉子=红（期望红）
-真源文件未被修改：是
-结论：影子副本方案 可行，且结论与就地变异一致
+真源 blob = e5d63669…   HEAD:app/win32/mft_reader.py = e5d63669…（一致）
+基线 绿/绿 → M1 红 M2 红 M3 红 M4 红 M5 红(有意) M6 绿 → 无假绿、无假红
+真源 blob 跑后 = e5d63669…（一致）   git status app/ = (空)
 ```
 
-好处：①真仓库全程只读，**与并发工作零冲突**；②进程被杀也不会留下变异源码（我现在靠 sha256 断言兜底，属于事后检测而非事前预防）。代价是多一次几 MB 的 `copytree`（毫秒级）。
+好处：①真仓库只读，**与并发工作零冲突**；②崩溃不会残留变异源码；③自证方式从"我记的 sha256"升级为 **`git hash-object` vs `HEAD:<path>`**（任何人可复核，不依赖我的日志）。代价是一次几 MB `copytree`（毫秒级）。
+
+**给 `tools/mutation_probe.py`（工程师提案）的设计建议**：默认影子模式；`--in-place` 作为需显式确认的逃生口（且强制 `finally` 还原 + blob 断言）；输入用清单（`file` / `old` / `new` / `expect`）；**不要接进 testflow**（"改被测对象"的工具进常规流水线会让结果不可预测）。
 
 ### 18.7 结论
 
 **P3 已闭环，验收 PASS。** 调用点钉子从「钉共存 → 钉接线+顺序」完成升级，两个假绿方向（`break` 前置、`if False:` 包裹）与一个假红方向（分支数量）全部消除，边界已文档化。唯一待办是**推送**（本地 ahead 2）与 §17/§18 一并入库；推送后基线变为 `1d1d01c`，运行时产物不变。
+
+### 18.8 预审 `tools/mutation_probe.py`（1 条一般 + 1 条建议 + 1 条已自然闭环）
+
+工程师已落地该工具（552 行，`--manifest` + 影子默认 + `--in-place` 逃生口 + 退出码 0/1/2 分级）与清单 `tools/mutations/cancel_semantics.json`。方向完全正确。逐行审阅 + 实测后如下。
+
+**F2（原为"跑不起来"，已闭环）** 我提这条时 `tools/mutations/` 尚不存在；随后清单落地，我**独立实跑**了一次（这是该工具的第一次真实执行记录）：
+
+```
+$ python tools/mutation_probe.py --manifest tools/mutations/cancel_semantics.json
+模式：shadow（真仓库只读）
+M1 删 mark_cancelled 调用（留 break）      fail  fail  符合   ...calls_mark_cancelled
+M2 删 break（留调用）                      fail  fail  符合   ...calls_mark_cancelled
+M3 break 前置（调用成死代码）               fail  fail  符合   ...calls_mark_cancelled
+M4 调用包进 if False（不可达）              fail  fail  符合   ...calls_mark_cancelled
+M5 守卫改本地别名（有意保留红）              fail  fail  符合   ...calls_mark_cancelled
+M6 新增第二个正确的取消分支（不该误红）      pass  pass  符合   -
+结论：6 条全部符合期望
+[probe] 真仓库未被改动（git blob 前后一致，1 个文件）
+```
+
+六格与我 `e2` 的判定**逐格一致**，且「首个失败的钉子」全部指向调用点钉子——说明清单锚点写对了。我另核了 6 条锚点在 `scan_volume_mft` 内**各出现 1 次**（满足工具「恰好一次」的前置），并确认 M6 的 `new` 正确保留了 `stats.total_records += 1`、没有夹带副作用。
+
+**F1（一般，`--in-place` 专用，提交前未修）行尾转换落在两套自证机制的盲区里。**
+`apply_mutation`（第 248 行）用 `write_text(..., newline="\n")` 写回，会把整文件 **CRLF → LF**。实测（施加一条**逻辑零改动**的变异 `old == new`）：
+
+```
+逻辑内容相同：True     字节相同：False     CRLF: 666 → 0
+sha256: b99186c4d1a5 → 10edda948253
+blob 与 HEAD 相同：True     ← 察觉不到行尾变化
+```
+
+原因：仓库 `core.autocrlf=true` 且无 `.gitattributes`，`git hash-object` 会施加 clean filter（CRLF→LF），因此**「行尾被转换」产生的 blob 与 `HEAD` 完全相同**。于是 `--in-place` 期间若进程被杀，残留物同时满足 `git status` 干净 + blob 一致——**两种保障都报告"没问题"**，而字节已经变了（正是我今天早些时候踩过的同一个坑，当时靠 sha256 才抓到）。修法：①按原行尾写回；②完整性校验增加 sha256 字节级摘要；③把第 171 行「blob 对『内容相同但行尾被转换』天生免疫」改成「**看不见**」——现在这句是反的，而它是写给后来人的保证。
+
+**F3（建议·清理）** `run_shadow` 里 `workdir` / `pristine` 是死代码（赋值后仅被 `_ = (workdir, pristine)` 消费）；`run_in_place` 的 `finally` 里 `raise` 会**掩盖**原始异常（锚点未命中时看到的是"还原不干净"而非"锚点出现 0 次"）。
+
+**F4（认可，无需改）** 锚点要求「恰好出现一次」（变异可复现）；每条变异前 `_fresh_copy` 重置 + 基线带缓存校验（基线不绿直接拒判）；`PYTHONPATH` 指向影子目录确保 `import app` 不回落真仓库；退出码 `0/1/2` 三分把"钉子有盲区"与"工具自己坏了"分开。
+
+**结论**：F1 只影响 `--in-place`（默认路径无害），**不阻塞 1.0.0E**；建议在 `tools/` 提交前修掉——它修的正是"安全网自己看不见的地方"。
