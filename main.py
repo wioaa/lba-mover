@@ -120,6 +120,8 @@ def _selftest() -> int:
         ("app.win32.mft_reader", "$MFT 原始读（只读）"),
         ("app.core.mft", "MFT FILE 记录解析"),
         ("app.core.scheduler", "依赖调度 + relay 中转"),
+        ("app.win32.file_io", "分块流式搬迁 I/O（用户态 Read/Write）"),
+        ("app.core.block_stream", "分块流式调度（65536 簇 block / 可调缓存）"),
         ("app.ui.main_window", "主窗口 / 界面装配"),
     ]
     failures = 0

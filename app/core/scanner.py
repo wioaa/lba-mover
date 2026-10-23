@@ -1433,3 +1433,100 @@ def describe_index_payload(payload: IndexPayload) -> str:
         f"耗时 {human_seconds(payload.elapsed)}"
     )
 
+
+# --------------------------------------------------------------------------- #
+# 1.0.0C 用户态分块流式搬迁（特殊工作模式）
+# --------------------------------------------------------------------------- #
+class BlockStreamWorker(QThread):
+    """用户态分块流式搬迁：把选定文件拷到目的地、校验后移到回收站。
+
+    与 :class:`MoveWorker`（``FSCTL_MOVE_FILE`` 簇级、需管理卷特权）不同：本 worker
+    在用户态用普通 ``ReadFile`` / ``WriteFile`` 按 65536 簇 block 分块流式拷贝（经
+    ``app.win32.file_io.copy_stream``，内存 / 硬盘两种可调缓存），**拷贝并校验完整后**
+    才把源文件移到回收站（可恢复），从而腾出源卷空间。绝不永久删除。
+    """
+
+    progress = Signal(int, int, str)
+    file_result = Signal(str, bool, str)
+    completed = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        entries: Sequence[FileEntry],
+        dest_dir: str,
+        *,
+        mode: str = "memory",
+        cache_dir: Optional[str] = None,
+        buffer_blocks: int = 2,
+        bytes_per_cluster: int = 4096,
+        block_clusters: int = 65536,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._entries = list(entries)
+        self._dest_dir = str(dest_dir)
+        self._mode = mode
+        self._cache_dir = cache_dir
+        self._buffer_blocks = int(buffer_blocks)
+        self._bpc = int(bytes_per_cluster)
+        self._block_clusters = int(block_clusters)
+        self._cancel = False
+
+    def request_cancel(self) -> None:
+        self._cancel = True
+
+    def run(self) -> None:  # noqa: D102 - QThread 钩子
+        import os
+
+        from app.win32 import file_io
+
+        if not self._dest_dir:
+            self.failed.emit("未设定目的地目录")
+            return
+        try:
+            os.makedirs(self._dest_dir, exist_ok=True)
+        except OSError as exc:
+            self.failed.emit(f"无法创建目的地目录：{exc}")
+            return
+
+        total = len(self._entries)
+        moved = failed = 0
+        moved_bytes = 0
+        done = 0
+        for entry in self._entries:
+            if self._cancel:
+                break
+            done += 1
+            self.progress.emit(done, total, entry.name)
+            if not entry.movable or entry.allocated_clusters <= 0:
+                failed += 1
+                self.file_result.emit(entry.path, False, "不可移动或无物理分配")
+                continue
+            src = entry.path
+            dst = os.path.join(self._dest_dir, entry.name)
+            try:
+                src_size = os.path.getsize(src)
+                written, nblocks = file_io.copy_stream(
+                    src, dst,
+                    mode=self._mode,
+                    cache_dir=self._cache_dir,
+                    buffer_blocks=self._buffer_blocks,
+                    bytes_per_cluster=self._bpc,
+                    block_clusters=self._block_clusters,
+                )
+                if written != src_size:
+                    raise OSError(f"拷贝不完整（写入 {written} / 源 {src_size}）")
+                # 校验通过才把源移回收站（可恢复），腾出源卷空间；删源失败则报失败、保留源
+                if not file_io.recycle(src):
+                    raise OSError("拷贝成功但无法把源移入回收站（源未删，可重试）")
+                moved += 1
+                moved_bytes += src_size
+                self.file_result.emit(entry.path, True, f"{nblocks} 块 / {src_size:,} B")
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                self.file_result.emit(entry.path, False, f"{type(exc).__name__}: {exc}")
+        self.completed.emit(
+            {"moved": moved, "failed": failed, "bytes": moved_bytes, "dest": self._dest_dir}
+        )
+

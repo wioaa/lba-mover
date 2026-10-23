@@ -145,6 +145,11 @@ def staged_copy(
                 write_at(scratch, block.offset, read_at(src, block.offset, block.length))
             else:  # store
                 written += write_at(dst, block.offset, read_at(scratch, block.offset, block.length))
+        # 搬运完成：清理暂存盘（硬盘缓存用完即还）
+        try:
+            os.remove(scratch_path)
+        except OSError:
+            pass
         return written, len(blocks)
     finally:
         close(src)
@@ -234,3 +239,38 @@ def copy_stream(
             block_clusters=block_clusters,
         )
     raise ValueError(f"未知缓存模式：{mode!r}（可选 {CACHE_MODE_MEMORY!r} / {CACHE_MODE_DISK!r}）")
+
+
+# ---------------------------------------------------------------- 回站删除
+_FO_DELETE = 3
+_FOF_ALLOWUNDO = 0x40
+_FOF_NOCONFIRMATION = 0x10
+_FOF_SILENT = 0x4
+_FOF_NOERRORUI = 0x400
+
+
+class _SHFILEOPSTRUCTW(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", wintypes.HWND),
+        ("wFunc", ctypes.c_uint),
+        ("pFrom", wintypes.LPCWSTR),
+        ("pTo", wintypes.LPCWSTR),
+        ("fFlags", ctypes.c_ushort),
+        ("fAnyOperationsAborted", wintypes.BOOL),
+        ("hNameMappings", wintypes.LPVOID),
+        ("lpszProgressTitle", wintypes.LPCWSTR),
+    ]
+
+
+_shell32 = ctypes.windll.shell32
+_shell32.SHFileOperationW.argtypes = [ctypes.POINTER(_SHFILEOPSTRUCTW)]
+_shell32.SHFileOperationW.restype = ctypes.c_int
+
+
+def recycle(path: str) -> bool:
+    """把文件移到回收站（可恢复），而非永久删除。返回是否成功。"""
+    op = _SHFILEOPSTRUCTW()
+    op.wFunc = _FO_DELETE
+    op.pFrom = f"{path}\0\0"   # pFrom 需以双空字符结尾
+    op.fFlags = _FOF_ALLOWUNDO | _FOF_NOCONFIRMATION | _FOF_SILENT | _FOF_NOERRORUI
+    return _shell32.SHFileOperationW(ctypes.byref(op)) == 0 and not op.fAnyOperationsAborted

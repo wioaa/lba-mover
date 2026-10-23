@@ -49,6 +49,8 @@ hiddenimports = [
     "app.core.io_profile",      # merge_segments 等在函数内 import
     "app.core.ranges",          # subtract_runs 等在函数内 import
     "app.core.models",          # 双保险
+    "app.win32.file_io",        # 分块流式搬迁：BlockStreamWorker.run() 内动态 import
+    "app.core.block_stream",    # file_io 依赖（随 file_io 捆；双保险）
 ]
 
 a = Analysis(

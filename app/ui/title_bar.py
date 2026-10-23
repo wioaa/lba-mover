@@ -39,6 +39,7 @@ class TitleBar(QWidget):
     maximizeRequested = Signal()
     closeRequested = Signal()
     themeToggleRequested = Signal()
+    workModeChanged = Signal(int)     # 0 = LBA 迁移，1 = 分块流式
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -64,6 +65,12 @@ class TitleBar(QWidget):
         text_column.addWidget(self._subtitle)
         layout.addLayout(text_column)
         layout.addStretch(1)
+
+        # ---- 工作模式切换（LBA 迁移 / 分块流式）----
+        self._work_switch = cards.SegmentedControl(["LBA 迁移", "分块流式"], 0, self)
+        self._work_switch.changed.connect(self.workModeChanged.emit)
+        layout.addWidget(self._work_switch, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addSpacing(10)
 
         self._mode_badge = cards.Badge("预览模式", "accent", self)
         layout.addWidget(self._mode_badge, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -105,6 +112,13 @@ class TitleBar(QWidget):
         """更新左上角的模式徽章（预览 / 执行）。"""
         self._mode_badge.set_state(text, kind)
 
+    def work_mode(self) -> int:
+        """当前工作模式：0 = LBA 迁移，1 = 分块流式。"""
+        return int(self._work_switch.current_index)
+
+    def set_work_mode(self, index: int) -> None:
+        self._work_switch.set_current(int(index), emit=False)
+
     def paintEvent(self, event) -> None:  # noqa: D102
         palette = theme.palette()
         painter = QPainter(self)
@@ -124,6 +138,9 @@ class TitleBar(QWidget):
         for button in (self._theme_button, self._btn_min, self._btn_max, self._btn_close):
             if button.geometry().adjusted(-2, -2, 2, 2).contains(position):
                 return True
+        # 工作模式切换器：别让在它上面的按压触发窗口拖动
+        if self._work_switch.geometry().adjusted(-2, -2, 2, 2).contains(position):
+            return True
         return False
 
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: D102
