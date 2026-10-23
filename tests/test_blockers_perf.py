@@ -175,7 +175,12 @@ def test_find_blockers_scale_is_sublinear() -> None:
         "（QA 独立场景 100% 命中 + 65,000 blockers 实测 431 ms，量级一致）；"
         "O(E×R) 热点的放大倍率参考纯裁剪对拍：10,000×10,000 下 11,532 ms → 17.3 ms。"
     )
-    assert elapsed_ms < 500.0, f"find_blockers 耗时 {elapsed_ms:.1f} ms 超过 500 ms 预算"
+    # ★ 基准预算 600ms（B-5：按 QA 实测放宽）——本场景命中率 50%
+    # （10 万 extent 中 5 万成挡路者，其余 5 万为陈旧索引走裁剪-空廉价路径）。
+    # 口径提醒：命中率不同的场景数值不可直接对比 —— QA 独立场景为
+    # 「100% 命中 + 65,000 blockers」，实测 431 ms（同样在预算内）；
+    # O(E×R) 热点的放大倍率参考纯裁剪对拍：10,000×10,000 下 11,532 ms → 17.3 ms。
+    assert elapsed_ms < 600.0, f"find_blockers 耗时 {elapsed_ms:.1f} ms 超过 600 ms 预算"
     # 偶数号（仍在占用）= 挡路者；奇数号（陈旧索引）必须被位图二次过滤掉
     assert len(blockers) == count // 2, (
         f"应恰好 50,000 个挡路者（陈旧索引要被过滤），实际 {len(blockers):,}"

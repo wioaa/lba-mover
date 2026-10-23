@@ -52,6 +52,14 @@
 - **可行性计算移出 UI 线程**：新增 `FeasibilityWorker`（QThread，只读），UI 线程只做参数打包与结果回显；结果返回时参数已变则丢弃并按最新参数重算，防抖 140ms 保留。大卷上拖动区间滑块不再卡顿界面。
 - **执行日志批量刷盘**（方案 A，降低执行期日志 I/O 等待）：`MoveJournal.append()` 改为「每行 write + flush、fsync 攒批」——攒满 32 行（`JOURNAL_FSYNC_EVERY`，模块级常量可覆盖）或距上次 fsync 超 2 秒（`JOURNAL_FSYNC_SECONDS`）才真正 `os.fsync`；断电窗口从「1 行」如实放宽为「最多 32 行 / 2 秒」，**数据本身不受影响**（FSCTL 已完成），受影响的是回滚清单完整性。新增 `force_fsync()`，并在三个硬要求时点强制刷盘：执行 worker 结束（含取消 / 异常）、回滚 worker 启动前、回滚结束；`close()` 兜底。fsync 计数测试（假 os 替身）：写 1 行 0 次 / 32 行恰 1 次 / 超时后第 33 行第 2 次 / `force_fsync` 立即。
 - **流式 disk 缓存去写放大**（方案 D）：①暂存**写合并**——`staged_copy` 的 `load` 不再逐 block 写暂存盘，攒满 `buffer_blocks` 个 block（或流末尾）后把连续块区间拼成单次顺序大写（功能输出逐字节不变；附带修掉「暂存文件在句柄未关时删除失败而残留」的旧问题）；②disk 模式 `cache_dir=None` **默认暂存在源文件所在卷根** `.lba-tmp-scratch\`（首文件决定卷，用完清理，卷根不可写回落 `%TEMP%`），主窗口不再拦截「硬盘缓存需设定暂存目录」；③UI 照实提示「暂存盘会多一倍写入，内存充足时建议内存缓存」。对拍：disk 与 memory 逐字节一致；5 块 buffer=2 暂存写从 5 次 → 3 次。
+- **修复（QA 验证 1.0.0D 系列提交后实锤项）**：
+  - **B-1（P1）执行三选确认两个动作按钮全部等价于「取消」**：`ChoiceDialog` 曾把按钮文字存进 `choice`，调用方按代号比对的「先应用再执行 / 按现有计划执行」两分支永不可达；改为 `choices=(代号, 文字, 角色)` 三元组、`choice` 存代号，执行确认框恢复逃生门（回归钉 `tests/test_dialogs.py`：编程点击断言 choice == "apply" / "proceed"）。
+  - **B-3（P2）closeEvent 取消清单缺 `_stream_worker`**（1.0.0C 遗留）：已补齐；回归钉 `tests/test_worker_lifecycle.py` 用 AST 扫描 MainWindow 源码中所有 `self._x_worker` 属性，断言 closeEvent 逐个覆盖、运行时取值为 None 或 QThread。
+  - **B-4（P2）TargetPanel pending 的 guard 不对称**：`_emit_pending` 补 guard 检查且 dirty 由快照实算（clean 时的偶发调用只会发出 `(False, 0)`，不再闪假 True）；`discard_pending` 的视觉同步段包进 guard。
+  - **B-5（P3）性能基准口径**：`test_blockers_perf.py` 标注场景命中率（50% 挡路者 + 50% 陈旧索引）与 QA 的 100% 命中场景实测（431ms）不可直接对比；预算按 QA 数字放宽为 600ms。
+  - **B-6（P3）可行性记忆键 `id(snapshot)` 地址复用风险**：memo 同时持有 snapshot **强引用**（`_feasibility_memo_snapshot`），memo 存活期间地址不可能被复用；签名本身去掉 `id` 项。
+  - **B-7（P3）文档/预览小修**：`pending_count` 文档改为「2 组」实际口径；quick-tail 预览的卷尾守卫改用 `_live_reserve_mb()`（待定的保留区修改立刻在预览可见，与面板 `_live_*` 回显一致）。
+  - **B-2（P3）死信号清理**：移除无发射点无订阅者的 `modeChanged` 声明。
 - 版本号 `1.0.0C → 1.0.0D`。
 
 ---

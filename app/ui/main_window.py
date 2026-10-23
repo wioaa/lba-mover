@@ -239,6 +239,7 @@ class MainWindow(QMainWindow):
         self._feasibility_worker: Optional[FeasibilityWorker] = None
         self._feasibility_seq = 0
         self._feasibility_signature = None
+        self._feasibility_memo_snapshot = None   # B-6：强引用，防 id 地址复用
         self._feasibility_rerun = False
 
         self._journal: Optional[MoveJournal] = None
@@ -1398,13 +1399,19 @@ class MainWindow(QMainWindow):
         selected = self._table.file_model.checked_entries()
         excluded = tuple(sorted(self._target_panel.excluded_paths()))
         signature = (
-            id(snapshot),
             start,
             end,
             excluded,
             tuple((entry.path, entry.allocated_clusters) for entry in selected),
         )
-        if signature == self._feasibility_signature and self._feasibility is not None:
+        # ★ B-6：memo 里**同时持有 snapshot 强引用** —— memo 存活期间
+        # ``id(snapshot)`` 不可能被地址复用，"换了位图但签名相同" 的理论风险
+        # 随之消除（比给模型加代次号轻）。
+        if (
+            self._feasibility_memo_snapshot is snapshot
+            and signature == self._feasibility_signature
+            and self._feasibility is not None
+        ):
             return                      # 参数没变，不白算
 
         if self._feasibility_worker is not None and self._feasibility_worker.isRunning():
@@ -1414,6 +1421,7 @@ class MainWindow(QMainWindow):
             return
 
         self._feasibility_signature = signature
+        self._feasibility_memo_snapshot = snapshot
         self._feasibility_seq += 1
         worker = FeasibilityWorker(
             self._feasibility_seq,
@@ -2032,6 +2040,9 @@ class MainWindow(QMainWindow):
     # 关闭
     # ================================================================== #
     def closeEvent(self, event) -> None:  # noqa: D102
+        # ★ B-3：取消清单必须覆盖**所有** QThread 槽位（含 1.0.0C 遗留的
+        # _stream_worker）——tests/test_worker_lifecycle.py 用 AST 扫描钉住
+        # 「self._x_worker 形态的属性必须全部出现在本清单」。
         for worker in (
             self._move_worker,
             self._rollback_worker,
@@ -2039,6 +2050,7 @@ class MainWindow(QMainWindow):
             self._index_worker,
             self._plan_worker,
             self._bitmap_worker,
+            self._stream_worker,
             self._feasibility_worker,
         ):
             if worker is not None and worker.isRunning():

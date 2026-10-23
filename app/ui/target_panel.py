@@ -183,11 +183,19 @@ class TargetPanel(QWidget):
         self._quick_start.setValue(quick_start)
         self._head_field.set_value(head_mb)
         self._tail_field.set_value(tail_mb)
-        self._guard = False
+        # ★ B-4：视觉同步段包进 guard —— `_sync_mode_visual` 会经
+        # `_recompute_quick` 触发 `_emit_pending`，guard 外会闪一对
+        # 「True→False」假 pending 脉冲。
+        self._guard = True
         self._sync_mode_visual()
         self._refresh_window_badge()
         self._refresh_reserve_hint()
-        self.pendingChanged.emit(False, 0)
+        self._guard = False
+        if self.mode() == MODE_QUICK:
+            # guard 外补一次结果标签刷新（guard 内被 `_recompute_quick` 早退跳过）；
+            # 值已恢复到 committed，`_emit_pending` 发出的是正确的 (False, 0)
+            self._recompute_quick()
+        self._emit_pending()
 
     # ------------------------------------------------------------------ #
     # 构建
@@ -431,7 +439,9 @@ class TargetPanel(QWidget):
     def _emit_pending(self) -> None:
         if self._guard:
             return
-        self.pendingChanged.emit(True, self.pending_count())
+        # ★ B-4：dirty 由当前快照**实算**，不在调用点假设 —— 恢复/回显路径的
+        # 偶发调用只会发出正确值（clean 时是 (False, 0)），不会闪假 True。
+        self.pendingChanged.emit(self.is_pending(), self.pending_count())
 
     def window(self) -> Tuple[int, int]:
         """**已提交**的目标区间 ``[start, end)``（待定修改不进来）。"""
@@ -484,9 +494,19 @@ class TargetPanel(QWidget):
         self.pendingChanged.emit(False, 0)
 
     def _quick_window(self) -> Tuple[int, int]:
+        """快捷模式下的**实时预览**区间（本地回显，与 `_live_*` 同口径）。
+
+        ★ B-7②：卷尾倒数模式的 tail 守卫取 `_live_reserve_mb()`（控件当前值）
+        —— 待定的保留区修改要能立刻在预览里看到；已提交值只用于规划
+        （``window()`` → `_window_of(self._committed)`）。
+        """
         clusters = gb_to_clusters(int(self._quick_gb.value()), self._bytes_per_cluster)
         if self._quick_combo.currentIndex() == QUICK_TAIL:
-            tail_guard = self.reserve_tail_clusters()
+            tail_guard = (
+                int(self._live_reserve_mb()[1] * MB / self._bytes_per_cluster)
+                if self._bytes_per_cluster > 0
+                else 0
+            )
             win = window_from_tail(self._total_clusters, clusters, tail_guard)
         else:
             win = window_from_length(
