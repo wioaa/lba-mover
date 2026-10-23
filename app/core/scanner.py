@@ -177,6 +177,97 @@ class BitmapWorker(QThread):
 
 
 # --------------------------------------------------------------------------- #
+# 可行性评估（1.0.0D：移出 UI 线程，**只读**）
+# --------------------------------------------------------------------------- #
+class FeasibilityWorker(QThread):
+    """在后台线程跑 :func:`packer.assess`（纯函数，只读）。
+
+    * 输入里的 ``bits`` 是**不可变**的 ``bytes`` 位图快照 —— 跨线程共享无
+      可变状态；``selected`` / ``ownership`` 在评估期间只被读取；
+    * ``request_cancel`` 在重活开始前生效（评估本身是单次纯计算，
+      中途不可打断 —— 所以取消语义是「丢弃结果」，由调用方按代次比对）；
+    * 结果带 ``seq`` 代次：UI 侧参数若已变化则直接丢弃并按最新参数重投。
+    """
+
+    completed = Signal(int, object)      # (seq, FeasibilityReport)
+    failed = Signal(int, str)            # (seq, message)
+
+    def __init__(
+        self,
+        seq: int,
+        bits: bytes,
+        window: Tuple[int, int],
+        allowed: List[Tuple[int, int]],
+        selected: List[FileEntry],
+        ownership,
+        excluded: Tuple[str, ...],
+        bytes_per_cluster: int,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._seq = int(seq)
+        self._bits = bits
+        self._window = (int(window[0]), int(window[1]))
+        self._allowed = list(allowed)
+        self._selected = list(selected)
+        self._ownership = ownership
+        self._excluded = tuple(excluded)
+        self._bytes_per_cluster = int(bytes_per_cluster)
+        self._cancel = False
+
+    def request_cancel(self) -> None:
+        """请求取消（在重活开始前生效；之后的结果由 UI 按代次丢弃）。"""
+        self._cancel = True
+
+    def run(self) -> None:  # noqa: D102 - QThread 钩子
+        if self._cancel:
+            return
+        try:
+            # 按需导入：位图切片与评估都是只读路径，与写出口无任何关系
+            from app.core import packer
+            from app.core.models import TargetWindow
+
+            start, end = self._window
+            free_runs = bitmap_mod.free_runs_in_window(self._bits, start, end)
+            if self._cancel:
+                return
+            # 区间内被占用的簇 = 区间 − 空闲
+            occupied_runs = _subtract_in_window(free_runs, start, end)
+            report = packer.assess(
+                self._selected,
+                TargetWindow(start, end),
+                self._allowed,
+                free_runs,
+                self._ownership,
+                occupied_runs,
+                self._excluded,
+                self._bytes_per_cluster,
+            )
+            if self._cancel:
+                return
+            self.completed.emit(self._seq, report)
+        except Exception as exc:  # noqa: BLE001 - 评估失败不能让 UI 崩
+            self.failed.emit(self._seq, f"可行性评估失败：{type(exc).__name__}: {exc}")
+
+
+def _subtract_in_window(
+    free_runs: List[Tuple[int, int]], start: int, end: int
+) -> List[Tuple[int, int]]:
+    """区间 − 空闲 = 占用（``free_runs`` 已限制在区间内）。"""
+    occupied: List[Tuple[int, int]] = []
+    cursor = start
+    for run_start, run_end in free_runs:
+        if run_start > cursor:
+            occupied.append((cursor, min(run_start, end)))
+        cursor = max(cursor, run_end)
+        if cursor >= end:
+            break
+    if cursor < end:
+        occupied.append((cursor, end))
+    return [(s, e) for s, e in occupied if e > s]
+
+
+# --------------------------------------------------------------------------- #
 # 大文件扫描（阈值模式，v1 行为）
 # --------------------------------------------------------------------------- #
 class ScanWorker(QThread):

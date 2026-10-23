@@ -44,7 +44,6 @@ from PySide6.QtWidgets import (
 )
 
 from app.core import densify as densify_mod
-from app.core import packer
 from app.core import ranges as ranges_mod
 from app.core.io_profile import IoProfile
 from app.core.journal import MoveJournal, default_journal_path
@@ -63,6 +62,7 @@ from app.core.safety import build_policy, default_head_mb, default_tail_mb
 from app.core.scanner import (
     BitmapWorker,
     BlockStreamWorker,
+    FeasibilityWorker,
     IndexWorker,
     MftScanWorker,
     MoveWorker,
@@ -235,6 +235,11 @@ class MainWindow(QMainWindow):
         self._index_payload = None
         self._feasibility: Optional[FeasibilityReport] = None
         self._has_pending = False            # 1.0.0D：是否存在未应用的配置修改
+        # 1.0.0D：可行性后台计算的状态
+        self._feasibility_worker: Optional[FeasibilityWorker] = None
+        self._feasibility_seq = 0
+        self._feasibility_signature = None
+        self._feasibility_rerun = False
 
         self._journal: Optional[MoveJournal] = None
         self._journal_path = ""
@@ -1369,46 +1374,72 @@ class MainWindow(QMainWindow):
         return build_policy(info, head_mb=head_mb, tail_mb=tail_mb)
 
     def _compute_feasibility_now(self) -> None:
-        """在 UI 线程里跑可行性评估（区间内有界的位图扫描，实测 < 100 ms）。"""
+        """把可行性评估**投递到后台线程**（1.0.0D：UI 线程只打包参数与回显）。
+
+        * 参数打包成不可变输入（位图 ``bytes`` 快照 + 区间 + 选中清单）；
+        * 结果按 ``seq`` 代次回显：返回时参数已变则丢弃（最新参数由重投覆盖）；
+        * 若上一个 worker 还在跑，置「待重算」标记，它结束后立即按最新参数重跑；
+        * 防抖（140 ms）仍由 ``_feasibility_timer`` 承担。
+        """
         info = self._volume
         snapshot = self._snapshot
         if info is None or snapshot is None or not snapshot.bits:
-            self._target_panel.set_feasibility(None)
-            self._feasibility = None
+            self._clear_feasibility()
             return
         start, end = self._target_panel.window()
         if end <= start:
-            self._target_panel.set_feasibility(None)
-            self._feasibility = None
+            self._clear_feasibility()
             return
-
         policy = self._policy()
         if policy is None:
             return
-        window = TargetWindow(start, end)
-        allowed = ranges_mod.subtract_runs(
-            [(start, end)], policy.forbidden_runs()
+
+        selected = self._table.file_model.checked_entries()
+        excluded = tuple(sorted(self._target_panel.excluded_paths()))
+        signature = (
+            id(snapshot),
+            start,
+            end,
+            excluded,
+            tuple((entry.path, entry.allocated_clusters) for entry in selected),
         )
-        try:
-            free_runs = bitmap_mod.free_runs_in_window(snapshot.bits, start, end)
-            occupied = ranges_mod.subtract_runs([(start, end)], free_runs)
-            selected = self._table.file_model.checked_entries()
-            report = packer.assess(
-                selected,
-                window,
-                allowed,
-                free_runs,
-                self._ownership,
-                occupied,
-                tuple(sorted(self._target_panel.excluded_paths())),
-                info.bytes_per_cluster or 4096,
-            )
-        except Exception as exc:  # noqa: BLE001 - 评估失败不能让 UI 崩
-            self._log.error(f"可行性评估失败：{type(exc).__name__}: {exc}")
-            self._target_panel.set_feasibility(None)
-            self._feasibility = None
+        if signature == self._feasibility_signature and self._feasibility is not None:
+            return                      # 参数没变，不白算
+
+        if self._feasibility_worker is not None and self._feasibility_worker.isRunning():
+            # 上一轮还在跑：标记重算，它结束后按最新参数重投
+            self._feasibility_rerun = True
+            self._feasibility_worker.request_cancel()
             return
 
+        self._feasibility_signature = signature
+        self._feasibility_seq += 1
+        worker = FeasibilityWorker(
+            self._feasibility_seq,
+            snapshot.bits,
+            (start, end),
+            ranges_mod.subtract_runs([(start, end)], policy.forbidden_runs()),
+            selected,
+            self._ownership,
+            excluded,
+            info.bytes_per_cluster or 4096,
+            parent=self,
+        )
+        worker.completed.connect(self._on_feasibility_ready)
+        worker.failed.connect(self._on_feasibility_failed)
+        worker.finished.connect(self._on_feasibility_finished)
+        self._feasibility_worker = worker
+        worker.start()
+
+    def _clear_feasibility(self) -> None:
+        self._feasibility = None
+        self._target_panel.set_feasibility(None)
+        self._target_panel.set_blockers([])
+        self._disk_map.set_blocker_ranges([])
+
+    def _on_feasibility_ready(self, seq: int, report: object) -> None:
+        if seq != self._feasibility_seq:
+            return                      # 过期结果：参数已变，丢弃
         self._feasibility = report
         self._target_panel.set_feasibility(report)
         self._target_panel.set_blockers(report.blockers)
@@ -1420,6 +1451,21 @@ class MainWindow(QMainWindow):
             ][:MAX_BLOCKER_OVERLAYS]
         )
         self._sync_buttons()
+
+    def _on_feasibility_failed(self, seq: int, message: str) -> None:
+        if seq != self._feasibility_seq:
+            return
+        self._log.error(message)
+        self._clear_feasibility()
+        self._sync_buttons()
+
+    def _on_feasibility_finished(self) -> None:
+        worker = self._feasibility_worker
+        if worker is not None and worker.isFinished():
+            self._feasibility_worker = None
+        if self._feasibility_rerun:
+            self._feasibility_rerun = False
+            QTimer.singleShot(0, self._compute_feasibility_now)
 
     # ================================================================== #
     # 模式 / 按钮状态
@@ -1992,6 +2038,7 @@ class MainWindow(QMainWindow):
             self._index_worker,
             self._plan_worker,
             self._bitmap_worker,
+            self._feasibility_worker,
         ):
             if worker is not None and worker.isRunning():
                 worker.request_cancel()
