@@ -26,8 +26,11 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import os
 import sys
+import textwrap
 import types
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -113,6 +116,44 @@ def test_mft_outcome_cancel_is_not_failure() -> None:
 
     outcome.fallback_code = mft_mod.FALLBACK_NO_PRIVILEGE
     assert outcome.ok is False, "只有回退码才让通道「不可用」"
+
+
+# --------------------------------------------------------------------------- #
+# ①c 调用点钉子：`scan_volume_mft` 的取消分支**必须真的调用** mark_cancelled
+#     动机（QA 提的第 5 次同类漏洞，上移一层）：①b 钉的是函数本身，如果调用点
+#     被删掉（`break` 留着），函数钉子仍全绿而取消语义又丢了。事件型分支的
+#     "有没有接线"只能靠调用点钉子 —— 用 AST 精确锚定，不用设备、成本极低。
+# --------------------------------------------------------------------------- #
+def test_scan_volume_mft_cancel_branch_calls_mark_cancelled() -> None:
+    source = textwrap.dedent(inspect.getsource(mft_reader.scan_volume_mft))
+    tree = ast.parse(source)
+
+    hits = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        guards_should_cancel = any(
+            isinstance(sub, ast.Name) and sub.id == "should_cancel"
+            for sub in ast.walk(node.test)
+        )
+        if not guards_should_cancel:
+            continue
+        calls_mark = any(
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Name)
+            and sub.func.id == "mark_cancelled"
+            for stmt in node.body
+            for sub in ast.walk(stmt)
+        )
+        breaks = any(isinstance(stmt, ast.Break) for stmt in node.body)
+        if calls_mark and breaks:
+            hits.append(node)
+
+    assert len(hits) == 1, (
+        "`scan_volume_mft` 的取消分支（`if should_cancel(...)`）必须同时"
+        "「调用 mark_cancelled(...)」和「break」——只 break 不置位会让 UI 把"
+        f"用户取消当成扫描完成。实际命中 {len(hits)} 处。"
+    )
 
 
 # --------------------------------------------------------------------------- #
