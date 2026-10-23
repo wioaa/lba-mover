@@ -27,6 +27,11 @@
 
 ![浅色主题](docs/screenshots/light.png)
 
+> 📖 **原理与深入说明**（架构分层、Win32 契约、介质探测、安全模型、规划算法、
+> v2 引擎实测、N1–N5 功能原理、1.0.0C 密实化 / 分块流式策略）见
+> **[manual_Datasheet.md](manual_Datasheet.md)**；版本变更见
+> **[CHANGELOG.md](CHANGELOG.md)**。本 README 只讲上手与操作。
+
 ---
 
 ## 一、运行方式
@@ -60,7 +65,7 @@ python main.py
 
 ---
 
-## 二、双模式
+## 二、双模式（预览 / 执行）
 
 | 模式 | 行为 | 是否写盘 |
 | --- | --- | --- |
@@ -69,8 +74,7 @@ python main.py
 
 代码层面的隔离措施：唯一的写操作模块 `app/win32/mover.py` 只在
 `MoveWorker.run()` 内部**按需导入**，因此「预览模式」这条代码路径上不存在任何
-写操作调用点（可验证：`import app.ui.main_window` 后
-`'app.win32.mover' in sys.modules` 为 `False`）。
+写操作调用点（细节见 manual_Datasheet.md §1）。
 
 ![深色主题](docs/screenshots/dark.png)
 
@@ -113,7 +117,7 @@ python main.py
    + 必须勾选「我已知晓风险」后确认按钮才可用；
 2. 每个 extent 移动前用位图**逐簇校验**目标区间确实空闲；
 3. 三重几何禁区（卷首 / 卷尾 / MFT 保留区）+ 对象禁区（`$` 元数据 / 压缩 / EFS /
-   无物理分配）；分区表在卷之外，物理上不可达；
+   无物理分配）；分区表在卷之外，物理上不可达（安全模型细节见 manual_Datasheet.md §4）；
 4. 只允许**同卷内**移动，执行前再次校验源文件属于当前卷根；
 5. 任何失败都记录完整上下文（文件、源 / 目标 LCN、簇数、Win32 错误码与文本），
    不吞异常；支持在 extent 之间安全取消（不把单个 extent 撕裂成两半）；
@@ -140,245 +144,34 @@ python main.py
 ## 四、界面说明
 
 ```
-┌ 标题栏：应用标识 / 模式徽章 / 主题切换 / 最小化 · 最大化 · 关闭 ┐
-├ 工具条：卷选择 · 大文件阈值 · 重新读取位图 · 扫描                 ┤
+┌ 标题栏：标识 / 工作模式切换（LBA 迁移 · 分块流式）/ 模式徽章 / 主题 / 窗口按钮 ┐
+├ 工具条：卷选择 · 大文件阈值 · 重新读取位图 · 扫描（含 MFT/句柄通道）        ┤
 ├──────────────┬──────────────────────────┤
-│ 卷 LBA 布局图 │ 迁移摘要（选中文件 / 总字节 / 簇数 / 预留区滑块）│
-│ 大文件列表    │ 模式与操作（分段控件 + 主操作按钮）              │
+│ 卷 LBA 布局图 │ 侧栏（随工作模式切换）：                              │
+│ 大文件列表    │  · LBA 迁移：摘要 / 目标区间+策略+可行性+挡路者+保留区  │
+│              │                / IO 加速 / 执行与恢复 / 模式与操作        │
+│              │  · 分块流式：目的地 / 缓存(内存·硬盘) / 缓冲倍数 / 开始  │
 ├──────────────┴──────────────────────────┤
-│ 进度条 + 折叠式操作日志                                  │
-│ 状态栏：权限徽章 · 簇大小 · 总簇数 · 可用空间 · 文件系统   │
+│ 进度条 + 折叠式操作日志                                     │
+│ 状态栏：权限徽章 · 介质 · 簇大小 · 总簇数 · 可用空间 · 文件系统 │
 └─────────────────────────────────────────┘
 ```
 
-* **卷 LBA 布局图**（自绘）：横向条带按 LCN 递增；上排刻度尺同时标注 LCN 与 GB
-  偏移；`迁移前 / 迁移后` 两条带对比；颜色区分已占用簇 / 空闲簇 / 待迁移文件 /
-  末端预留区（虚线框）/ MFT 保留区（斜纹）；鼠标悬停显示 LCN、偏移、状态与
-  所属文件；超长卷按像素聚合（每像素代表多簇，用占用密度决定深浅）。
-* **大文件列表**：去表格化（无网格线、斑马纹 + 悬停高亮），行高 50px，
-  复选框 / 文件名+完整路径双行 / 带渐变占比条的大小 / 碎片数胶囊徽章
-  （1 段绿、2–5 段黄、>5 段红）/ LCN 区间 / 状态；支持点击表头排序、全选、反选。
-* **右侧规划面板**：迁移摘要 + 末端预留区滑块与数字框联动 + 预览/执行分段控件
-  + 单一主操作按钮（预览态「生成迁移计划」/ 执行态「开始迁移」为危险色）。
+* **顶栏「工作模式」切换**：`LBA 迁移`（簇级精确搬运）与 `分块流式`（用户态分块拷贝）
+  两 种工作模式，切换即换右侧栏，**左侧布局图 + 文件表作为主 UI 全程不变**。
+* **卷 LBA 布局图**（自绘）：横向条带按 LCN 递增；`迁移前 / 迁移后` 两条带对比；
+  可**直接拖选设定目标区间**（与右侧双向同步）；悬停显示 LCN、偏移、状态与所属文件。
+* **大文件列表**：复选框 / 文件名+完整路径 / 大小占比条 / 碎片数徽章 / LCN 区间 / 状态；
+  「前半·候选」标注占卷前半的大文件（应搬末端者）。支持表头排序、全选、反选。
+* **规划策略**（LBA 迁移模式，目标区间面板）：区间装箱 / 自动填满末端 / 区间预密实化 /
+  按大小分区——各策略原理见 manual_Datasheet.md §8。
 * **键盘**：`Ctrl+R` 重新扫描、`Ctrl+E` 执行主操作、`Esc` 取消当前操作、
   `Ctrl+L` 折叠 / 展开日志。
-* 所有耗时操作（位图读取、扫描、规划、移动）都在 `QThread` 中执行，UI 不阻塞。
+* 所有耗时操作都在 `QThread` 中执行，UI 不阻塞。
 
 ---
 
-## 五、文件结构
-
-```
-lba-mover/
-  main.py                    入口：高 DPI、单实例互斥、异常兜底、全局 QSS
-  app/
-    win32/
-      api.py                 kernel32/advapi32 绑定、DeviceIoControl 封装、Win32Error
-      volume.py              卷枚举、GetVolumeInformation、FSCTL_GET_NTFS_VOLUME_DATA
-      bitmap.py              FSCTL_GET_VOLUME_BITMAP 分块读取、popcount、空闲区间提取
-      retrieval.py           FSCTL_GET_RETRIEVAL_POINTERS 变长结构解析
-      storage.py             IOCTL_STORAGE_QUERY_PROPERTY 介质探测（HDD/SSD，只读）
-      mft_reader.py          v2 · $MFT 直读（唯一原始读点，严格只读）
-      mover.py               FSCTL_MOVE_FILE（唯一写操作出口）
-      privilege.py           管理员检测 + SeManageVolumePrivilege 提权
-    core/
-      models.py              VolumeInfo / FileEntry / Extent / MovePlan 等 dataclass
-      ranges.py              纯区间工具（merge / subtract / find_containing）
-      safety.py              安全保留区策略 + 硬下限夹紧 + 安全论证文案
-      guard.py               逐次目标校验（位图 + 保留区 + 禁区 + 越界）
-      ownership.py           LCN 区间 → 文件 的归属索引（N4/N5 共用）
-      io_profile.py          介质策略 / 批次换算 / 段合并 / 预热参数
-      packer.py              FDD 装箱 + 空间账本 + 挡路者识别 + 可行性三档
-      scheduler.py           依赖图 + 电梯序（Kahn + 最小堆）+ 环断裂（relay）
-      journal.py             JSONL 流水（逐段 flush），手动回滚用
-      mft.py                 v2 · FILE 记录解析（fixup / 属性链 / runlist / 路径）
-      planner.py             末端分配（v1）+ 区间装箱入口 build_range_plan（v2）
-      scanner.py             位图/扫描/索引/规划/移动 QThread Worker（含 MFT 双通道）
-    ui/
-      theme.py               浅色 / 深色调色板 + 完整 QSS
-      icons.py               全部矢量图标（QPainter 自绘，无 emoji、无外部资源）
-      cards.py               卡片 / 徽章 / 分段控件 / 自绘复选框与下拉框 / 进度条
-      title_bar.py           无边框标题栏（拖拽、双击最大化、主题与窗口按钮）
-      disk_map.py            LBA 布局图（刻度尺、条带、聚合、悬停气泡、图例）
-      file_table.py          QTableView + 自定义 delegate + 空状态
-      log_panel.py           折叠式彩色日志
-      dialogs.py             危险确认对话框 / 信息对话框
-      main_window.py         无边框圆角窗口、布局编排、业务联动
-  tools/preview_shots.py     开发期截图脚本（只读，不移动任何簇）
-  docs/screenshots/          界面截图
-  requirements.txt
-  run.bat
-```
-
----
-
-## 六、关键 Win32 调用
-
-| 调用 | 控制码 / 结构 | 用途 | 验证结果 |
-| --- | --- | --- | --- |
-| `FSCTL_GET_NTFS_VOLUME_DATA` | `0x00090064`，`NTFS_VOLUME_DATA_BUFFER`（96 B） | 簇大小 / 总簇数 / MFT 区 | R: 实测 19,660,799 簇、4 KiB 簇、MFT 区 `[89440, 129088)` |
-| `FSCTL_GET_VOLUME_BITMAP` | `0x0009006F`，`VOLUME_BITMAP_BUFFER`（16 B 头 + 位图） | 卷占用位图（分块拼接） | R: 2,457,600 字节位图；占用 2,158,869 簇，空闲 17,501,930 簇，与 `NTFS_VOLUME_DATA` 的 `FreeClusters` **完全一致** |
-| `FSCTL_GET_RETRIEVAL_POINTERS` | `0x00090073`，变长 `RETRIEVAL_POINTERS_BUFFER` | 文件 VCN→LCN extents | `ntoskrnl.exe` 解析出 2 段（VCN 0→1388 @LCN 18911832、1388→3206 @LCN 70736138） |
-| `FSCTL_MOVE_FILE` | `0x00090074`，`MOVE_FILE_DATA`（**sizeof = 32**） | 真实移动簇 | 结构体偏移校验：`FileHandle@0`、`StartingVcn@8`、`StartingLcn@16`、`ClusterCount@24`（未在验证中执行真实移动） |
-| `AdjustTokenPrivileges` | `SeManageVolumePrivilege` | 提权 | 非管理员时正确返回失败并给出提示 |
-
-补充验证：`MOVE_FILE_DATA` 的 `ctypes.sizeof` 为 **32 字节**，字段偏移与
-`winioctl.h` 一致；`NTFS_VOLUME_DATA_BUFFER` 按 `"<qqqqqIIIIqqqqq"` 解析，
-长度为 96 字节。
-
----
-
-## 六之二、v2 引擎层（T01–T04）实测数据
-
-引擎层已实现并**只做读取验证**（规模、位图、retrieval pointers、MFT 解析），
-**没有任何一次真实 `FSCTL_MOVE_FILE`**。
-
-### MFT 直读通道 vs 句柄通道（实测，只读）
-
-| 卷 | MFT 通道 | 句柄通道 | 比值 | 记录数 | 在用记录 | 文件 |
-| --- | --- | --- | --- | --- | --- | --- |
-| `R:`（≈75 GiB） | **0.31 s** | 0.68 s | **2.2×**（两次测量 2.2×~3.0×） | 46,592 | 5,363 | 5,143 |
-| `F:`（≈1.8 TiB） | **19.8 s（热缓存）/ 79.9 s（冷缓存）** | 未跑全量（225 k 文件，预计数分钟） | — | 1,587,456 | 225,036 | 约 21 万 |
-
-两条通道的差异不只是速度：句柄通道必须逐文件 `CreateFile` + IOCTL，权限失败、
-被独占打开的文件会被跳过（`R:` 上少 1,206 个）；MFT 通道能列出**全部**登记在案的
-文件（含被独占、压缩、EFS），因此对它们做「可搬性」标注而不是隐藏。
-
-### 抽样复核（证明解析正确性，默认 32 个/次）
-
-| 卷 | 抽样 | 一致 | 不一致 | 多碎片样本 | 说明 |
-| --- | --- | --- | --- | --- | --- |
-| `R:` | 32 | **32** | 0 | 若干 | 按 `(vcn, lcn, clusters)` 三元组比对 |
-| `F:` | 32 | **32** | 0 | 3~4 | 同上；单次扫描 1.59 M 条记录 |
-
-比对的是**三元组**而不是字节数：只比总量会漏掉"vcn 错位导致文件中间段被搬走"这类
-静默数据错乱。不一致率 > 5% 时整条通道自动降级回句柄扫描，并写日志 + 统计留痕。
-
-### 自动回退原因码（不允许静默降级）
-
-| 原因码 | 触发条件 | 用户可见文案 |
-| --- | --- | --- |
-| `not_ntfs` | 卷不是 NTFS | 当前卷不是 NTFS，已改用句柄扫描 |
-| `no_privilege` | 卷设备打不开（非管理员等） | 缺少管理员权限，无法直读 MFT，已改用句柄扫描 |
-| `mft_runlist_unavailable` | `$MFT` 自身 runlist 取不到 | 无法定位 $MFT 的物理布局，已改用句柄扫描 |
-| `structure_invalid` | magic / fixup / 属性头异常超阈值 | MFT 结构不符合预期，已改用句柄扫描 |
-| `bounds_violation` | 原始读越界（`MftBoundsError`） | 原始读越界，已中止 MFT 通道并改用句柄扫描 |
-| `sample_mismatch` | 抽样不一致率 > 5% | MFT 解析可信度不足，已改用句柄扫描 |
-| `user_preferred_handle` | 用户手动选择句柄通道 | 已按用户选择使用句柄扫描 |
-
-### `$MFT` 自身 runlist 的取法
-
-首选 `CreateFile("X:\$MFT")` + `FSCTL_GET_RETRIEVAL_POINTERS`（无需解析引导扇区）。
-该路径在**非提升进程 / 安全软件策略**下会被拒绝（实测 `ERROR_ACCESS_DENIED`），
-此时改用**卷设备句柄 + `MftStartLcn`** 读 `$MFT` 记录 0 取它自己的 runlist
-（仍然只读、仍不解析引导扇区）。两条都不行才整体回退句柄通道，并给出原因码。
-
----
-
-
-## 六之三、v2 用户功能（N1–N5）
-
-v2 在你提的四项需求上做了落地，下面从「用户能感知到什么、为什么安全」两个角度说明。
-
-### N1 · 磁盘安全保留范围（避免 LBA 移动破坏分区表 / 元数据）
-
-移动只发生在**卷内 LCN** 层面，物理上**不可能**触达卷外的分区表；此外再用三道
-几何禁区把危险区域挡在外面：
-
-* **卷首保留区**：默认 16 MiB，硬下限 1 MiB（`clamp_reserve_mb` 唯一换算入口，
-  向上取整 `ceil_div`，不会因 MB→簇换算把保留区悄悄放大）；
-* **卷尾保留区**：末端 LBA 防护，默认 16 MiB，同样有硬下限；
-* **MFT 保留区**：直接读 `MftZoneStart/End` 画成斜纹禁区，绝不把簇搬进 $MFT。
-
-**对象禁区**（跳过并标注不可移动）：`$` 开头的 NTFS 元数据、压缩（WOF/LZX）/
-EFS/无物理分配（`resident $DATA`）的文件。
-
-**双重校验**：规划阶段 `planner` 断言区间合法；执行阶段每次 `FSCTL_MOVE_FILE`
-之前都由 `SafetyGuard.allow()` 再核一次（位图空闲 + 保留区 + 禁区 + 不越界）。
-程序**从不打开 `\\.\PhysicalDriveN` 可写**，分区表在卷之外，物理上不可达。
-
-### N2 · LBA 万向移动（区间装箱）
-
-不再只往卷尾堆：你可以在 LBA 布局图上**拖选任意目标区间** `[start, end)`，工具会：
-
-1. 把选中的大文件**连续**装入该区间（FDD 装箱，按簇数降序、要求连续落位）；
-2. 区间内不属于选中集合的占用（挡路者）**自动识别并迁出**到区间外空闲处；
-3. 给出**可行性三档**量化结论：
-   * `direct` —— 区间内已有足够连续空闲，直接装；
-   * `evict` —— 需要顺带搬走 N 个挡路文件（界面给出清单与「可排除」勾选）；
-   * `impossible` —— 量化原因（"即使腾走全部可驱逐簇仍差 N 簇" / "其中 M 簇归属未知"）。
-
-自重叠文件（落点压到自身某段）或文件间的**依赖环**，用**中转（relay）两阶段**
-（`src → relay → dst`，最多 3 轮环断裂）解决，而不是靠普通碎片落点硬塞。
-
-### N3 · 内存加速（可调缓冲，解决 HDD 半双工）
-
-`FSCTL_MOVE_FILE` 是**文件系统内核里搬数据**，用户态缓冲拷贝既慢又无意义——
-所以这里的「内存加速」是**诚实的 IO 调度**，不是把数据读到用户态再写回：
-
-* **介质探测**：`IOCTL_STORAGE_QUERY_PROPERTY` 的 `StorageDeviceSeekPenaltyProperty=7`
-  （不是 4/6，偏移在 12 字节布局的 offset 8），只有判定为 HDD（有寻道惩罚）才启用加速；
-* **批次合并**：单次 `MoveWorker` 最多合并 65536 簇的连续段，减少 IOCTL 往返；
-* **预读预热**（prewarm）：规划后对目标区间做预算内的预读，摊薄随机寻道；
-* **电梯序**：调度用 Kahn 拓扑序 + 最小堆按 `dst_lcn` 排序，让磁头单向扫；
-* **可调**：右侧「IO 加速」面板可调整缓冲 / 批大小与预热预算。
-
-### N4 · 挡路碎片自动整理
-
-装箱时 `find_blockers` 用位图二次过滤（剔除陈旧归属索引产生的幽灵）找出区间内
-真实挡路文件；`build_evictions` 把**可搬**的挡路者迁出到区间外连续空闲；
-
-* 被独占打开 / `$` 元数据 / 无物理分配 的挡路者**不强行搬**，而计入
-  `unknown_owner_clusters`，使可行性**诚实降级**为 `impossible` 并提示
-  "请开启全卷归属索引（MFT 通道）"；
-* 文件间依赖环通过 `scheduler` 的 Tarjan SCC + relay 打断，不会死锁。
-
-### N5 · MFT 扫描与安全控制
-
-* **直读 `$MFT`**（唯一原始读点，**严格只读**）：校验 `FILE` magic → 应用
-  **USA fixup**（每个扇区恢复 USN）→ 沿 `$ATTRIBUTE_LIST` 回退属性链 →
-  解码 runlist（头部字节低 4 位=长度字节数、高 4 位=**有符号相对偏移**，偏移-长度为
-  稀疏段 `LCN=-1`，VCN 仍推进）；
-* **元数据记录 0–15 排除**，`$Root`(5) 只进路径表不出 `FileEntry`；
-  `resident $DATA` 没有物理簇、不可搬；
-* **双通道**：MFT 直读通道 + 句柄通道，任一失败按原因码（`not_ntfs` /
-  `no_privilege` / `mft_runlist_unavailable` / `structure_invalid` / `bounds_violation`
-  / `sample_mismatch`）**自动回退**到句柄扫描，绝不静默出错；
-* **抽样复核**：默认抽 32 条记录用 `(vcn, lcn, clusters)` 三元组与句柄通道比对，
-  不一致率 > 5% 整条 MFT 通道降级并留痕；
-* **边界安全**：每条记录做边界校验，原始读越界立即中止通道，绝不写任何字节。
-
----
-
-## 七、迁移规划算法
-
-`app/core/planner.py` 是**纯函数**模块，输入输出都是 dataclass / 区间列表，
-可直接单元测试。
-
-1. 末端预留区：`floor = TotalClusters - ReserveClusters`；
-2. 用位图提取 `[floor, TotalClusters)` 内的空闲连续区间（64 KiB 分块 + 大整数
-   位运算，2.4 MiB 位图约 40 ms）；
-3. 从卷尾向前、按「文件簇数降序」依次放置，每个文件要求**连续**落位；
-4. 跳过被占用簇与 MFT 保留区；单个文件大于预留区或剩余连续空间不足时**报错而
-   不是硬塞**；
-5. 已经完全位于预留区内的文件标记为「已就位」，不再搬动；
-6. 输出 `MovePlan`（每个文件的源 extents、目标起始 LCN、目标簇数、需要搬运的
-   逐段 `MoveSegment`），并驱动「迁移前 / 迁移后」两张布局图。
-
----
-
-## 八、安全硬约束
-
-* 只允许**同卷内**移动（执行前再次校验源文件路径属于当前卷根）；
-* 跳过并标记为「不可移动」的对象：`$` 开头的 NTFS 元数据文件、打开句柄失败
-  （被独占 / 权限不足）的文件、无物理分配的文件；
-* 目标 LCN 必须 `< TotalClusters`，目标区间不得跨越卷尾；
-* 目标区间不得与 MFT 保留区、本次任务已占用的目标区间、位图中的已占用簇重叠；
-* 预览模式不加载写操作模块，不存在任何写盘路径。
-
----
-
-## 九、已知限制
+## 五、已知限制
 
 1. **仅支持 NTFS**：位图与 retrieval pointers 依赖 NTFS 的 FSCTL；FAT/exFAT 卷
    会提示不可用。
@@ -392,63 +185,37 @@ EFS/无物理分配（`resident $DATA`）的文件。
    可能出现「部分搬移」的状态；失败详情会完整记录在日志中。
 7. 单实例限制通过命名互斥体实现；关闭过程中若移动线程未能在 1.5 s 内退出会被
    强制放弃等待（`wait` 超时），此时请勿重复启动。
+8. **分块流式模式是文件级拷贝**（目的地簇由文件系统分配），**不保证落到指定 LBA**；
+   其删源为「移入回收站、可恢复」，见 manual_Datasheet.md §8.5。
 
 ---
 
-## 十、开发期截图脚本
+## 六、开发期截图脚本
 
 ```bat
 python tools/preview_shots.py
 ```
 
-该脚本**只读**运行：真实枚举卷、读取位图、在有界目录内解析真实文件的物理布局，
-用真实规划算法生成示例计划，然后把界面渲染到 `docs/screenshots/`。
-它**不会**调用 `FSCTL_MOVE_FILE`。
+该脚本**只读**运行：真实枚举卷、读取位图、解析真实文件的物理布局，用真实规划算法
+生成示例计划，然后把界面渲染到 `docs/screenshots/`。它**不会**调用 `FSCTL_MOVE_FILE`。
 
 ---
 
-## 十一、打包为单文件 EXE
+## 七、打包为单文件 EXE
 
-`dist/LBA-Tail-Mover.exe` 是**单文件、无控制台**的 Windows x64 程序：双击即用，
-目标机器**无需安装 Python / PySide6**（约 45 MB）。
-
-### 构建（在 Windows + 已装 PySide6 的机器上）
+`dist/LBA-Tail-Mover.exe` 是**单文件、无控制台、默认请求管理员（UAC）**的 Windows x64
+程序：双击即用，目标机器**无需安装 Python / PySide6**（约 45 MB）。
 
 ```bat
 pip install pyinstaller
 python -m PyInstaller --clean --noconfirm LBA-Tail-Mover.spec
 ```
 
-产物：`dist/LBA-Tail-Mover.exe`。
-
-### 配置说明
-
-* **`LBA-Tail-Mover.spec`**：`--onefile` + `console=False`。其中 `hiddenimports`
-  显式声明了所有「函数内动态 import」的模块——最关键的是
-  `app.win32.mover`（**唯一写路径**，只在 `MoveWorker.run()` 内按需 import），
-  PyInstaller 的静态分析看不见它，不声明的话打包出来的 EXE 一进「执行模式」就会
-  `ModuleNotFoundError`。同理还有 `app.core.mft` / `app.win32.mft_reader`。
-  `excludes` 剔除了用不到的 WebEngine / Pdf 以减小体积。
-* **`tools/version_info.txt`**：写进 EXE 的 Windows 版本资源。`FileVersion` 用
-  三段号转成的数字四元组（`1.0.0.0`），修订字母只出现在 `ProductVersion`
-  （`1.0.0A`）——与 `app/__init__.py` 的 `__version__` / `__revision__` 对齐可反查。
-
-### 验证打包完整性
+产物：`dist/LBA-Tail-Mover.exe`。自检打包完整性：
 
 ```bat
 LBA-Tail-Mover.exe --selftest
 ```
 
-逐个 import 关键模块（含唯一写路径 `app.win32.mover`），只读、不起界面；
-退出码 `0` = 打包完整，`1` = 有模块缺失。用户在目标机器上跑一下即可自检安装。
-
-### 排障
-
-需要看启动报错时，可临时出一个**带控制台**的版本（打包模块集完全一致，仅多一个
-控制台窗口用于观察输出）：
-
-```bat
-set LBA_BUILD_CONSOLE=1
-set LBA_BUILD_NAME=LBA-Tail-Mover-debug
-python -m PyInstaller --clean --noconfirm LBA-Tail-Mover.spec
-```
+逐个 import 关键模块（含唯一写路径 `app.win32.mover` 与分块流式 `file_io`/`block_stream`），
+退出码 `0` = 打包完整。打包配置与 hidden-import 原理见 manual_Datasheet.md §9。
