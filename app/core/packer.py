@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -383,14 +384,45 @@ def find_blockers(
     selected = set(selected_paths)
     excluded = set(excluded_paths)
     occupied = merge_runs([(int(s), int(e)) for s, e in occupied_runs if e > s])
+    # 1.0.0D 性能：run 起点列表只算一次，供 `_clip_extent` 做二分定位
+    occupied_starts = [run[0] for run in occupied]
 
     buckets: Dict[str, List[Extent]] = {}
+    # 1.0.0D：把 `_clip_extent` 的二分裁剪**内联**进主循环 —— 10 万 extent 级别时
+    # 每.extent 一次函数调用的开销在剖析里是可测的；算法不变，只是少一层调用。
+    extent_cls = Extent
     for path, extent in ownership.query(window.start_lcn, window.end_lcn):
         if path in selected:
             continue
-        # 与"仍占用"区间求交，剔除陈旧索引
-        for piece in _clip_extent(extent, occupied):
-            buckets.setdefault(path, []).append(piece)
+        lcn = extent.lcn
+        lcn_end = extent.lcn_end
+        # 候选占用区间是一段连续下标：
+        #   first = 最后一个 run_start <= lcn 的下标（可能包含 extent 起点）
+        #   last  = 最后一个 run_start <  lcn_end 的下标
+        first = bisect.bisect_right(occupied_starts, lcn) - 1
+        if first < 0:
+            first = 0
+        last = bisect.bisect_left(occupied_starts, lcn_end) - 1
+        pieces: Optional[List[Extent]] = None
+        for index in range(first, last + 1):
+            run_start, run_end = occupied[index]
+            left = lcn if lcn > run_start else run_start
+            right = run_end if run_end < lcn_end else lcn_end
+            if right > left:
+                piece = extent_cls(
+                    vcn=extent.vcn + (left - lcn), lcn=left, clusters=right - left
+                )
+                if pieces is None:
+                    pieces = [piece]
+                else:
+                    pieces.append(piece)
+        if pieces is None:
+            continue
+        bucket = buckets.get(path)
+        if bucket is None:
+            buckets[path] = pieces
+        else:
+            bucket.extend(pieces)
 
     blockers: List[Blocker] = []
     for path, extents in buckets.items():
@@ -429,10 +461,35 @@ def find_blockers(
     return blockers
 
 
-def _clip_extent(extent: Extent, runs: Sequence[Run]) -> List[Extent]:
-    """把 extent 裁剪到给定区间集合上（可能产生多段）。"""
+def _clip_extent(
+    extent: Extent,
+    runs: Sequence[Run],
+    starts: Optional[Sequence[int]] = None,
+) -> List[Extent]:
+    """把 extent 裁剪到给定区间集合上（可能产生多段）。
+
+    ``runs`` 必须是 :func:`merge_runs` 的产物（升序、互不相交）——
+    1.0.0D 起：用 ``bisect`` 按 run 起点定位首个可能相交的 run，向后推进到
+    不相交为止。复杂度 O(E×R) → O(E log R + 命中数)；规划 10 万 extent ×
+    5 万占用区间时这是 :func:`find_blockers` 的绝对热点。
+    ``starts`` 是 ``[r[0] for r in runs]``，由调用方（``find_blockers``）
+    预计算一次复用；不给则内部现算（O(R)，仅小规模场景这么用）。
+    """
     pieces: List[Extent] = []
-    for run_start, run_end in runs:
+    if not runs:
+        return pieces
+    if starts is None:
+        starts = [run[0] for run in runs]
+
+    # 候选区间是一段连续下标：
+    #   first = 最后一个 run_start <= extent.lcn 的下标（它可能包含 extent 起点）
+    #   last  = 最后一个 run_start <  extent.lcn_end 的下标
+    first = bisect.bisect_right(starts, extent.lcn) - 1
+    if first < 0:
+        first = 0
+    last = bisect.bisect_left(starts, extent.lcn_end) - 1
+    for index in range(first, last + 1):
+        run_start, run_end = runs[index]
         left = max(extent.lcn, run_start)
         right = min(extent.lcn_end, run_end)
         if right > left:

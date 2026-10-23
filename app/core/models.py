@@ -160,8 +160,14 @@ class FileEntry:
 
     @property
     def allocated_clusters(self) -> int:
-        """实际占用的簇数（不含稀疏段）。"""
-        return sum(e.clusters for e in self.allocated_extents)
+        """实际占用的簇数（不含稀疏段）。
+
+        1.0.0D：改成生成器求和（原先经 ``allocated_extents`` 先建中间列表，
+        在「10 万 extent 级挡路者识别」的性能剖析里可测）。
+        """
+        return sum(
+            e.clusters for e in self.extents if not e.is_sparse and e.clusters > 0
+        )
 
     @property
     def fragments(self) -> int:

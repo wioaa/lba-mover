@@ -134,6 +134,13 @@ class DiskMapWidget(QWidget):
         self._drag_current: int = -1
         self._dragging: bool = False
         self._selectable: bool = True
+        # ---- 渲染缓存（1.0.0D 性能优化）---- #
+        #: 条带图像缓存：键 = (主题模式, 像素宽, 是否"迁移后")。
+        #: ``_build_band_image`` 每次要跑 width 次 Python 循环（数千像素），
+        #: 悬停 / 拖动时的重绘若都重建会白白烧 CPU。失效时机见
+        #: :meth:`_invalidate_band_cache`（数据代次变化）与 :meth:`resizeEvent`
+        #: （宽度变化）。主题切换由键里的 ``theme.theme().mode`` 自动区分。
+        self._band_cache: dict = {}
         self.setMouseTracking(True)
         self.setMinimumHeight(200)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -147,7 +154,12 @@ class DiskMapWidget(QWidget):
         self._total_clusters = max(0, int(total_clusters))
         self._bytes_per_cluster = max(0, int(bytes_per_cluster))
         self._density = self._compute_density(bits, self._total_clusters)
+        self._invalidate_band_cache()
         self.update()
+
+    def _invalidate_band_cache(self) -> None:
+        """清空条带图像缓存（任何影响密度 / 迁移高亮的数据变化都必须调用）。"""
+        self._band_cache.clear()
 
     def clear(self) -> None:
         """清空全部数据（回到空状态）。"""
@@ -169,6 +181,7 @@ class DiskMapWidget(QWidget):
         self._drag_anchor = -1
         self._drag_current = -1
         self._dragging = False
+        self._band_cache.clear()
         self.update()
 
     def set_mft_zone(self, start_lcn: int, end_lcn: int) -> None:
@@ -219,6 +232,7 @@ class DiskMapWidget(QWidget):
         self._file_ranges = list(ordered)
         self._file_starts = [item[0] for item in ordered]
         self._has_plan = bool(self._sources or self._targets)
+        self._invalidate_band_cache()
         self.update()
 
     def clear_plan_ranges(self) -> None:
@@ -228,6 +242,7 @@ class DiskMapWidget(QWidget):
         self._file_ranges = []
         self._file_starts = []
         self._has_plan = False
+        self._invalidate_band_cache()
         self.update()
 
     # ------------------------------------------------------------------ #
@@ -556,10 +571,22 @@ class DiskMapWidget(QWidget):
         )
 
     def _build_band_image(self, width: int, after: bool) -> Optional[QImage]:
-        """按像素生成条带图像（每像素对多簇取占用密度）。"""
+        """按像素生成条带图像（每像素对多簇取占用密度）。
+
+        结果按 ``(主题模式, width, after)`` 缓存 —— 生成一次要跑 ``width`` 次
+        Python 循环，而重绘（悬停 / 拖动 / 局部失效）远比数据变化频繁。
+        缓存失效：数据变化走 :meth:`_invalidate_band_cache`；宽度变化走
+        :meth:`resizeEvent`；主题切换体现在键里，天然区分。
+        """
+        key = (theme.theme().mode, width, after)
+        cached = self._band_cache.get(key)
+        if cached is not None:
+            return cached
+
         image = QImage(width, 1, QImage.Format.Format_RGB32)
         if not self._density:
             image.fill(QColor(theme.palette()["free"]))
+            self._band_cache[key] = image
             return image
 
         palette = theme.palette()
@@ -624,7 +651,14 @@ class DiskMapWidget(QWidget):
                 strength = min(1.0, src_cov * 3.0)
                 color = _blend(color, _blend(accent, cyan, x / max(1, width)), strength)
             image.setPixel(x, 0, color.rgb())
+        self._band_cache[key] = image
         return image
+
+    def resizeEvent(self, event) -> None:  # noqa: D102
+        # 宽度变了 → 条带图像按像素宽度生成，旧缓存全部作废
+        if self._band_cache:
+            self._band_cache.clear()
+        super().resizeEvent(event)
 
     # ---------------- 图例 ---------------- #
     def _paint_legend(self, painter: QPainter, palette) -> None:
@@ -672,11 +706,12 @@ class DiskMapWidget(QWidget):
             )
 
     # ---------------- 悬停气泡 ---------------- #
-    def _paint_hover_bubble(self, painter: QPainter, palette) -> None:
+    def _hover_bubble_rect(self) -> Optional[QRectF]:
+        """计算悬停气泡矩形（绘制与"局部失效"共用同一套几何，保证不漂移）。"""
+        if self._hover_lcn < 0 or not self._hover_text:
+            return None
         font = QFont(theme.app_font(11))
-        painter.setFont(font)
         metrics = QFontMetrics(font)
-
         line_height = metrics.height() + 2
         padding = 9
         width = max(metrics.horizontalAdvance(line) for line in self._hover_text) + padding * 2
@@ -690,9 +725,20 @@ class DiskMapWidget(QWidget):
             y = self._hover.y() + 18
         if y + height > self.height() - 4:
             y = self.height() - height - 4
-        x = max(4.0, x)
+        return QRectF(max(4.0, x), y, width, height)
 
-        bubble = QRectF(x, y, width, height)
+    def _paint_hover_bubble(self, painter: QPainter, palette) -> None:
+        bubble = self._hover_bubble_rect()
+        if bubble is None:
+            return
+        font = QFont(theme.app_font(11))
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+        line_height = metrics.height() + 2
+        padding = 9
+        width = bubble.width()
+        height = bubble.height()
+
         painter.setPen(QPen(QColor(palette["border_strong"]), 1.0))
         painter.setBrush(QColor(palette["elevated"]))
         painter.drawRoundedRect(bubble, 8, 8)
@@ -733,6 +779,7 @@ class DiskMapWidget(QWidget):
 
     def mouseMoveEvent(self, event) -> None:  # noqa: D102
         position = event.position()
+        old_bubble = self._hover_bubble_rect()
         self._hover = position
         self._hover_lcn = -1
         self._hover_text = []
@@ -751,14 +798,28 @@ class DiskMapWidget(QWidget):
                             self._drag_current = min(
                                 self._total_clusters, lcn + 1
                             )
-                            self.windowSelected.emit(
-                                min(self._drag_anchor, self._drag_current),
-                                max(self._drag_anchor, self._drag_current),
-                            )
+                            # ★ 1.0.0D：拖动中**不再**发 windowSelected ——
+                            # 信号会触发主窗口连锁重算（2-3 次全图重绘）。
+                            # 实时反馈交给 `_preview_window()` 画的紫色预览框，
+                            # 一次性同步推迟到 mouseReleaseEvent。
                         self._hover_text = self._describe(lcn, index == 1)
                         self.lcnHovered.emit(lcn)
                     break
-        self.update()
+
+        if self._dragging:
+            # 拖动中：预览框跨两条条带，直接整幅重绘（条带图像有缓存，开销可控）
+            self.update()
+        else:
+            # ★ 1.0.0D：悬停只重绘「旧气泡 ∪ 新气泡」两块矩形，
+            # 条带 / 刻度 / 图例从 backing store 拷贝，不再整图重画。
+            new_bubble = self._hover_bubble_rect()
+            region: Optional[QRectF] = None
+            for rect in (old_bubble, new_bubble):
+                if rect is None:
+                    continue
+                region = rect if region is None else region.united(rect)
+            if region is not None:
+                self.update(region.toRect().adjusted(-2, -2, 2, 2))
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: D102

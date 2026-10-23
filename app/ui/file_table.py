@@ -11,6 +11,7 @@ from typing import List, Optional
 from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
+    QRect,
     QRectF,
     QSize,
     Qt,
@@ -111,10 +112,22 @@ class FileTableModel(QAbstractTableModel):
 
     def append_entry(self, entry: FileEntry) -> None:
         """增量追加一行（扫描过程中使用）。"""
+        self.append_entries([entry])
+
+    def append_entries(self, entries: List[FileEntry]) -> None:
+        """批量追加多行：**一次** ``beginInsertRows`` / ``endInsertRows``。
+
+        1.0.0D 性能：扫描命中数上万时，逐条 append 会让模型发 N 次
+        ``rowsInserted``、视图重绘 N 次；调用方先做条数 / 时间缓冲再走这里。
+        """
+        if not entries:
+            return
         row = len(self._rows)
-        self.beginInsertRows(QModelIndex(), row, row)
-        self._rows.append(entry)
-        self._max_size = max(self._max_size, entry.size)
+        self.beginInsertRows(QModelIndex(), row, row + len(entries) - 1)
+        self._rows.extend(entries)
+        biggest = max(e.size for e in entries)
+        if biggest > self._max_size:
+            self._max_size = biggest
         self.endInsertRows()
 
     def clear(self) -> None:
@@ -229,6 +242,33 @@ class FileItemDelegate(QStyledItemDelegate):
     def __init__(self, view: "FileTableView") -> None:
         super().__init__(view)
         self._view = view
+        #: 1.0.0D 性能：QFont / QFontMetrics 按 (主题, 角色) 缓存。
+        #: 每行每列 paint 都新建 QFont + QFontMetrics 会在大表上放大 GC 压力；
+        #: 键里带主题模式，主题切换时自然失配重建。
+        self._font_cache: dict = {}
+
+    def _font(self, role: str) -> "tuple[QFont, QFontMetrics]":  # noqa: ANN201
+        """按角色取缓存的 ``(QFont, QFontMetrics)``。
+
+        角色表：``name`` / ``path`` / ``size`` / ``badge`` / ``lcn``。
+        """
+        key = (theme.theme().mode, role)
+        cached = self._font_cache.get(key)
+        if cached is None:
+            if role == "name":
+                font = QFont(theme.app_font(13, QFont.Weight.DemiBold))
+            elif role == "path":
+                font = QFont(theme.app_font(11))
+            elif role == "size":
+                font = QFont(theme.mono_font(12))
+                font.setWeight(QFont.Weight.DemiBold)
+            elif role == "badge":
+                font = QFont(theme.app_font(11, QFont.Weight.DemiBold))
+            else:  # lcn
+                font = QFont(theme.mono_font(11))
+            cached = (font, QFontMetrics(font))
+            self._font_cache[key] = cached
+        return cached
 
     # ---------------- 绘制 ---------------- #
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index: QModelIndex) -> None:
@@ -306,10 +346,9 @@ class FileItemDelegate(QStyledItemDelegate):
         left = rect.left() + 8
         width = rect.width() - 16
 
-        font_name = QFont(theme.app_font(13, QFont.Weight.DemiBold))
+        font_name, metrics = self._font("name")
         painter.setFont(font_name)
         painter.setPen(QColor(palette["text"] if entry.movable else palette["text_dim"]))
-        metrics = QFontMetrics(font_name)
         name = metrics.elidedText(entry.name, Qt.TextElideMode.ElideRight, int(width))
         painter.drawText(
             QRectF(left, rect.top() + 7, width, 18),
@@ -317,10 +356,9 @@ class FileItemDelegate(QStyledItemDelegate):
             name,
         )
 
-        font_path = QFont(theme.app_font(11))
+        font_path, metrics_path = self._font("path")
         painter.setFont(font_path)
         painter.setPen(QColor(palette["text_faint"]))
-        metrics_path = QFontMetrics(font_path)
         reason = entry.reason if (entry.reason and not entry.movable) else entry.path
         path_text = metrics_path.elidedText(reason, Qt.TextElideMode.ElideMiddle, int(width))
         painter.drawText(
@@ -356,8 +394,7 @@ class FileItemDelegate(QStyledItemDelegate):
         painter.setBrush(gradient)
         painter.drawRoundedRect(fill, 6, 6)
 
-        font = QFont(theme.mono_font(12))
-        font.setWeight(QFont.Weight.DemiBold)
+        font, _metrics = self._font("size")
         painter.setFont(font)
         painter.setPen(QColor(palette["text"]))
         painter.drawText(
@@ -382,9 +419,8 @@ class FileItemDelegate(QStyledItemDelegate):
             "neutral": ("text_dim", "sunken"),
         }.get(kind, ("text_dim", "sunken"))
 
-        font = QFont(theme.app_font(11, QFont.Weight.DemiBold))
+        font, metrics = self._font("badge")
         painter.setFont(font)
-        metrics = QFontMetrics(font)
         width = metrics.horizontalAdvance(text) + 20
         height = 22.0
         left = rect.left() + 8
@@ -399,10 +435,9 @@ class FileItemDelegate(QStyledItemDelegate):
         painter.drawText(pill, int(Qt.AlignmentFlag.AlignCenter), text)
 
     def _paint_lcn(self, painter: QPainter, palette, rect: QRectF, entry: FileEntry) -> None:
-        font = QFont(theme.mono_font(11))
+        font, metrics = self._font("lcn")
         painter.setFont(font)
         painter.setPen(QColor(palette["text_dim"] if entry.movable else palette["text_faint"]))
-        metrics = QFontMetrics(font)
         text = metrics.elidedText(entry.lcn_text, Qt.TextElideMode.ElideRight, int(rect.width() - 18))
         painter.drawText(
             QRectF(rect.left() + 8, rect.top(), rect.width() - 16, rect.height()),
@@ -530,20 +565,42 @@ class FileTableView(QTableView):
     def mouseMoveEvent(self, event) -> None:  # noqa: D102
         row = self._row_at(event.position().toPoint())
         if row != self.hover_row:
+            # 1.0.0D 性能：只重绘旧行 + 新行两块矩形（整幅 viewport().update()
+            # 在数万行的表格上会让每次悬停移动都全表重画）
+            old_rect = self._row_rect(self.hover_row)
             self.hover_row = row
             self.setCursor(
                 Qt.CursorShape.PointingHandCursor
                 if row >= 0
                 else Qt.CursorShape.ArrowCursor
             )
-            self.viewport().update()
+            new_rect = self._row_rect(row)
+            for rect in (old_rect, new_rect):
+                if rect.isValid():
+                    self.viewport().update(rect)
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event) -> None:  # noqa: D102
         if self.hover_row != -1:
+            old_rect = self._row_rect(self.hover_row)
             self.hover_row = -1
-            self.viewport().update()
+            if old_rect.isValid():
+                self.viewport().update(old_rect)
         super().leaveEvent(event)
+
+    def _row_rect(self, row: int):  # noqa: ANN201 - QRect
+        """第 ``row`` 行在 viewport 坐标系里的整行矩形；无效返回无效 QRect。"""
+        if row < 0 or not self.model():
+            return QRect()
+        top_left = self.visualRect(self.model().index(row, 0))
+        if top_left.isNull():
+            return QRect()
+        return QRect(
+            0,
+            top_left.y(),
+            self.viewport().width(),
+            self.rowHeight(row),
+        )
 
     def _on_header_clicked(self, column: int) -> None:
         if column in (COL_NAME, COL_SIZE, COL_FRAG, COL_LCN, COL_STATUS):

@@ -250,6 +250,15 @@ class MainWindow(QMainWindow):
         self._feasibility_timer.setInterval(FEASIBILITY_DEBOUNCE_MS)
         self._feasibility_timer.timeout.connect(self._compute_feasibility_now)
 
+        # ---- 1.0.0D 性能：扫描结果批量插入（64 条或 100ms）---- #
+        self._scan_buffer: List[FileEntry] = []
+        self._scan_flush_timer = QTimer(self)
+        self._scan_flush_timer.setSingleShot(True)
+        self._scan_flush_timer.setInterval(100)
+        self._scan_flush_timer.timeout.connect(self._flush_scan_buffer)
+        # ---- 1.0.0D 性能：按钮状态记忆（避免高频 QSS unpolish+polish）---- #
+        self._button_state: Optional[tuple] = None
+
         theme.theme().prepare_fonts()
 
         self._build_ui()
@@ -934,6 +943,8 @@ class MainWindow(QMainWindow):
             f"阈值 {human_bytes(threshold)}（仅读取布局）"
         )
         self._table.file_model.clear()
+        self._scan_buffer.clear()
+        self._scan_flush_timer.stop()
         self._table.set_scanning_state("正在扫描卷上的大文件…")
         self._scan_panel.clear_stats()
         self._progress.set_indeterminate(True)
@@ -993,15 +1004,33 @@ class MainWindow(QMainWindow):
             scanned, max(1, scanned + 1), f"已处理 {scanned:,} 项", current
         )
 
+    #: 扫描结果批量插入的缓冲条数（配合 100ms 定时器）
+    SCAN_FLUSH_COUNT = 64
+
     def _on_scan_found(self, entry: FileEntry) -> None:
         if not isinstance(entry, FileEntry):
             return
-        self._table.file_model.append_entry(entry)
+        # 1.0.0D 性能：逐条 append 会让模型发 N 次 rowsInserted 且每次触发视图
+        # 重绘；改为缓冲 64 条或 100ms，一次批量插入。
+        self._scan_buffer.append(entry)
+        if len(self._scan_buffer) >= self.SCAN_FLUSH_COUNT:
+            self._flush_scan_buffer()
+        else:
+            self._scan_flush_timer.start()
+
+    def _flush_scan_buffer(self) -> None:
+        """把扫描缓冲里的条目一次性插进表格模型。"""
+        self._scan_flush_timer.stop()
+        if not self._scan_buffer:
+            return
+        items, self._scan_buffer = self._scan_buffer, []
+        self._table.file_model.append_entries(items)
         self._count_badge.set_state(
             f"{self._table.file_model.rowCount()} 个", "accent"
         )
 
     def _on_scan_completed(self, entries: object) -> None:
+        self._flush_scan_buffer()
         items: List[FileEntry] = list(entries) if isinstance(entries, list) else []
         self._table.file_model.set_entries(items)
         self._progress.set_indeterminate(False)
@@ -1060,6 +1089,7 @@ class MainWindow(QMainWindow):
         )
 
     def _on_scan_failed(self, message: str) -> None:
+        self._flush_scan_buffer()
         self._progress.set_indeterminate(False)
         self._progress.reset("扫描失败")
         self._table.set_empty_state("扫描失败", message, "warning")
@@ -1152,19 +1182,22 @@ class MainWindow(QMainWindow):
         self._on_selection_changed()
 
     def _on_selection_changed(self) -> None:
+        # 1.0.0D 性能：`checked_entries()` 只算一次向下传递
+        # （原先在本方法 / _update_summary / _refresh_disk_preview 里各算一遍）
         selected = self._table.file_model.checked_entries()
         self._count_badge.set_state(
             f"{self._table.file_model.rowCount()} 个 · 选 {len(selected)}",
             "accent" if selected else "neutral",
         )
         self._plan_stale = True
-        self._update_summary()
-        self._refresh_disk_preview()
+        self._update_summary(selected)
+        self._refresh_disk_preview(selected)
         self._schedule_feasibility()
         self._sync_buttons()
 
-    def _update_summary(self) -> None:
-        selected = self._table.file_model.checked_entries()
+    def _update_summary(self, selected: Optional[List[FileEntry]] = None) -> None:
+        if selected is None:
+            selected = self._table.file_model.checked_entries()
         total_bytes = sum(e.size for e in selected)
         self._summary.set_selection(len(selected), total_bytes)
         if self._plan is not None and not self._plan_stale:
@@ -1180,8 +1213,11 @@ class MainWindow(QMainWindow):
     # ================================================================== #
     # 布局图联动
     # ================================================================== #
-    def _refresh_disk_preview(self) -> None:
-        selected = self._table.file_model.checked_entries()
+    def _refresh_disk_preview(
+        self, selected: Optional[List[FileEntry]] = None
+    ) -> None:
+        if selected is None:
+            selected = self._table.file_model.checked_entries()
         sources = []
         file_ranges = []
         for entry in selected:
@@ -1385,16 +1421,14 @@ class MainWindow(QMainWindow):
 
         if self._io_panel.engine() == ENGINE_STREAM:
             # 分块流式引擎：免规划，选中文件即可执行（用户态，不要求卷特权）
-            self._action_button.setText("开始分块流式迁移")
-            cards.set_role(self._action_button, "danger")
-            self._action_button.setEnabled(
-                selected > 0 and self._snapshot is not None and not self._busy
+            self._apply_action_button(
+                ("开始分块流式迁移", "danger"),
+                selected > 0 and self._snapshot is not None and not self._busy,
             )
             return
 
         if self._mode == MODE_PREVIEW:
-            self._action_button.setText("生成迁移计划")
-            cards.set_role(self._action_button, "primary")
+            desired = ("生成迁移计划", "primary")
             enabled = (
                 selected > 0
                 and self._snapshot is not None
@@ -1403,12 +1437,10 @@ class MainWindow(QMainWindow):
             )
         else:
             if plan_ready:
-                self._action_button.setText("开始迁移")
-                cards.set_role(self._action_button, "danger")
+                desired = ("开始迁移", "danger")
                 enabled = self._is_admin and self._privilege_ok and not self._busy
             else:
-                self._action_button.setText("生成迁移计划")
-                cards.set_role(self._action_button, "primary")
+                desired = ("生成迁移计划", "primary")
                 enabled = (
                     selected > 0
                     and self._snapshot is not None
@@ -1416,6 +1448,21 @@ class MainWindow(QMainWindow):
                     and not self._busy
                     and feasible
                 )
+        self._apply_action_button(desired, enabled)
+
+    def _apply_action_button(self, desired: tuple, enabled: bool) -> None:
+        """只在 (文案, 角色, 可用态) 真变化时触碰主按钮。
+
+        ``cards.set_role`` 内部是 unpolish + polish（QSS 重解析），高频调用
+        会白白烧 CPU；勾选框变化 / 悬停重算都会走到 ``_sync_buttons``，
+        这里记忆上次状态，三者全等时直接跳过。
+        """
+        state = (desired[0], desired[1], enabled)
+        if state == self._button_state:
+            return
+        self._button_state = state
+        self._action_button.setText(desired[0])
+        cards.set_role(self._action_button, desired[1])
         self._action_button.setEnabled(enabled)
 
     # ================================================================== #
