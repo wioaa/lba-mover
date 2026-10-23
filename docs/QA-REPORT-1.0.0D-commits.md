@@ -549,3 +549,162 @@ cancelled = bool(getattr(self.sender(), "cancelled", False))
 **放行，可打包推送。** 生产代码侧（`fadad65` + `f1b4a80`）已达标：取消不再被报成完成、不自动勾选、不建残索引、不卡忙碌态、`fallback_code` 与 `ok` 语义未被污染；两处直调兜底与顺序契约均生效。
 
 **唯一待办**：第三个 commit（仅测试，+41 行调用点钉子）仍未提交——它不改变运行时行为，所以不阻塞打包；但**必须提交**，否则"取消分支被删掉调用行"这一层永远没有钉子看守（我已实测该钉子在变异下会红、还原后通过）。
+
+> **本章条已关闭**：该批已作为 `3d2aa27` 提交（`tests/test_cancel_semantics.py` +41、`CHANGELOG.md` +1），随后 `dea5d0f` 把本报告 §13~§16 入库并推到远端。见 §17。
+
+---
+
+## 17. 1.0.0E 正式验收（基线 `3d2aa27`，含第三批调用点钉子）
+
+**最终发布基线 = `dea5d0f`（远端 `main`，我用 `git ls-remote origin refs/heads/main` 独立核过）**。`dea5d0f` 相对 `3d2aa27` 只有一处改动：`docs/QA-REPORT-1.0.0D-commits.md` +232 行（本报告 §13~§16），**零源码、零测试**。因此本章对 `3d2aa27` 的全部实测结论对 `dea5d0f` 逐条成立，不需要重跑；team-lead 侧在 `dea5d0f` 上另跑过 testflow = 335/0，与本机结果一致。
+
+取证脚本：`qa_work/e1_scan_cancel_check.py`、**`qa_work/e2_callpoint_nail_audit.py`**（新增，6 变异判别力审计）、**`qa_work/e2b_proposed_nail_check.py`**（新增，验证我建议的加固写法）、`qa_work/e3_offscreen_smoke.py`。工作区 `git status` 干净（`dea5d0f` 已把本报告入库），源码文件 sha256 `b99186c4…`，变异后逐次还原并校验一致。
+
+### 17.1 三项要求：全部达成
+
+| 项 | 结果 |
+|---|---|
+| `e1`（对 `3d2aa27` 提交版） | **18/18 PASS**，脚本自判"全绿：取消语义已达标" |
+| testflow 全量 | **335 passed / 0 failed / 0 errors / 0 skipped**（44.7s，`reason=ok`） |
+| 用例数核对 | `test_cancel_semantics.py` **12**、`test_ui_execute_flow.py` **14**，全仓 `def test_` 合计 **335**，与 testflow 汇总一致 |
+| 版本 / 隔离 / 冒烟 | `display_version()=="1.0.0E"`；`app.win32.mover` 未加载；主窗可构建、初始 `_busy=False`、`_plan_worker=None` |
+
+### 17.2 第三批调用点钉子：变异审计（我独立做，非引用其自述）
+
+钉的是 `test_scan_volume_mft_cancel_branch_calls_mark_cancelled`（AST 扫 `scan_volume_mft`，要求"含 `should_cancel` 的 `if` 分支 body 同时含 `mark_cancelled(...)` 与 `break`，且此类分支恰好 1 处"）。
+
+| 变异（我施加在真源文件上，跑完逐次还原） | 行为是否坏了 | 调用点钉子 | 函数钉子 | 期望 | 判定 |
+|---|---|---|---|---|---|
+| 基线 `3d2aa27` | — | **绿** | **绿** | 绿 | OK |
+| M1 删 `mark_cancelled` 留 `break`（工程师复现过的洞） | 坏 | **红** | 绿 | 红 | **OK，且证明它钉的是接线不是实现** |
+| M2 删 `break` 留调用 | 坏（取消后仍扫完整个 MFT） | **红** | 绿 | 红 | OK |
+| M3 `break` 前置（调用变死代码） | 坏 | **绿** | 绿 | 红 | **假绿（漏网）** |
+| M4 调用包进 `if False:` | 坏（永不置位） | **绿** | 绿 | 红 | **假绿（漏网）** |
+| M5 守卫改本地别名 `probe = should_cancel`（纯重构） | **不变** | **红** | 绿 | 绿 | 假红（过硬，但红是安全方向） |
+| M6 在路径重建阶段**新增第二个正确取消分支** | **更好** | **红** | 绿 | 绿 | **假红（过硬，正常演进会误伤）** |
+
+- 结论 A（回答"变异是否真红"）：**是**。M1 下只有调用点钉子红、函数钉子仍绿，与工程师自述一致——它确实锚定"接线"这一层。
+- 结论 B（回答"恰好 1 处会不会误红"）：**会**。`len(hits) == 1` 把"分支数量"也钉死了：将来在采样/路径重建阶段加第二个**完全正确**的取消分支（M6），语义更强却判红。建议改成"**每一处**取消分支都必须接线"，而不是"**只有一处**取消分支"。
+- 结论 C（新发现的漏网方向）：现状断言只要求"同一 body 里既有调用又有 `break`"，**不检查顺序、不检查可达性**。所以 `break; mark_cancelled(...)`（M3，最像手滑挪行的事故）与 `if False: mark_cancelled(...)`（M4）都是绿的——两者都会让取消语义完全丢失，而函数钉子也照旧绿。**这是比"删掉调用行"更隐蔽的复发路径。**
+
+### 17.3 我建议的加固写法（已在内存中验证判别力，未改仓库）
+
+```python
+branches = [n for n in ast.walk(tree) if isinstance(n, ast.If)
+            and any(isinstance(s, ast.Name) and s.id == "should_cancel" for s in ast.walk(n.test))]
+assert branches, "找不到任何以 should_cancel 为守卫的取消分支（取消能力被删？）"
+for node in branches:
+    call_idx = next((i for i, st in enumerate(node.body)
+                     if isinstance(st, ast.Expr) and isinstance(st.value, ast.Call)
+                     and getattr(st.value.func, "id", "") == "mark_cancelled"), None)
+    break_idx = next((i for i, st in enumerate(node.body) if isinstance(st, ast.Break)), None)
+    assert call_idx is not None, "取消分支没有直接调用 mark_cancelled(...)"
+    assert break_idx is not None, "取消分支没有 break"
+    assert call_idx < break_idx, "mark_cancelled 在 break 之后 → 死代码"
+```
+
+`qa_work/e2b_proposed_nail_check.py` 实测（纯文本变异，不写盘）：
+
+| | M1 | M2 | M3 | M4 | M5 | M6 |
+|---|---|---|---|---|---|---|
+| 现状写法 | 红 | 红 | **绿** | **绿** | 红 | **红** |
+| 建议写法 | 红 | 红 | **红** | **红** | 红 | **绿** |
+
+即：3 个问题变异修好 2 个（M3/M4），M6 的误红消除；**M5（把守卫改成别名）仍会红**——任何靠 AST 认名字的钉子都做不到跟随别名，这一条只能靠"红了就去改测试"消化，方向安全（响而不是哑）。
+
+### 17.4 打包状态
+
+`dist/LBA-Tail-Mover.exe` 资源 `ProductVersion=1.0.0E`、`FileVersion=1.0.0.0`，时间戳 `2026-10-24 06:52:59`，**晚于 `3d2aa27`（06:51:33）**，之后只有文档 commit `dea5d0f`。即现有产物已含全部 1.0.0E 运行时改动（第三批仅测试，不影响产物）。重打包可做但非必需。注：PyInstaller 压缩了 pyc，字节里搜不到 `mark_cancelled` 等符号属正常，不能作为"未打进去"的证据。
+
+**`tests/` 不进产物（已核 `.spec`）**：`datas=[]`、`scripts=[main.py]`，`Analysis` 从入口沿 import 图收集；`app/` 从不 import `tests/`，故任何**纯测试 commit 都不会改变 exe 字节**，也不需要重打包。这条是"P3 钉子硬化可以在 1.0.0E 发布后再补一个测试 commit"的依据。
+
+### 17.5 放行结论
+
+**放行，可打包推送三个 commit。** 阻断/严重级 0 条。
+
+新增 1 条 **建议级（P3，不阻塞）**：调用点钉子的判别边界——`hits == 1` 过硬（M6 误红）、且不辨顺序/可达性（M3/M4 漏网）。修法见 17.3，可在 1.0.0E 之后单独一个测试 commit 处理；**不影响本次发布**，因为取消语义本身已由 5 层钉子把守（函数钉子 + 调用点钉子 + worker `cancelled` 属性 + UI 取消分支 + 直调兜底），漏掉的只是"将来有人挪行"的一种形态。
+
+### 17.6 发布状态（收尾）
+
+| 项 | 状态 |
+|---|---|
+| 远端 `main` | `dea5d0f`（`git ls-remote` 独立核对一致），本地 `main` 无 ahead/behind |
+| 推送链 | `fadad65` → `f1b4a80` → `3d2aa27` → `dea5d0f` |
+| 产物 | `dist/LBA-Tail-Mover.exe` `ProductVersion=1.0.0E`；`--selftest` exit=0（team-lead 侧） |
+| §16.6「唯一待办」 | **已关闭**（由 `3d2aa27` 交付） |
+| 本报告 §17 | 本次新增，尚未入库（唯一未提交文件） |
+| P3 钉子硬化 | 已转工程师，建议在下一批次单独一个测试 commit 处理 |
+
+---
+
+## 18. P3 闭环：调用点钉子硬化（`1990122` + `1d1d01c`，本地 ahead 2，待推）
+
+### 18.1 两个 commit 的性质（我先核范围，再跑测试）
+
+| commit | 内容 | `app/` 改动 |
+|---|---|---|
+| `1990122` | 调用点钉子重写为「接线 + 顺序」，去掉「恰好一处」 | **空** |
+| `1d1d01c` | 只加 13 行注释（「有意红」清单 + 覆盖边界） | **空** |
+
+`git diff --stat HEAD~1 HEAD -- app/` 为空；`1d1d01c` 相对 `1990122` 去掉注释行后 diff 为**零**（纯注释）。故两版对**产品代码零影响**，`dist/` 无需重打（依据见 §17.4：`tests/` 不进依赖图）。
+
+### 18.2 六格变异矩阵：`3d2aa27` → `1d1d01c` 的实测变化
+
+`qa_work/e2_callpoint_nail_audit.py`（写进真源 → 跑 → 还原 → 校验 sha256，本机实测）：
+
+| 变异 | 行为 | `3d2aa27`（旧钉子） | `1d1d01c`（新钉子） | 期望 |
+|---|---|---|---|---|
+| M1 删调用留 `break` | 坏 | 红 | **红** | 红 |
+| M2 删 `break` 留调用 | 坏 | 红 | **红** | 红 |
+| M3 `break` 前置（死代码） | 坏 | **绿（假绿）** | **红** ✅ | 红 |
+| M4 调用包 `if False:` | 坏 | **绿（假绿）** | **红** ✅ | 红 |
+| M5 守卫改别名 | 不变 | 红（过硬） | **红（有意保留）** | 红（已接受） |
+| M6 新增第二个正确分支 | 更好 | **红（假红）** | **绿** ✅ | 绿 |
+
+脚本自判：**「无假绿、无假红：钉子的判别力边界与设计意图一致。」** 两个假绿 + 一个假红全部消除，M5 由「意外过硬」转为「文档化的有意红」。
+
+### 18.3 新钉子的实现要点（我逐条对照过，与我在 §17.3 验证的算法等价）
+
+`_cancel_branches`（全部以 `should_cancel` 为守卫的 `ast.If`，不限数量）+ `_first_index`（**只扫直接子语句**、返回下标）+ `_is_mark_cancelled_call`（`ast.Expr` + `Call` + 裸名 `mark_cancelled`）+ 四条断言链（`branches` 非空 → `call_at` 存在 → `break_at` 存在 → `call_at < break_at`）。失败信息带 `lineno`，比我的版本更好定位。三个 helper 以 `_` 前缀命名，`test_*` 收集不受影响（用例数仍 12）。
+
+### 18.4 已知且**有意不覆盖**的边界（已写进 docstring，我也认同）
+
+| 形态 | 新钉子 | 是否为缺陷 |
+|---|---|---|
+| 守卫改名 / 抽成 `_check_cancel()` 辅助函数 | 红 | 不是——AST 认名字跟不了别名，**红是响不是哑**（M5 同类） |
+| 属性调用 `mft_reader.mark_cancelled(...)` | 红 | 同上，改结构须同步改钉子 |
+| 改中断方式为 `raise _ScanCancelled` | 红 | 行为等价，属"改结构"；`continue` 形态则属**真红**（不中断解析） |
+| 条件写反 `if should_cancel(...) is False:`（M7） | **绿** | **职责边界**：这一层是"接线+顺序"，判条件语义应交给行为钉子；用 AST 判语义是反模式 |
+
+M7 是我在 §17 之后自己构造的第七个形态，明确**不塞进**这枚钉子——把边界写下来，比无限加断言更有价值。
+
+### 18.5 收尾数据
+
+| 项 | 实测 |
+|---|---|
+| `e2`（`1d1d01c`） | 基线绿；M1~M5 红、M6 绿；`无假绿、无假红` |
+| `e2b` | 已改为**历史对照**（`3d2aa27` vs 加固版），现行判据以 `e2` 为准 |
+| testflow（`1d1d01c`） | **335 passed / 0 failed / 0 errors / 0 skipped**（46.7s，`reason=ok`） |
+| testflow（`1990122`） | 335/0（59.7s） |
+| 用例数 | `test_cancel_semantics.py` 12、`test_ui_execute_flow.py` 14 |
+| 真源 sha256 | `b99186c4…`（每次变异后均校验还原） |
+
+> 过程插曲：在 `1990122` 上首跑 testflow 得到 `INVALID (source-changed)`，原因是工程师**并发**在改 `tests/test_cancel_semantics.py`（mtime 落在本次运行窗口内，且改完内容与 HEAD 相同）。这是 §17 已定性的设计行为，重跑即 PASS，**不记为缺陷**。
+> 但它暴露了变异探针的真实风险：**就地改真源**会与并发工作互相干扰。为此我验证了「影子副本」方案（§18.6）。
+
+### 18.6 变异探针的改进方案（已验证，建议采纳）
+
+`qa_work/e2c_shadow_mutation_probe.py`：把 `app/` + `tests/` 拷到临时目录 → 改**副本** → 在副本里跑测试。实测：
+
+```
+影子副本基线：调用点钉子=绿
+影子副本 M1：调用点钉子=红（期望红）
+真源文件未被修改：是
+结论：影子副本方案 可行，且结论与就地变异一致
+```
+
+好处：①真仓库全程只读，**与并发工作零冲突**；②进程被杀也不会留下变异源码（我现在靠 sha256 断言兜底，属于事后检测而非事前预防）。代价是多一次几 MB 的 `copytree`（毫秒级）。
+
+### 18.7 结论
+
+**P3 已闭环，验收 PASS。** 调用点钉子从「钉共存 → 钉接线+顺序」完成升级，两个假绿方向（`break` 前置、`if False:` 包裹）与一个假红方向（分支数量）全部消除，边界已文档化。唯一待办是**推送**（本地 ahead 2）与 §17/§18 一并入库；推送后基线变为 `1d1d01c`，运行时产物不变。
