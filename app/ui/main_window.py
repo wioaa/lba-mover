@@ -1728,9 +1728,9 @@ class MainWindow(QMainWindow):
                 "配置未应用",
                 "目标区间 / IO 配置有未应用的修改。当前计划基于修改前的参数。",
                 choices=[
-                    ("先应用再执行", "primary"),
-                    ("按现有计划执行", "danger"),
-                    ("取消", "secondary"),
+                    ("apply", "先应用再执行", "primary"),
+                    ("proceed", "按现有计划执行", "danger"),
+                    ("cancel", "取消", "secondary"),
                 ],
                 kind="warn",
                 parent=self,

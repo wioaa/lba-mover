@@ -443,11 +443,18 @@ class ChoiceDialog(QDialog):
         dialog = ChoiceDialog(
             "配置未应用",
             "目标区间 / IO 配置有未应用的修改……",
-            choices=[("先应用再执行", "primary"), ("按现有计划执行", "danger"), ("取消", "secondary")],
+            choices=[
+                ("apply", "先应用再执行", "primary"),
+                ("proceed", "按现有计划执行", "danger"),
+                ("cancel", "取消", "secondary"),
+            ],
             kind="warn", parent=self,
         )
         if dialog.exec() and dialog.choice == "apply": ...
 
+    * ``choices`` 是 ``(代号, 按钮文字, 角色)`` 三元组 —— **代号**才是
+      ``choice`` 的取值（B-1 回归钉：早期版本把按钮文字存进了 ``choice``，
+      调用方按代号比对的两个分支永远不可达）；
     * 点任一按钮 → ``choice`` 记下对应代号并 ``accept()``；
     * 按 Esc / 关闭 → ``reject()``（``choice`` 保持 ``None``）。
     """
@@ -456,7 +463,7 @@ class ChoiceDialog(QDialog):
         self,
         title: str,
         message: str,
-        choices: Sequence[Tuple[str, str]],
+        choices: Sequence[Tuple[str, str, str]],
         *,
         kind: str = "warn",
         parent: Optional[QWidget] = None,
@@ -510,7 +517,7 @@ class ChoiceDialog(QDialog):
 
         row = QHBoxLayout()
         row.addStretch(1)
-        for index, (text, role) in enumerate(choices):
+        for index, (code, text, role) in enumerate(choices):
             button = QPushButton(text, card)
             button.setProperty("role", role)
             button.setMinimumWidth(118)
@@ -521,7 +528,7 @@ class ChoiceDialog(QDialog):
             )
             row.addWidget(button)
         layout.addLayout(row)
-        self._codes = [code for code, _role in choices]
+        self._codes = [code for code, _text, _role in choices]
 
     def _pick(self, index: int) -> None:
         if 0 <= index < len(self._codes):

@@ -65,9 +65,9 @@ class TargetPanel(QWidget):
     windowChanged = Signal()
     excludeChanged = Signal(object)      # FrozenSet[str]
     reserveChanged = Signal(int, int)    # 卷首 MB, 卷尾 MB
-    modeChanged = Signal(str)            # MODE_ANY / MODE_QUICK
     strategyChanged = Signal(str)        # range / auto_fill / compact / zone
-    #: (是否待定, 变更组数)。变更组：目标区间 / 规划策略 / 保留区。
+    #: (是否待定, 变更组数)。变更组（实现为 2 组）：目标区间（含模式 /
+    #: 规划策略 / 快捷参数，策略变化伴随区间定义来源变化，故并入区间组）/ 保留区。
     pendingChanged = Signal(bool, int)
 
     #: 规划策略：标签 → PlanWorker mode（1.0.0C 新增）
@@ -134,7 +134,7 @@ class TargetPanel(QWidget):
         return self._snapshot() != self._committed
 
     def pending_count(self) -> int:
-        """变更组数（目标区间 / 规划策略 / 保留区）。"""
+        """变更组数（2 组：目标区间〔含模式/策略/快捷参数〕、保留区）。"""
         current = self._snapshot()
         count = 0
         if current[self._WINDOW_SLICE] != self._committed[self._WINDOW_SLICE]:
@@ -429,7 +429,8 @@ class TargetPanel(QWidget):
         self._emit_pending()
 
     def _emit_pending(self) -> None:
-        """控件变化 → 只报待定态，不动既有语义信号（等「应用配置」）。"""
+        if self._guard:
+            return
         self.pendingChanged.emit(True, self.pending_count())
 
     def window(self) -> Tuple[int, int]:

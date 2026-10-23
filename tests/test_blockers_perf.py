@@ -164,9 +164,16 @@ def test_find_blockers_scale_is_sublinear() -> None:
     started = time.perf_counter()
     blockers = find_blockers(window, [], ownership, occupied_runs, by_path)
     elapsed_ms = (time.perf_counter() - started) * 1000.0
+    hit_rate = len(blockers) / count if count else 0.0
     print(
         f"\n[perf] find_blockers：{count:,} extent × {len(occupied_runs):,} 占用区间 "
         f"→ {len(blockers):,} 个挡路者，耗时 {elapsed_ms:.1f} ms"
+    )
+    print(
+        "[perf] ★ 基准口径：extent 命中率 50%（10 万中 5 万成挡路者，"
+        "其余 5 万为陈旧索引走裁剪-空廉价路径）。命中率不同的场景数值不可直接对比"
+        "（QA 独立场景 100% 命中 + 65,000 blockers 实测 431 ms，量级一致）；"
+        "O(E×R) 热点的放大倍率参考纯裁剪对拍：10,000×10,000 下 11,532 ms → 17.3 ms。"
     )
     assert elapsed_ms < 500.0, f"find_blockers 耗时 {elapsed_ms:.1f} ms 超过 500 ms 预算"
     # 偶数号（仍在占用）= 挡路者；奇数号（陈旧索引）必须被位图二次过滤掉
