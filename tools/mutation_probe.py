@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -167,8 +168,15 @@ def project_root_from_tool() -> Path:
 def git_hash_object(root: Path, relative: str) -> str:
     """取 ``git hash-object <relative>``（工作树版本），失败返回空串。
 
-    用 blob 号而不是 mtime/size：它能和 ``git rev-parse HEAD:<path>`` 直接比对，
-    也天生对「内容相同但行尾被转换」这类差异免疫（一旦被转换 blob 就变了）。
+    用 blob 号而不是 mtime/size：它能和 ``git rev-parse HEAD:<path>`` 直接比对。
+
+    .. warning::
+
+        **blob 看不见行尾差异**：本仓库 ``core.autocrlf=true`` 且无
+        ``.gitattributes``，``git hash-object`` 会施加 clean filter（CRLF → LF），
+        所以「内容被写成 LF / 原本是 CRLF」这种**字节已变**的残留，blob 与
+        ``HEAD`` 完全一致、``git status`` 也干净。要证明「字节没被动过」，必须
+        另配 :func:`sha256_of`（字节级摘要）兜底 —— 这两者互补，不能互相替代。
     """
     proc = subprocess.run(
         ["git", "hash-object", relative],
@@ -179,6 +187,18 @@ def git_hash_object(root: Path, relative: str) -> str:
         errors="replace",
     )
     return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def sha256_of(path: Path) -> str:
+    """取文件**字节级**摘要（对行尾、BOM、编码差异都敏感）。
+
+    与 :func:`git_hash_object` 互补：后者被 clean filter 归一化，看不见行尾变化；
+    前者是「这个字节流有没有被动过」的最终真相，用于变异后还原的自证。
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return ""
 
 
 def git_status_porcelain(root: Path, paths: Sequence[str]) -> str:
@@ -199,6 +219,11 @@ def git_status_porcelain(root: Path, paths: Sequence[str]) -> str:
 def snapshot_blobs(root: Path, files: Sequence[str]) -> Dict[str, str]:
     """给一组相对路径拍一份 ``git hash-object`` 快照。"""
     return {relative: git_hash_object(root, relative) for relative in files}
+
+
+def snapshot_sha256(root: Path, files: Sequence[str]) -> Dict[str, str]:
+    """给一组相对路径拍一份 **字节级** sha256 快照（看得见行尾变化）。"""
+    return {relative: sha256_of(root / relative) for relative in files}
 
 
 # --------------------------------------------------------------------------- #
@@ -226,26 +251,52 @@ def make_shadow(root: Path, copies: Sequence[str]) -> Path:
 # --------------------------------------------------------------------------- #
 # 变异 / 测试
 # --------------------------------------------------------------------------- #
+def detect_newline(raw: bytes) -> bytes:
+    """探测文件的行尾风格（``b"\\r\\n"`` 或 ``b"\\n"``）。"""
+    return b"\r\n" if b"\r\n" in raw else b"\n"
+
+
 def apply_mutation(workdir: Path, mutation: Mutation) -> None:
     """把一条变异写进 ``workdir``（影子或真仓库）里的目标文件。
 
+    ★ **逐字节替换，不动行尾**（1.0.0E · QA-F1）：清单里的 ``old`` / ``new`` 一律
+    用 ``\\n`` 书写，这里先按目标文件自身的行尾风格把它们转成字节，再在**原始字节**
+    上做一次替换。好处是除被替换的那几行外，文件其余字节（含 CRLF、BOM、缩进）
+    一个都不变 —— 于是「逻辑零改动的变异（``old == new``）写回后字节完全相同」，
+    ``--in-place`` 的还原自证才有意义。
+
+    历史教训：早先的实现是 ``read → 归一化成 \\n → write_text(newline="\\n")``，
+    会把**整文件** CRLF 改成 LF；而本仓库 ``core.autocrlf=true`` + 无
+    ``.gitattributes``，``git hash-object`` 的 clean filter 恰好把行尾差异吃掉 →
+    blob 与 ``git status`` 双双"看不见"，`--in-place` 被 Ctrl-C 打断时的残留
+    就成了哑弹。所以这里必须在字节层面工作，并用 sha256 兜底自证。
+
     Args:
         workdir: 变异落点（影子目录或项目根）。
-        mutation: 变异定义。
+        mutation: 变异定义（``old`` / ``new`` 用 ``\\n`` 书写）。
 
     Raises:
-        ValueError: 锚点 ``old`` 未出现或出现多次（变异不可复现，必须人工修清单）。
+        ValueError: 锚点 ``old`` 在该文件里出现次数不为 1（变异不可复现，须人工修
+            清单）；或该文件行尾风格与锚点不匹配（混合行尾文件请先在清单里改用
+            不含换行的锚点）。
     """
     target = workdir / mutation.file
-    # 统一按 \n 读入，锚点不必关心 CRLF / LF
-    text = target.read_bytes().decode("utf-8").replace("\r\n", "\n")
-    occurrences = text.count(mutation.old)
+    raw = target.read_bytes()
+    newline = detect_newline(raw)
+
+    def _to_bytes(text: str) -> bytes:
+        """把清单里的 ``\\n`` 文本转成目标文件行尾风格的字节。"""
+        return text.replace("\n", newline.decode("ascii")).encode("utf-8")
+
+    old_bytes = _to_bytes(mutation.old)
+    new_bytes = _to_bytes(mutation.new)
+    occurrences = raw.count(old_bytes)
     if occurrences != 1:
         raise ValueError(
             f"锚点在 {mutation.file} 里出现 {occurrences} 次（要求恰好 1 次）："
-            f"{mutation.old!r}"
+            f"{mutation.old!r}（该文件行尾={newline!r}）"
         )
-    target.write_text(text.replace(mutation.old, mutation.new, 1), encoding="utf-8", newline="\n")
+    target.write_bytes(raw.replace(old_bytes, new_bytes, 1))
 
 
 def run_test(workdir: Path, test: str, timeout: int) -> Tuple[bool, str]:
@@ -362,6 +413,10 @@ def _reset_shadow(root: Path, copies: Sequence[str], shadow: Path) -> Path:
 def run_in_place(root: Path, manifest: Manifest) -> List[MutationResult]:
     """直接在真仓库里改文件并还原（**逃生口**，需要文件级副作用时才用）。
 
+    还原自证是**双重**的：每条变异还原后立刻比对 ``sha256``（字节级，看得见行尾
+    变化），全部跑完再核对 ``git status --porcelain -- <copies>``。只用后者会漏 ——
+    clean filter 会吃掉行尾差异（见 :func:`git_hash_object` 的警告）。
+
     Args:
         root: 项目根。
         manifest: 变异清单。
@@ -370,18 +425,26 @@ def run_in_place(root: Path, manifest: Manifest) -> List[MutationResult]:
         逐条变异的结果。
 
     Raises:
-        RuntimeError: 还原后工作树仍不干净（说明有变异残留，必须人工介入）。
+        RuntimeError: 还原后**字节**不一致（说明有变异残留，必须人工介入）。
+        BaseException: 循环里原有的异常**原样向上抛**（不被还原校验掩盖）。
     """
     results: List[MutationResult] = []
     try:
         for mutation in manifest.mutations:
             target = root / mutation.file
             original = target.read_bytes()
+            original_sha = hashlib.sha256(original).hexdigest()
             try:
                 apply_mutation(root, mutation)
                 passed, output = run_test(root, mutation.test, manifest.timeout)
             finally:
                 target.write_bytes(original)
+            restored_sha = hashlib.sha256(target.read_bytes()).hexdigest()
+            if restored_sha != original_sha:
+                raise RuntimeError(
+                    f"in-place 还原后**字节**不一致：{mutation.file}"
+                    f"（{original_sha[:16]} → {restored_sha[:16]}）"
+                )
             results.append(
                 MutationResult(
                     mutation=mutation,
@@ -390,13 +453,21 @@ def run_in_place(root: Path, manifest: Manifest) -> List[MutationResult]:
                     detail=_tail(output),
                 )
             )
-    finally:
+    except BaseException:
+        # 原异常优先：这里只做"附带体检"，打印后原样抛出，绝不掩盖真实错误
         dirty = git_status_porcelain(root, list(manifest.copies))
         if dirty:
-            raise RuntimeError(
-                "in-place 还原后工作树不干净，请人工检查：\n" + dirty
+            print(
+                "[probe] 警告：in-place 异常退出后工作树不干净（原异常优先保留）：\n"
+                + dirty,
+                file=sys.stderr,
             )
-    return results
+        raise
+    else:
+        dirty = git_status_porcelain(root, list(manifest.copies))
+        if dirty:
+            raise RuntimeError("in-place 还原后工作树不干净，请人工检查：\n" + dirty)
+        return results
 
 
 def _tail(text: str, limit: int = 1200) -> str:
@@ -503,9 +574,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     files = sorted({mutation.file for mutation in manifest.mutations})
     blobs_before = snapshot_blobs(root, files)
+    sha_before = snapshot_sha256(root, files)
     missing = [relative for relative, blob in blobs_before.items() if not blob]
     if missing:
         print(f"[probe] 取不到 git blob（不在仓库里？）：{missing}", file=sys.stderr)
+        return EXIT_ERROR
+    missing = [relative for relative, digest in sha_before.items() if not digest]
+    if missing:
+        print(f"[probe] 取不到文件字节摘要：{missing}", file=sys.stderr)
         return EXIT_ERROR
 
     print(f"[probe] 项目根：{root}")
@@ -521,17 +597,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_ERROR
 
     blobs_after = snapshot_blobs(root, files)
+    sha_after = snapshot_sha256(root, files)
     print_table(results)
 
-    if blobs_after != blobs_before:
+    if blobs_after != blobs_before or sha_after != sha_before:
         changed = {
-            relative: (blobs_before[relative], blobs_after[relative])
+            relative: {
+                "blob": (blobs_before[relative], blobs_after[relative]),
+                "sha256": (sha_before[relative][:16], sha_after[relative][:16]),
+            }
             for relative in blobs_before
             if blobs_before[relative] != blobs_after[relative]
+            or sha_before[relative] != sha_after[relative]
         }
         print(f"[probe] 真仓库文件被改动，拒绝给出结论：{changed}", file=sys.stderr)
         return EXIT_ERROR
-    print(f"[probe] 真仓库未被改动（git blob 前后一致，{len(files)} 个文件）")
+    print(
+        f"[probe] 真仓库未被改动（git blob + sha256 前后一致，{len(files)} 个文件）"
+    )
 
     if args.in_place:
         dirty = git_status_porcelain(root, list(manifest.copies))
