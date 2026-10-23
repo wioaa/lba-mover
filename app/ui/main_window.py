@@ -235,8 +235,10 @@ class MainWindow(QMainWindow):
         self._index_payload = None
         self._feasibility: Optional[FeasibilityReport] = None
         self._has_pending = False            # 1.0.0D：是否存在未应用的配置修改
-        #: 1.0.0D：执行前选「先应用再执行」后，等新计划就绪时是否自动接续执行
-        #: （接续仍会再走 DangerConfirmDialog，不跳过人工确认）
+        #: 1.0.0D：执行前选「先应用再执行」后，等新计划就绪时是否自动接续执行。
+        #: 只是一个**瞬时的交接位**：``_generate_plan`` 入口立刻把它挪到本次规划
+        #: 的 worker 上（``resume_after``），因此任何 early-return 都不会留下悬挂
+        #: 意图（接续仍会再走 DangerConfirmDialog，不跳过人工确认）。
         self._resume_execute_after_plan = False
         # 1.0.0D：可行性后台计算的状态
         self._feasibility_worker: Optional[FeasibilityWorker] = None
@@ -1615,21 +1617,38 @@ class MainWindow(QMainWindow):
         info = self._volume
         snapshot = self._snapshot
         selected = self._table.file_model.checked_entries()
+        # ---- QA ① 修复：把「自动接续执行」的意图从窗口全局状态挪到**本次规划** ----
+        # 进入规划的第一件事就是把意图摘下来（随后交给 worker 持有），于是下面
+        # 任何一处 early-return 都不可能留下悬挂标志；否则用户下次只是正常点
+        # 「生成计划」时，_on_plan_ready 末尾的接续块会被误触发、意外弹一次危险
+        # 确认框（QA 实测 B1）。
+        resume_after = self._resume_execute_after_plan
+        self._resume_execute_after_plan = False
+
+        def _blocked(message: str, kind: str = "warning") -> None:
+            """规划未能启动：若本次原本要自动接续执行，必须明说不再自动执行。"""
+            if resume_after:
+                message = (
+                    f"{message}（配置已应用，自动执行已取消，请调整后手动点击开始迁移）"
+                )
+                self._log.warn("自动接续未发生：规划条件不满足")
+            self._set_notice(message, kind)
+
         if info is None or snapshot is None:
-            self._set_notice("请先等待卷位图加载完成", "warning")
+            _blocked("请先等待卷位图加载完成")
             return
         if not selected:
-            self._set_notice("请先勾选需要迁移的文件", "warning")
+            _blocked("请先勾选需要迁移的文件")
             return
         strategy = self._target_panel.strategy()
         start, end = self._target_panel.window()
         needs_window = strategy in ("range", "compact", "zone")
         if needs_window:
             if end <= start:
-                self._set_notice("请先设定目标区间（起点必须小于终点）", "warning")
+                _blocked("请先设定目标区间（起点必须小于终点）")
                 return
             if self._feasibility is not None and not self._feasibility.ok:
-                self._set_notice(
+                _blocked(
                     "当前目标区间不可行：" + "；".join(self._feasibility.reasons[:2]),
                     "danger",
                 )
@@ -1664,17 +1683,54 @@ class MainWindow(QMainWindow):
             excluded_paths=tuple(sorted(self._target_panel.excluded_paths())),
             mode=strategy,
         )
+        # 意图随本次规划走：worker 持有「完成后是否自动接续」，消费即清。
+        worker.resume_after = resume_after
         worker.completed.connect(self._on_plan_ready)
         worker.failed.connect(self._on_plan_failed)
+        # ★ QA ② 兜底：PlanWorker 被取消时**不发任何终态信号**（run 里直接
+        # return），只连 completed/failed 会让 UI 永久停在忙碌态。finished 一定
+        # 会发，用它在「没有任何终态信号」时接管收尾。
+        worker.finished.connect(self._on_plan_worker_finished)
         self._plan_worker = worker
         worker.start()
 
+    def _take_resume_intent(self, worker: object = None) -> bool:
+        """一次性取出「本次规划完成后自动接续执行」的意图。
+
+        意图优先取自**发出信号的 worker**（``resume_after`` 属性，由
+        :meth:`_generate_plan` 挂上）：它随本次规划一起生灭，因此规划在
+        任何 early-return 处被拦下都不会留下悬挂意图（QA ①）。直接调用
+        （测试 / 内部复用）时 ``sender()`` 为 ``None``，回落到窗口标志。
+
+        Args:
+            worker: 显式指定的发送者；``None`` 时使用 Qt 的 ``sender()``。
+
+        Returns:
+            本次规划完成后是否应自动接续执行流程。
+        """
+        sender = worker if worker is not None else self.sender()
+        intent = False
+        if sender is not None:
+            intent = bool(getattr(sender, "resume_after", False))
+            try:
+                sender.resume_after = False      # 消费即清，绝不复用
+            except (AttributeError, TypeError):
+                pass                             # 只读替身：忽略
+        # 窗口标志只可能是「刚被 apply 分支置上、还没来得及交给 worker」的瞬时值
+        intent = intent or self._resume_execute_after_plan
+        self._resume_execute_after_plan = False
+        return intent
+
     def _on_plan_ready(self, plan: object) -> None:
+        # ★ 必须在任何 early-return 之前消费意图（否则异常结果会留下悬挂标志）
+        resume_after = self._take_resume_intent()
         self._progress.set_indeterminate(False)
         self._set_busy(False)
         self._plan_worker = None
         if not isinstance(plan, MovePlan):
             self._set_notice("规划返回了异常结果", "danger")
+            if resume_after:
+                self._log.warn("自动接续未发生：规划返回了异常结果")
             return
 
         self._plan = plan
@@ -1717,8 +1773,7 @@ class MainWindow(QMainWindow):
         # 用户在执行模式下选了 apply：配置已提交、计划已按新参数重生成，
         # 这里自动接续回 _start_move（它会再走一遍 DangerConfirmDialog，
         # **不跳过人工确认**）；不满足条件时明确告知需手动点开始。
-        if self._resume_execute_after_plan:
-            self._resume_execute_after_plan = False
+        if resume_after:
             blocking = self._feasibility is not None and not self._feasibility.ok
             if self._mode == MODE_EXECUTE and not plan.empty and not blocking:
                 self._log.info("计划已按新参数重新生成，自动接续执行流程（仍需人工确认）")
@@ -1732,14 +1787,38 @@ class MainWindow(QMainWindow):
                 self._log.warn(f"自动接续未发生：{reason}")
 
     def _on_plan_failed(self, message: str) -> None:
-        # 标志不得悬挂：规划失败时清掉，避免下一次成功规划误触发执行
-        self._resume_execute_after_plan = False
+        # 标志不得悬挂：规划失败时把意图消费掉（worker 上的与窗口上的都清）
+        self._take_resume_intent()
         self._progress.set_indeterminate(False)
         self._progress.reset("规划失败")
         self._set_busy(False)
         self._plan_worker = None
         self._log.error(message)
         self._set_notice(message, "danger")
+        self._sync_buttons()
+
+    def _on_plan_worker_finished(self) -> None:
+        """PlanWorker 的**兜底收尾**（QA ②：取消时 worker 不发任何终态信号）。
+
+        :meth:`PlanWorker.run` 在已请求取消时直接 ``return``，既不发
+        ``completed`` 也不发 ``failed``；若 UI 只连这两个信号，规划中按 Esc
+        （或自动重新规划期间反悔）后就会永久停在忙碌态：进度条一直转、按钮
+        全禁、只能关窗。``QThread.finished`` 一定会发，本槽在「线程已结束但
+        没有任何终态信号被处理过」（``_plan_worker`` 仍非空）时接管收尾。
+        """
+        worker = self.sender()
+        if worker is not None and worker is not self._plan_worker:
+            return                          # 已被新任务替换：收尾交给新任务
+        pending = self._plan_worker
+        if pending is None:
+            return                          # 正常路径（completed / failed）已收尾
+        self._plan_worker = None
+        self._take_resume_intent(pending)   # 本次没产出结果 → 意图作废（含 worker 上的）
+        self._progress.set_indeterminate(False)
+        self._progress.reset("规划已取消")
+        self._set_busy(False)
+        self._log.warn("规划已取消（未产出结果）")
+        self._set_notice("规划已取消，可调整参数后重新生成计划", "warning")
         self._sync_buttons()
 
     # ================================================================== #
@@ -1788,6 +1867,8 @@ class MainWindow(QMainWindow):
                     "warning",
                 )
                 self._log.info("执行前应用了待定配置：重新规划后将自动接续执行（仍需人工确认）")
+                # 意图由此交给本次规划（_generate_plan 入口会立刻摘下并挂到 worker），
+                # 若规划条件不满足，_generate_plan 会明说"自动执行已取消"。
                 self._generate_plan()
                 return
             if dialog.choice != "proceed":

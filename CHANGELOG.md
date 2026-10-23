@@ -62,6 +62,10 @@
 
   - **C-1（P2，QA 对方案 D 的专项审计）进程被杀时 stage 文件残留且无人清理**：`staged_copy` 的 `os.remove(scratch_path)` 挪进 finally（句柄关闭后删，异常路径同样清现场，删除失败不掩盖原异常）；`BlockStreamWorker` 收尾改为「先删目录内全部 `.stage` 残留（跨文件积累的也一并清）→ 清空后 rmdir，非 stage 文件不动、目录保留」；开发期实证残留 `C:\.lba-tmp-scratch\o.bin.stage` 已清理并 rmdir 空目录。回归钉：注入 dst 写入中途异常断言 stage 被清、预置 `.stage` 残留 + 外来文件的 worker 收尾清场对拍。
   - **执行前「先应用再执行」改为应用后自动重新规划并接续执行**：修复前该分支只提示"请重新生成迁移计划"就 return，按钮文字承诺"再执行"而实际一簇未搬，用户实机感知为「点了执行却不执行」；现改为「应用配置 → 自动 `_generate_plan()` → 新计划就绪后自动接续执行流程」（新增 `_resume_execute_after_plan` 标志，接续仍会再走 `DangerConfirmDialog`，**不跳过人工确认**；接续一次后复位，规划失败时清标志防悬挂）。同时补两处静默返回的提示：卷/位图尚未就绪、尚未生成迁移计划。回归钉 `tests/test_ui_execute_flow.py`（6 例）。
+  - **QA 对上一提交（800f4a4）复核的两条同批修复**：
+    - **「自动接续」意图悬挂（P2）**：`_resume_execute_after_plan` 原本是窗口全局状态，`_generate_plan` 里有 4 处 early-return（卷/位图未就绪、未勾选文件、区间非法、区间不可行）以及 `_on_plan_ready` 收到非 `MovePlan` 那条 return 都不会清它 —— 用户下次只是正常点「生成计划」时，`_on_plan_ready` 末尾的接续块会被误触发，**意外弹一次危险确认框**。改为把意图绑到**本次规划**：`_generate_plan` 入口立刻摘下窗口标志并挂到 `worker.resume_after`，`_on_plan_ready` / `_on_plan_failed` / `finished` 兜底统一经 `_take_resume_intent()` 一次性消费（消费即清）；早退时提示「配置已应用，自动执行已取消，请调整后手动点击开始迁移」。
+    - **规划中按 Esc → UI 永久卡死（P1，既存但被自动重新规划放大）**：`PlanWorker.run` 在已请求取消时直接 `return`，`completed` / `failed` 一个都不发，而 UI 只连了这两个信号 —— 于是 `_set_busy(False)` 永不执行、`_plan_worker` 永不置空，进度条一直转、按钮全禁、只能关窗。现将 `worker.finished` 接到新增的 `_on_plan_worker_finished()` 兜底：仅在「线程已结束但没有任何终态信号被处理过」（`_plan_worker` 仍非空）时接管收尾（清槽位 + 退忙碌态 + 作废意图 + 提示「规划已取消」），正常收尾后为 no-op，不误清别的任务的忙碌态。已核对同一模式的其余 worker：`ScanWorker` / `MftScanWorker` / `IndexWorker` / `RollbackWorker` / `BlockStreamWorker` 取消路径都会发终态信号，`FeasibilityWorker` 已连 `finished` 且不参与忙碌态，只有 `PlanWorker` 是裸 return。
+    - 回归钉扩到 11 例（新增：apply 后早退不留悬挂意图、意图绑到 worker 且 `finished` 必连、`_take_resume_intent` 一次性消费、取消兜底退出忙碌态、正常收尾后 `finished` 为 no-op）；另用离屏脚本对真实 `PlanWorker` 复刻「start → request_cancel → wait」验证取消后 `busy=False` / `_plan_worker=None` / 意图作废。
 - 版本号 `1.0.0C → 1.0.0D`。
 
 ---

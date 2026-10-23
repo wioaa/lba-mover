@@ -818,6 +818,12 @@ class PlanWorker(QThread):
         self._cancel = False
 
     def request_cancel(self) -> None:
+        """请求取消（规划是单次纯计算，取消的语义是「丢弃结果」）。
+
+        ★ 契约：取消后 ``run`` 直接返回，**``completed`` 与 ``failed`` 都不发**。
+        调用方必须自己用 ``QThread.finished`` 兜底收尾（否则会永久停在忙碌态
+        —— 主窗口的 :meth:`MainWindow._on_plan_worker_finished` 就是这层兜底）。
+        """
         self._cancel = True
 
     # ------------------------------------------------------------------ #
@@ -834,7 +840,7 @@ class PlanWorker(QThread):
             else:
                 plan = self._plan_tail()
             if self._cancel:
-                return
+                return          # 已取消：不发任何终态信号（调用方靠 finished 兜底）
             self.completed.emit(plan)
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(f"生成迁移计划失败：{type(exc).__name__}: {exc}")
