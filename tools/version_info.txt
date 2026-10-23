@@ -33,7 +33,7 @@ VSVersionInfo(
                         ),
                         StringStruct("OriginalFilename", "LBA-Tail-Mover.exe"),
                         StringStruct("ProductName", "LBA Tail Mover"),
-                        StringStruct("ProductVersion", "1.0.0C"),
+                        StringStruct("ProductVersion", "1.0.0D"),
                     ],
                 )
             ]
