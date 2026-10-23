@@ -577,8 +577,12 @@ class MainWindow(QMainWindow):
         )
         self._stream_scope = cards.label("未选择文件", "body", scope_card, False)
         scope_card.body().addWidget(self._stream_scope)
+        self._stream_target = cards.label(
+            "流式处理默认只填充末端（卷尾保留区）", "body", scope_card, False
+        )
+        scope_card.body().addWidget(self._stream_target)
         scope_card.body().addWidget(cards.label(
-            "目标：同卷内 前端 → 卷尾空闲区（先预填充一段连续簇，落点由文件系统在空闲区分配）",
+            "先在卷尾预留一段连续簇，再把选中文件流式写入；落点由文件系统在空闲区分配。",
             "caption", scope_card, True,
         ))
         column.addWidget(scope_card, 0)
@@ -665,12 +669,29 @@ class MainWindow(QMainWindow):
         selected = self._table.file_model.checked_entries()
         if not selected:
             self._stream_scope.setText("未选择文件（请在左侧大文件列表勾选）")
-            return
-        total_bytes = sum(e.size for e in selected)
-        total_clusters = sum(e.allocated_clusters for e in selected)
-        self._stream_scope.setText(
-            f"选中 {len(selected)} 个文件 · {human_bytes(total_bytes)} · {total_clusters:,} 簇"
-        )
+        else:
+            total_bytes = sum(e.size for e in selected)
+            total_clusters = sum(e.allocated_clusters for e in selected)
+            self._stream_scope.setText(
+                f"选中 {len(selected)} 个文件 · {human_bytes(total_bytes)} · {total_clusters:,} 簇"
+            )
+        # 目标：卷尾保留区（流式处理默认只填充末端）
+        if hasattr(self, "_stream_target"):
+            info = self._volume
+            total = int(info.total_clusters) if info else 0
+            reserve = 0
+            if hasattr(self, "_target_panel"):
+                try:
+                    reserve = int(self._target_panel.reserve_tail_clusters())
+                except Exception:  # noqa: BLE001
+                    reserve = 0
+            if total > 0 and reserve > 0:
+                floor = max(0, total - reserve)
+                self._stream_target.setText(
+                    f"流式处理默认只填充末端 · 卷尾保留区 LCN [{floor:,}, {total:,})"
+                )
+            else:
+                self._stream_target.setText("流式处理默认只填充末端（卷尾保留区）")
 
     def _start_stream_move(self) -> None:
         entries = self._table.file_model.checked_entries()

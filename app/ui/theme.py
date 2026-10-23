@@ -417,6 +417,22 @@ QComboBox QAbstractItemView::item:hover {{
     background-color: {p['hover']};
 }}
 
+/* ===================== 输入框 ===================== */
+QLineEdit {{
+    background-color: {p['card']};
+    color: {p['text']};
+    border: 1px solid {p['border']};
+    border-radius: {RADIUS_CTRL}px;
+    padding: 6px 10px;
+    min-height: 20px;
+    font-size: 13px;
+    selection-background-color: {p['accent']};
+    selection-color: {p['card']};
+}}
+QLineEdit:hover {{ border-color: {p['border_strong']}; }}
+QLineEdit:focus {{ border-color: {p['accent']}; }}
+QLineEdit:disabled {{ background-color: {p['disabled_bg']}; color: {p['text_faint']}; }}
+
 /* ===================== 数字框 ===================== */
 QSpinBox, QDoubleSpinBox {{
     background-color: {p['card']};
