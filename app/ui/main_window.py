@@ -562,28 +562,13 @@ class MainWindow(QMainWindow):
         column.addWidget(head, 0)
 
         column.addWidget(cards.label(
-            "用户态 Read/Write 分块拷贝：以 65536 簇为 1 块、缓冲按块的倍数可调；"
-            "两阶段流水（load 源→暂存 / store 暂存→目的）重叠推进，缓解 HDD 半双工。"
-            "拷贝并校验完整后，才把源文件移入回收站（可恢复），从而腾出源卷空间。"
-            "不走 FSCTL、不需管理卷特权，但不保证落到指定 LBA（由文件系统分配）。",
+            "同卷内「前端 → 卷尾」搬迁的用户态实现：先按总大小**预填充一段（尽量连续）的簇**，"
+            "再**流式读出**前端文件、**在内存缓存**（65536 簇/块、缓冲按块倍数可调），"
+            "最后对这段**流式覆盖**——一个分块读完立马顶上下一块，缓解 HDD 半双工、整体直搬更快。"
+            "落点 LBA 由文件系统在空闲区分配（预分配保证连续、不保证精确 LCN）。"
+            "校验完整后才把源移入回收站（可恢复）。不走 FSCTL、不需管理卷特权，**无外部目的地**。",
             "caption", inner, True,
         ), 0)
-
-        # ---- 目的地 ----
-        dest_card = cards.Card(inner, padding=14, spacing=8)
-        dest_card.body().addWidget(cards.SectionHeader("目的地", "folder", "", dest_card))
-        dest_row = QHBoxLayout()
-        dest_row.setSpacing(8)
-        self._stream_dest = QLineEdit(dest_card)
-        self._stream_dest.setPlaceholderText("选定文件将拷贝到该目录，腾出源卷空间")
-        dest_row.addWidget(self._stream_dest, 1)
-        dest_browse = QPushButton("浏览…", dest_card)
-        dest_browse.setProperty("role", "ghost")
-        dest_browse.setCursor(Qt.CursorShape.PointingHandCursor)
-        dest_browse.clicked.connect(lambda: self._browse_dir(self._stream_dest))
-        dest_row.addWidget(dest_browse, 0)
-        dest_card.body().addLayout(dest_row)
-        column.addWidget(dest_card, 0)
 
         # ---- 缓存 ----
         cache_card = cards.Card(inner, padding=14, spacing=8)
@@ -660,13 +645,8 @@ class MainWindow(QMainWindow):
 
     def _start_stream_move(self) -> None:
         entries = self._table.file_model.checked_entries()
-        dest = self._stream_dest.text().strip()
         if not entries:
             self._stream_notice.setText("请先勾选要搬迁的文件")
-            self._stream_notice.setVisible(True)
-            return
-        if not dest:
-            self._stream_notice.setText("请先设定目的地目录")
             self._stream_notice.setVisible(True)
             return
         mode = "disk" if self._stream_cache_switch.current_index == 1 else "memory"
@@ -679,7 +659,7 @@ class MainWindow(QMainWindow):
         info = self._volume
         bpc = (info.bytes_per_cluster if info else 4096) or 4096
         dialog = dialogs.DangerConfirmDialog(
-            volume_name=f"分块流式 → {dest}",
+            volume_name="分块流式搬迁（前端 → 卷尾，同卷内）",
             files=list(entries),
             total_clusters=sum(e.allocated_clusters for e in entries),
             bytes_per_cluster=bpc,
@@ -691,7 +671,6 @@ class MainWindow(QMainWindow):
         self._stream_notice.setVisible(False)
         worker = BlockStreamWorker(
             entries,
-            dest,
             mode=mode,
             cache_dir=cache_dir,
             buffer_blocks=int(self._stream_buffer_spin.value()),
@@ -707,8 +686,8 @@ class MainWindow(QMainWindow):
         self._progress.set_indeterminate(True)
         self._progress.set_state(0, 1, "分块流式搬迁中", "")
         self._log.info(
-            f"开始分块流式搬迁：{len(entries)} 个文件 → {dest}"
-            f"（{mode} 缓存，缓冲 {self._stream_buffer_spin.value()}× 块）"
+            f"开始分块流式搬迁：{len(entries)} 个文件（前端 → 卷尾，同卷内；"
+            f"{mode} 缓存，缓冲 {self._stream_buffer_spin.value()}× 块）"
         )
         worker.start()
 
@@ -729,7 +708,8 @@ class MainWindow(QMainWindow):
         data = summary if isinstance(summary, dict) else {}
         moved, failed = data.get("moved", 0), data.get("failed", 0)
         self._log.success(
-            f"分块流式搬迁完成：搬走 {moved} 个 / 失败 {failed} 个 → {data.get('dest')}"
+            f"分块流式搬迁完成：搬走 {moved} 个（{data.get('clusters', 0):,} 簇）/ "
+            f"失败 {failed} 个（源已移回收站，可恢复）"
         )
         self._stream_notice.setText(
             f"完成：搬走 {moved} 个，失败 {failed} 个（源已移回收站，可恢复）"

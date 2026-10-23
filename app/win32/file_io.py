@@ -46,6 +46,9 @@ kernel32.WriteFile.argtypes = [
 ]
 kernel32.WriteFile.restype = wintypes.BOOL
 
+kernel32.SetEndOfFile.argtypes = [wintypes.HANDLE]
+kernel32.SetEndOfFile.restype = wintypes.BOOL
+
 
 def _ok_handle(handle: int, context: str) -> int:
     if handle is None or handle == _INVALID:
@@ -62,13 +65,31 @@ def open_read(path: str) -> int:
     return _ok_handle(handle, f"open_read({path})")
 
 
-def open_write(path: str) -> int:
-    """创建/覆盖一个只写文件。"""
+def open_write(path: str, truncate: bool = True) -> int:
+    """创建/覆盖一个只写文件。
+
+    ``truncate=False`` 时用 ``OPEN_EXISTING``（不截断）——用于覆盖一个已预分配
+    （preallocate）好的文件，保留其已占用的连续簇。
+    """
+    disposition = CREATE_ALWAYS if truncate else OPEN_EXISTING
     handle = kernel32.CreateFileW(
         str(path), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-        None, CREATE_ALWAYS, 0, None,
+        None, disposition, 0, None,
     )
     return _ok_handle(handle, f"open_write({path})")
+
+
+def preallocate_size(handle: int, size: int) -> None:
+    """把文件扩展到 ``size`` 字节（SetEndOfFile），**预先填充一段（尽量连续）的簇**。
+
+    之后用 ``open_write(truncate=False)`` 打开同一路径做流式覆盖，数据即落入这段
+    预占的连续簇——实现「前端 → 后端连续区」的整体直搬（落点 LBA 由文件系统在
+    空闲区分配，预分配保证连续性）。
+    """
+    if not kernel32.SetFilePointerEx(handle, int(size), None, FILE_BEGIN):
+        raise api.Win32Error(kernel32.GetLastError(), f"SetFilePointerEx@{size}")
+    if not kernel32.SetEndOfFile(handle):
+        raise api.Win32Error(kernel32.GetLastError(), "SetEndOfFile")
 
 
 def open_readwrite(path: str) -> int:
@@ -121,11 +142,13 @@ def staged_copy(
     buffer_blocks: int = 2,
     bytes_per_cluster: int = 4096,
     block_clusters: int = BLOCK_CLUSTERS,
+    preallocate_dst: bool = False,
 ) -> Tuple[int, int]:
     """双阶段分块流式搬迁：源 →(load) 暂存盘 →(store) 目的。
 
     按 :func:`block_stream.stream_schedule` 推进；暂存盘同时驻留块数 ≤
-    ``buffer_blocks``。返回 ``(写入目的字节数, 块数)``。
+    ``buffer_blocks``。``preallocate_dst=True`` 时先按总大小预填充一段（尽量连续）
+    的簇再流式覆盖。返回 ``(写入目的字节数, 块数)``。
     """
     total = os.path.getsize(src_path)
     blocks = plan_blocks(total, bytes_per_cluster, block_clusters)
@@ -134,9 +157,13 @@ def staged_copy(
         close(handle)
         return 0, 0
 
+    if preallocate_dst and total > 0:
+        ph = open_write(dst_path)
+        preallocate_size(ph, total)
+        close(ph)
     src = open_read(src_path)
     scratch = open_readwrite(scratch_path)
-    dst = open_write(dst_path)
+    dst = open_write(dst_path, truncate=not preallocate_dst)
     try:
         written = 0
         for kind, index in stream_schedule(len(blocks), buffer_blocks):
@@ -164,12 +191,14 @@ def memory_copy(
     buffer_blocks: int = 2,
     bytes_per_cluster: int = 4096,
     block_clusters: int = BLOCK_CLUSTERS,
+    preallocate_dst: bool = False,
 ) -> Tuple[int, int]:
     """内存分配缓存模式：块在 RAM 缓冲里中转（无暂存盘）。
 
     ``load`` 读源块进 RAM、``store`` 从 RAM 写目的；RAM 同时驻留 ≤ ``buffer_blocks``
-    个 block（可调）。最快，但占用内存 = ``buffer_blocks × block``。返回
-    ``(写入目的字节数, 块数)``。
+    个 block（可调）。最快，但占用内存 = ``buffer_blocks × block``。
+    ``preallocate_dst=True`` 时先按总大小预分配一段（尽量连续）的簇，再流式覆盖
+    （「预先填充 → 流式覆盖」，前端→后端整体直搬）。返回 ``(写入目的字节数, 块数)``。
     """
     total = os.path.getsize(src_path)
     blocks = plan_blocks(total, bytes_per_cluster, block_clusters)
@@ -178,8 +207,12 @@ def memory_copy(
         close(handle)
         return 0, 0
 
+    if preallocate_dst and total > 0:
+        ph = open_write(dst_path)      # 建文件
+        preallocate_size(ph, total)    # 预先填充一段（尽量连续）的簇
+        close(ph)
     src = open_read(src_path)
-    dst = open_write(dst_path)
+    dst = open_write(dst_path, truncate=not preallocate_dst)  # 预分配则覆盖其连续簇、否则新建
     cache: dict = {}  # index -> bytes，RAM 驻留 ≤ buffer_blocks
     try:
         written = 0
@@ -210,12 +243,16 @@ def copy_stream(
     buffer_blocks: int = 2,
     bytes_per_cluster: int = 4096,
     block_clusters: int = BLOCK_CLUSTERS,
+    preallocate_dst: bool = False,
 ) -> Tuple[int, int]:
     """统一入口：按缓存模式做分块流式搬运。
 
     * ``mode="memory"``：内存分配缓存——块在 RAM 中转，最快、占内存；
     * ``mode="disk"``：设定缓存目录的硬盘缓存——块落 ``cache_dir`` 暂存盘再读出，
       占磁盘、可缓冲更大（``buffer_blocks`` 仍按 65536 簇 block 的倍数可调）。
+    * ``preallocate_dst=True``：先按总大小**预填充一段（尽量连续）的簇**，再流式覆盖
+      （「预先填充 → 流式覆盖」，实现前端→后端整体直搬；落点 LBA 由文件系统在空闲区
+      分配，预分配保证连续性）。
 
     Returns:
         ``(写入目的字节数, 块数)``。
@@ -226,6 +263,7 @@ def copy_stream(
             buffer_blocks=buffer_blocks,
             bytes_per_cluster=bytes_per_cluster,
             block_clusters=block_clusters,
+            preallocate_dst=preallocate_dst,
         )
     if mode == CACHE_MODE_DISK:
         if not cache_dir:
@@ -237,6 +275,7 @@ def copy_stream(
             buffer_blocks=buffer_blocks,
             bytes_per_cluster=bytes_per_cluster,
             block_clusters=block_clusters,
+            preallocate_dst=preallocate_dst,
         )
     raise ValueError(f"未知缓存模式：{mode!r}（可选 {CACHE_MODE_MEMORY!r} / {CACHE_MODE_DISK!r}）")
 

@@ -1454,7 +1454,6 @@ class BlockStreamWorker(QThread):
     def __init__(
         self,
         entries: Sequence[FileEntry],
-        dest_dir: str,
         *,
         mode: str = "memory",
         cache_dir: Optional[str] = None,
@@ -1465,7 +1464,6 @@ class BlockStreamWorker(QThread):
     ) -> None:
         super().__init__(parent)
         self._entries = list(entries)
-        self._dest_dir = str(dest_dir)
         self._mode = mode
         self._cache_dir = cache_dir
         self._buffer_blocks = int(buffer_blocks)
@@ -1481,18 +1479,9 @@ class BlockStreamWorker(QThread):
 
         from app.win32 import file_io
 
-        if not self._dest_dir:
-            self.failed.emit("未设定目的地目录")
-            return
-        try:
-            os.makedirs(self._dest_dir, exist_ok=True)
-        except OSError as exc:
-            self.failed.emit(f"无法创建目的地目录：{exc}")
-            return
-
         total = len(self._entries)
         moved = failed = 0
-        moved_bytes = 0
+        moved_clusters = 0
         done = 0
         for entry in self._entries:
             if self._cancel:
@@ -1504,29 +1493,37 @@ class BlockStreamWorker(QThread):
                 self.file_result.emit(entry.path, False, "不可移动或无物理分配")
                 continue
             src = entry.path
-            dst = os.path.join(self._dest_dir, entry.name)
+            # 同卷临时文件：读出 src（腾空前部簇）→ 写 tmp（FS 在空闲区分配落点）→
+            # 校验 → 源移回收站 → 改回原路径。**无外部目的地**，全程同卷内。
+            tmp = src + ".lbastream.tmp"
             try:
                 src_size = os.path.getsize(src)
                 written, nblocks = file_io.copy_stream(
-                    src, dst,
+                    src, tmp,
                     mode=self._mode,
                     cache_dir=self._cache_dir,
                     buffer_blocks=self._buffer_blocks,
                     bytes_per_cluster=self._bpc,
                     block_clusters=self._block_clusters,
+                    preallocate_dst=True,  # 先预填充一段连续簇，再流式覆盖（前端→后端直搬）
                 )
                 if written != src_size:
                     raise OSError(f"拷贝不完整（写入 {written} / 源 {src_size}）")
-                # 校验通过才把源移回收站（可恢复），腾出源卷空间；删源失败则报失败、保留源
                 if not file_io.recycle(src):
-                    raise OSError("拷贝成功但无法把源移入回收站（源未删，可重试）")
+                    raise OSError("无法把源移入回收站（源未删，可重试）")
+                os.replace(tmp, src)  # 簇已由文件系统重分配到空闲区，改回原路径
                 moved += 1
-                moved_bytes += src_size
-                self.file_result.emit(entry.path, True, f"{nblocks} 块 / {src_size:,} B")
+                moved_clusters += entry.allocated_clusters
+                self.file_result.emit(entry.path, True, f"{nblocks} 块 / {entry.allocated_clusters:,} 簇")
             except Exception as exc:  # noqa: BLE001
+                try:
+                    if os.path.exists(tmp):
+                        file_io.recycle(tmp)  # 清理残留临时文件
+                except Exception:  # noqa: BLE001
+                    pass
                 failed += 1
                 self.file_result.emit(entry.path, False, f"{type(exc).__name__}: {exc}")
         self.completed.emit(
-            {"moved": moved, "failed": failed, "bytes": moved_bytes, "dest": self._dest_dir}
+            {"moved": moved, "failed": failed, "clusters": moved_clusters}
         )
 

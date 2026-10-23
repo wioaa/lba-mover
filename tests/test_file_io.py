@@ -88,17 +88,35 @@ def test_copy_stream_disk_requires_cache_dir() -> None:
         raise AssertionError("disk 模式未给 cache_dir 应抛 ValueError")
 
 
+def test_copy_stream_preallocate_overwrite() -> None:
+    """预填充（SetEndOfFile 预分配连续簇）后再流式覆盖，内容与大小一致。"""
+    with tempfile.TemporaryDirectory() as d:
+        data = os.urandom(9000)
+        src = os.path.join(d, "src.bin")
+        with open(src, "wb") as fh:
+            fh.write(data)
+        dst = os.path.join(d, "dst.bin")
+        written, nblocks = file_io.copy_stream(
+            src, dst, mode="memory", buffer_blocks=2,
+            bytes_per_cluster=512, block_clusters=4, preallocate_dst=True,
+        )
+        assert written == len(data)
+        assert os.path.getsize(dst) == len(data)
+        with open(dst, "rb") as fh:
+            assert fh.read() == data
+
+
 def test_block_stream_worker_end_to_end() -> None:
-    """BlockStreamWorker 端到端：拷贝到目的地 + 校验 + 源移回收站 + 完成信号。"""
+    """BlockStreamWorker 同卷内「前端→卷尾」：预填充 + 流式覆盖 + 源进回收站 + 改回原路径。"""
     from PySide6.QtWidgets import QApplication
 
     from app.core.models import Extent, FileEntry
     from app.core.scanner import BlockStreamWorker
 
     _ = QApplication.instance() or QApplication([])
-    with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as dst:
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as cache:
         d1, d2 = os.urandom(5000), os.urandom(3000)
-        p1, p2 = os.path.join(src, "a.bin"), os.path.join(src, "b.bin")
+        p1, p2 = os.path.join(d, "a.bin"), os.path.join(d, "b.bin")
         with open(p1, "wb") as fh:
             fh.write(d1)
         with open(p2, "wb") as fh:
@@ -111,18 +129,20 @@ def test_block_stream_worker_end_to_end() -> None:
         ]
         summary: dict = {}
         worker = BlockStreamWorker(
-            entries, dst, mode="disk", cache_dir=os.path.join(dst, ".cache"),
+            entries, mode="disk", cache_dir=cache,
             buffer_blocks=2, bytes_per_cluster=512, block_clusters=4,
         )
         worker.completed.connect(lambda s: summary.update(s))
         worker.run()  # 同步执行（不 start，避免真实线程）
 
-        with open(os.path.join(dst, "a.bin"), "rb") as fh:
+        # 同卷内重定位：改回原路径、内容一致
+        with open(p1, "rb") as fh:
             assert fh.read() == d1
-        with open(os.path.join(dst, "b.bin"), "rb") as fh:
+        with open(p2, "rb") as fh:
             assert fh.read() == d2
-        # 源已移回收站（不存在）
-        assert not os.path.exists(p1) and not os.path.exists(p2)
+        # 无残留临时文件
+        assert not os.path.exists(p1 + ".lbastream.tmp")
+        assert not os.path.exists(p2 + ".lbastream.tmp")
         assert summary.get("moved") == 2 and summary.get("failed") == 0, summary
 
 
