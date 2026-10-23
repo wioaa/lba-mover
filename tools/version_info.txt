@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Windows 资源版本信息（PyInstaller EXE(..., version=...) 使用）。
 # 约定：FileVersion 用三段号转成的数字四元组（1.0.0.0），修订字母只出现在
-# 产品字符串 ProductVersion（"1.0.0B"）里——可与 app/__init__.py 的
+# 产品字符串 ProductVersion（"1.0.0C"）里——可与 app/__init__.py 的
 # __version__ / __revision__ 反查对齐。
 VSVersionInfo(
     ffi=FixedFileInfo(
@@ -33,7 +33,7 @@ VSVersionInfo(
                         ),
                         StringStruct("OriginalFilename", "LBA-Tail-Mover.exe"),
                         StringStruct("ProductName", "LBA Tail Mover"),
-                        StringStruct("ProductVersion", "1.0.0B"),
+                        StringStruct("ProductVersion", "1.0.0C"),
                     ],
                 )
             ]
