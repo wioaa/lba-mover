@@ -134,6 +134,19 @@ def test_mft_outcome_cancel_is_not_failure() -> None:
 #       * 别名重写（`probe = should_cancel`）会红 —— 这是**有意的**：AST 认名字，
 #         跟随不了别名；失败方向是「响」而非「哑」，符合我们的取舍（按误判方向的
 #         危害选择失败方向）。**改结构时必须同步改这枚钉子，别把它删掉。**
+#
+#     ★ 三条**有意为之**的红（后人看到红请先读这里，别以为钉子坏了就删）：
+#       1. **守卫改名 / 别名化**：`probe = should_cancel`、
+#          `self._cancel.is_set()` 之类 —— AST 只认 `should_cancel` 这个名字；
+#       2. **标记改了调用形态**：`mft_reader.mark_cancelled(outcome)`（属性调用）
+#          或 `self._mark_cancelled(...)` —— 本钉子只认裸名 `mark_cancelled`；
+#       3. **中断改用 `raise` / `continue`**：本钉子把 `break` 当作「中断解析」的
+#         唯一实现方式。若将来改用 `raise _ScanCancelled`（语义等价）或
+#          `continue`（每批轮询、但**不会**中断解析 —— 这一种属**真红**，取消
+#          等于没生效），都必须同步改这枚钉子。
+#     ★ 覆盖范围边界：本钉子只钉「接线 + 顺序」，**不钉条件是否写反**
+#       （如 `if should_cancel(...) is False:` —— AST 里名字仍在、接线仍对，本钉子
+#       绿）。条件语义归行为钉子管，用 AST 查语义是反模式。
 # --------------------------------------------------------------------------- #
 def _cancel_branches(tree: ast.AST) -> list:
     """所有「test 里出现 `should_cancel`」的 ``if`` 节点（不限制数量）。"""
