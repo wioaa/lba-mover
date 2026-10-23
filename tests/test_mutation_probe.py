@@ -141,6 +141,76 @@ def test_load_manifest_rejects_bad_expect(tmp_path=None) -> None:
             raise AssertionError("非法 expect 未被拒绝")
 
 
+def test_crash_residue_is_detected_via_state_file() -> None:
+    """崩溃残留模拟：施加变异**不还原**（模拟 SIGKILL），下次运行自证必须报不一致。
+
+    这是 F1 的另一半：``--in-place`` 被 SIGKILL 时 ``finally`` 不执行，盘上留下变异体；
+    若变异体只改了行尾，``git status`` 与 ``git hash-object`` 都说"干净"
+    （``core.autocrlf=true`` 的 clean filter 吃掉差异）。所以探针在**运行前**把目标
+    文件的字节 sha256 落到临时状态文件、正常结束才删；下次运行发现「状态文件还在 +
+    字节不符」即判定残留。本用例把这个生命周期走一遍（不真杀进程）。
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        root = mutation_probe.Path(directory)
+        target = root / "sample.py"
+        with open(target, "wb") as handle:
+            handle.write(CRLF_SOURCE.encode("utf-8"))
+        files = ["sample.py"]
+
+        mutation_probe.clear_state(root)
+        assert mutation_probe.check_crash_residue(root, files) == [], "无状态文件时不该报残留"
+
+        # 运行前落状态（模拟一次正常启动）
+        mutation_probe.save_state(root, mutation_probe.snapshot_sha256(root, files))
+        assert mutation_probe.check_crash_residue(root, files) == [], "字节没变不该报残留"
+
+        # 模拟「变异体留在盘上」：整文件 CRLF → LF（逻辑不变，git 看不见）
+        target.write_bytes(CRLF_SOURCE.replace("\r\n", "\n").encode("utf-8"))
+
+        residues = mutation_probe.check_crash_residue(root, files)
+        assert len(residues) == 1, f"字节级自证必须察觉残留，实际 {residues}"
+        assert residues[0]["file"] == "sample.py", residues
+        assert residues[0]["recorded"] != residues[0]["current"], residues
+
+        # 正常收尾（还原 + 清状态）后应恢复干净
+        target.write_bytes(CRLF_SOURCE.encode("utf-8"))
+        mutation_probe.clear_state(root)
+        assert mutation_probe.check_crash_residue(root, files) == [], "清理后不该再报残留"
+
+
+def test_head_bytes_are_lf_but_worktree_is_crlf() -> None:
+    """锁定一个**踩过的坑**：``git show HEAD:<path>`` 是 LF，工作树是 CRLF。
+
+    仓库 ``core.autocrlf=true``、无 ``.gitattributes`` → blob 里换行一律 LF，工作树
+    却是 CRLF（本仓库实测 ``mft_reader.py``：HEAD `CRLF=0/LF=666/28535B`，工作树
+    `CRLF=666/29201B`）。因此「工作树字节 vs HEAD 字节」**永远不同**，不能当"干净"
+    的判据 —— 谁再想用它抓崩溃残留，会得到"每次运行都报残留"的假阳性。
+    本用例只是把这条事实钉住，防止后人重犯（见 `git_head_bytes` 的 warning）。
+    """
+    import subprocess
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = mutation_probe.Path(directory)
+        target = root / "sample.py"
+        with open(target, "wb") as handle:
+            handle.write(CRLF_SOURCE.encode("utf-8"))
+        for cmd in (
+            ["git", "init", "-q"],
+            ["git", "config", "core.autocrlf", "true"],
+            ["git", "add", "-A"],
+            ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"],
+        ):
+            subprocess.run(cmd, cwd=directory, check=True, capture_output=True)
+
+        head_bytes = mutation_probe.git_head_bytes(root, "sample.py")
+        work_bytes = target.read_bytes()
+        assert b"\r\n" not in head_bytes, "HEAD 里的字节应当是 LF（clean filter 存 LF）"
+        assert b"\r\n" in work_bytes, "工作树应当是 CRLF（checkout 转换）"
+        assert mutation_probe.sha256_bytes(head_bytes) != mutation_probe.sha256_bytes(
+            work_bytes
+        ), "两者字节必然不同 —— 正因如此，不能用 HEAD 字节当干净基线"
+
+
 if __name__ == "__main__":
     from tests._harness import exit_with
 

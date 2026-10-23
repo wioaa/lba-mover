@@ -216,6 +216,102 @@ def git_status_porcelain(root: Path, paths: Sequence[str]) -> str:
     return (proc.stdout or "").strip()
 
 
+def git_head_bytes(root: Path, relative: str) -> bytes:
+    """取 ``HEAD:<relative>`` 的**原始字节**（失败返回 ``b""``）。
+
+    .. warning::
+
+        **不要用它当「干净基线」**：``git show`` 拿到的是**仓库里存的字节**，而本仓库
+        ``core.autocrlf=true``，blob 里的换行一律是 LF，工作树却是 CRLF。实测
+        ``app/win32/mft_reader.py``：HEAD 字节 ``CRLF=0 / LF=666 / 28535 B``，工作树
+        ``CRLF=666 / 28535+666 B`` —— 两者 sha256 **永远不同**。所以"工作树 vs HEAD
+        字节"只能用来判断「与提交版是否有差异」，不能判断「是否被变异污染」。
+        崩溃残留改用 :func:`check_crash_residue`（运行前落一份临时状态文件，下次运行
+        比对）来抓。
+    """
+    proc = subprocess.run(
+        ["git", "show", f"HEAD:{relative}"],
+        cwd=str(root),
+        capture_output=True,
+    )
+    return proc.stdout if proc.returncode == 0 else b""
+
+
+def sha256_bytes(data: bytes) -> str:
+    """对字节流取 sha256（与 :func:`sha256_of` 口径一致）。"""
+    return hashlib.sha256(data).hexdigest()
+
+
+def state_file(root: Path) -> Path:
+    """崩溃残留状态文件的位置（**临时目录，绝不写进仓库**）。
+
+    用项目根路径的 hash 做键：同一个仓库的多次运行共用一个状态文件，不同仓库互不干扰。
+    接受 ``str`` 或 ``Path``（测试与外部调用都方便）。
+    """
+    tag = sha256_bytes(str(Path(root).resolve()).encode("utf-8"))[:16]
+    return Path(tempfile.gettempdir()) / f"mutation-probe-state-{tag}.json"
+
+
+def load_state(root: Path) -> Optional[Dict[str, str]]:
+    """读上次运行留下的字节摘要快照（没有则 ``None``）。"""
+    path = state_file(root)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_state(root: Path, digests: Dict[str, str]) -> None:
+    """落一份字节摘要快照（用于下次运行侦测「上次是否被强杀」）。"""
+    state_file(root).write_text(
+        json.dumps(digests, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def clear_state(root: Path) -> None:
+    """删除状态文件（一次成功运行结束后调用）。"""
+    try:
+        state_file(root).unlink()
+    except OSError:
+        pass
+
+
+def check_crash_residue(root: Path, files: Sequence[str]) -> List[Dict[str, str]]:
+    """侦测「上次运行被强杀（SIGKILL / Ctrl-C 后未收尾）」留下的字节残留。
+
+    原理：运行前把目标文件的 **sha256** 落到临时状态文件；正常结束时删除它。若进程
+    被强杀，``finally`` 不执行、状态文件留存 —— 下次运行一看「状态文件还在，且当前
+    字节与记录不符」，即可判定上次留下了变异体。
+
+    为什么必须用状态文件而不是「和 HEAD 比」：本仓库 ``core.autocrlf=true`` 时 blob
+    存的是 LF、工作树是 CRLF，两者 sha256 永远不同（见 :func:`git_head_bytes`），
+    拿它当干净基线会把**每一次干净运行**都误报成残留。
+
+    Args:
+        root: 项目根。
+        files: 目标文件（相对路径）。
+
+    Returns:
+        残留清单，每项形如 ``{"file", "recorded", "current"}``（字节 sha256 前缀）。
+    """
+    recorded = load_state(root)
+    if not recorded:
+        return []
+    current = snapshot_sha256(root, files)
+    residues: List[Dict[str, str]] = []
+    for relative in files:
+        before = recorded.get(relative, "")
+        now = current.get(relative, "")
+        if before and now and before != now:
+            residues.append(
+                {"file": relative, "recorded": before[:16], "current": now[:16]}
+            )
+    return residues
+
+
 def snapshot_blobs(root: Path, files: Sequence[str]) -> Dict[str, str]:
     """给一组相对路径拍一份 ``git hash-object`` 快照。"""
     return {relative: git_hash_object(root, relative) for relative in files}
@@ -588,6 +684,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(f"[probe] 清单：{manifest_path}（{len(manifest.mutations)} 条变异）")
     print(f"[probe] 模式：{'in-place（真仓库）' if args.in_place else 'shadow（真仓库只读）'}")
 
+    # ★ 起跑前先查「上次被强杀留下的残留」：正常结束时状态文件会被删；它还在且字节
+    # 与记录不符 → 上次的变异体还在盘上。此时**拒绝运行**，因为「跑前跑后一致」会把
+    # 这份残留当成正常基线，自证彻底失效（这正是 F1 的坑：残留只改了行尾，
+    # git status 与 git hash-object 都看不见）。
+    residues = check_crash_residue(root, files)
+    if residues:
+        for item in residues:
+            print(
+                f"[probe] 发现崩溃残留（上次运行未收尾）：{item['file']} "
+                f"记录={item['recorded']} 当前={item['current']}",
+                file=sys.stderr,
+            )
+        print(
+            "[probe] 拒绝运行：请先 `git checkout -- <file>` 恢复字节，"
+            f"或确认无损后删除状态文件 {state_file(root)}",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    save_state(root, sha_before)
+
     try:
         results = (
             run_in_place(root, manifest) if args.in_place else run_shadow(root, manifest, args.keep_shadow)
@@ -641,6 +757,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         print(f"[probe] 结果已写入：{args.json_out}")
 
+    # 正常收尾（字节与进来时一致）→ 清掉状态文件，下次运行从干净基线开始。
+    # 注意：上面的 EXIT_ERROR 分支都**不**清除，好让下次运行能认出"上次没跑完"。
+    clear_state(root)
     return EXIT_OK if all(result.matches for result in results) else EXIT_MISMATCH
 
 
