@@ -30,6 +30,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from PySide6.QtCore import QObject, Signal  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from app.core.models import (  # noqa: E402
@@ -164,6 +165,47 @@ def _use_tail_strategy(window) -> None:
     window._target_panel.strategy = lambda: "tail"
 
 
+class _FakeFeasibility:
+    """可行性报告替身（``_generate_plan`` 只读 ``ok`` 与 ``reasons``）。"""
+
+    def __init__(self, ok: bool, reasons=None) -> None:
+        self.ok = ok
+        self.reasons = list(reasons or [])
+
+
+class _FakeDangerDialog:
+    """计数桩：只统计危险确认框被**实例化**几次，``exec()`` 一律「拒绝」。"""
+
+    count = 0
+    result = None                      # != QDialog.Accepted → 不启动搬运线程
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        _FakeDangerDialog.count += 1
+
+    def exec(self):
+        return _FakeDangerDialog.result
+
+
+def _patch_danger_dialog(mw):
+    """把 ``dialogs.DangerConfirmDialog`` 换成计数桩，返回原始类供复原。"""
+    original = mw.dialogs.DangerConfirmDialog
+    _FakeDangerDialog.count = 0
+    mw.dialogs.DangerConfirmDialog = _FakeDangerDialog
+    return original
+
+
+class _SignalSource(QObject):
+    """带**真** Qt 信号的最小发送者。
+
+    用它 emit 才能真正让槽里的 ``self.sender()`` 拿到对象 —— 从而覆盖
+    「意图绑在 worker 上」那条代码路径（纯 Python 替身的 emit 不会设置 sender）。
+    """
+
+    completed = Signal(object)
+    failed = Signal(str)
+    finished = Signal()
+
+
 # --------------------------------------------------------------------------- #
 # ① apply 分支：置标志 + 发起重新规划，不原地继续
 # --------------------------------------------------------------------------- #
@@ -257,19 +299,50 @@ def test_start_move_notifies_when_not_ready() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# ⑦ apply 后规划撞 early-return：窗口不留悬挂意图（QA ①）
+# ⑦ apply 后规划撞 early-return：三条路径都不得留下悬挂意图（QA ①）
 # --------------------------------------------------------------------------- #
-def test_early_return_after_apply_does_not_leave_intent() -> None:
-    window, _mw = _make_window()
-    # 一个文件都没勾选 → _generate_plan 在建 worker 之前就 early-return
-    window._resume_execute_after_plan = True
-    window._generate_plan()
+def _setup_none_selected(window) -> None:
+    """(a) 一个文件都没勾选。"""
+    return
 
-    assert window._resume_execute_after_plan is False, (
-        "规划早退不得留下悬挂意图（否则下次普通规划会意外弹危险确认框）"
-    )
-    assert window._plan_worker is None, "早退时不该创建规划线程"
-    assert "自动执行已取消" in window._notice.text(), window._notice.text()
+
+def _setup_bad_window(window) -> None:
+    """(b) 目标区间非法（``end <= start``）。"""
+    _select_one_file(window)
+    window._target_panel.strategy = lambda: "range"
+    window._target_panel.window = lambda: (500, 500)
+
+
+def _setup_infeasible(window) -> None:
+    """(c) 目标区间不可行（可行性报告 ok=False）。"""
+    _select_one_file(window)
+    window._target_panel.strategy = lambda: "range"
+    window._target_panel.window = lambda: (100, 900)
+    window._feasibility = _FakeFeasibility(False, ["区间内空闲不足", "挡路者不可驱逐"])
+
+
+def test_early_return_after_apply_does_not_leave_intent() -> None:
+    for setup, fragment in (
+        (_setup_none_selected, "请先勾选需要迁移的文件"),
+        (_setup_bad_window, "请先设定目标区间"),
+        (_setup_infeasible, "当前目标区间不可行"),
+    ):
+        window, _mw = _make_window()
+        setup(window)
+        # apply 分支置的意图（模拟「先应用再执行」刚点下去）
+        window._resume_execute_after_plan = True
+        window._generate_plan()
+
+        assert window._resume_execute_after_plan is False, (
+            f"[{fragment}] 规划早退不得留下悬挂意图"
+            "（否则下次普通规划会意外弹危险确认框）"
+        )
+        assert window._plan_worker is None, f"[{fragment}] 早退时不得创建规划线程"
+        text = window._notice.text()
+        assert fragment in text, f"应提示具体原因，实际 {text!r}"
+        assert "自动执行已取消" in text, (
+            f"[{fragment}] 早退时必须明说不再自动执行，实际 {text!r}"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -346,6 +419,55 @@ def test_plan_finished_is_noop_after_terminal_signal() -> None:
     window._busy = True                   # 假设别的任务正忙
     window._on_plan_worker_finished()
     assert window._busy is True, "没有未收尾的规划线程时 finished 必须什么都不做"
+
+
+# --------------------------------------------------------------------------- #
+# ⑫ 正常规划（无意图）完成 → 不弹危险确认框、不启动搬运（QA 钉子 2）
+# --------------------------------------------------------------------------- #
+def _armed_window():
+    """执行模式、权限齐备、危险确认框换成计数桩的窗口。"""
+    window, mw = _make_window()
+    window._is_admin = True
+    window._privilege_ok = True
+    original = _patch_danger_dialog(mw)
+    return window, mw, original
+
+
+def test_plan_ready_without_intent_does_not_confirm() -> None:
+    window, mw, original = _armed_window()
+    source = _SignalSource()               # 真信号 → 槽里 sender() 可用
+    source.resume_after = False
+    source.completed.connect(window._on_plan_ready)
+    try:
+        source.completed.emit(window._plan)
+    finally:
+        mw.dialogs.DangerConfirmDialog = original
+
+    assert _FakeDangerDialog.count == 0, "没有接续意图时不得弹任何危险确认框"
+    assert window._move_worker is None, "没有接续意图时不得启动搬运线程"
+
+
+# --------------------------------------------------------------------------- #
+# ⑬ 带意图的规划完成 → 接续一次、危险确认框恰好实例化 1 次（QA 钉子 3）
+# --------------------------------------------------------------------------- #
+def test_plan_ready_with_intent_confirms_exactly_once() -> None:
+    window, mw, original = _armed_window()
+    source = _SignalSource()
+    source.resume_after = True
+    source.completed.connect(window._on_plan_ready)
+    try:
+        source.completed.emit(window._plan)
+        first = _FakeDangerDialog.count
+        source.completed.emit(window._plan)      # 第二次：意图已被消费
+        second = _FakeDangerDialog.count
+    finally:
+        mw.dialogs.DangerConfirmDialog = original
+
+    assert first == 1, f"接续必须恰好弹 1 次危险确认框（人工闸门不许跳过），实际 {first}"
+    assert second == 1, "意图只消费一次：重复的 completed 不得再弹确认框"
+    assert window._move_worker is None, "确认框桩返回「拒绝」时不得启动搬运线程"
+    assert window._resume_execute_after_plan is False
+    assert getattr(source, "resume_after") is False, "worker 上的意图消费即清"
 
 
 if __name__ == "__main__":
