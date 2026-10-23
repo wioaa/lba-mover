@@ -54,7 +54,7 @@
 - **修复「执行时提示卷序列号变化」误报**：卷身份校验曾跨 API 比较（规划期 `GetVolumeInformation` 32 位 vs 执行期 `FSCTL_GET_NTFS_VOLUME_DATA` 64 位），同一卷被误拒；改为两边同源（`volume.read_volume_serial`）。
 - EXE **默认以管理员启动**（`uac_admin=True`，嵌入 `requireAdministrator` 清单；可用 `LBA_NO_ADMIN=1` 出免提权调试版）。
 - README 加强安全警示：顶部高危横幅 + 完整「三、风险声明与安全须知」。
-- 接入 **testflow 测试工具流**（拷自 ShellBreaker，`python tools/testflow.py` 唯一入口；新增 `tools/run_all_tests.py` 适配器，把各测试文件聚合为 pytest 风格输出喂内置解析器）。
+- 接入 **testflow 测试工具流**（通用测试流水线，`python tools/testflow.py` 唯一入口；新增 `tools/run_all_tests.py` 适配器，把各测试文件聚合为 pytest 风格输出喂内置解析器）。
 - 版本号 `1.0.0A → 1.0.0B`。
 
 #### 1.0.0C
@@ -63,6 +63,8 @@
 - **策略② 选定区间预密实化**（`densify.compact_range`）：把选定区间内的可移动文件密集重排（可打包空间 = 区间空闲 ∪ 这些文件自身将腾出的簇，并避开区间内不可搬障碍），把碎片空闲 coalesce 成更大的连续块。
 - **策略③ 按文件大小分区段**（`densify.plan_size_zones`）：把区间按尺寸类切成连续区段（需求优先、从大到小），同尺寸的文件聚在同一段里密实排布；区间超发时优先保住大文件。
 - 三者为**纯规划函数**（新模块 `app/core/densify.py`），只算目标布局，搬运顺序 / 中转交由既有 `scheduler`；新增 `tests/test_densify.py`（11 例）。
+- **用户态分块流式搬迁模式**（新模块 `app/core/block_stream.py` + `app/win32/file_io.py`）：以 **65536 簇为 block**，可调缓存按 block 的**倍数**积攒；双阶段流水线（`load`：源→暂存 / `store`：暂存→目的）重叠推进，一个分块走了立马顶上，缓解 HDD 半双工，数据经文件系统落地、源簇读出即被重占用。两种**缓存模式**经 `file_io.copy_stream(mode=..., cache_dir=...)` 统一入口：`memory`（内存分配缓存，块在 RAM 中转）与 `disk`（设定缓存目录的硬盘缓存，块落暂存盘再读出）。新增 `tests/test_block_stream.py`（12 例）+ `tests/test_file_io.py`（4 例，对临时文件真实读写）。
+- README 增加「代码由 AI 助手生成、维护者不具备审查能力」的来源声明。
 - 本版**仅改源码 + 离线测试**，未重新打包（`dist/` EXE 仍为 1.0.0B，待收工再打包）。
 - 版本号 `1.0.0B → 1.0.0C`。
 

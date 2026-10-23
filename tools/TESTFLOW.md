@@ -42,7 +42,7 @@
 ## 用法
 
 ```bash
-python tools/testflow.py              # 跑默认 profile（ShellBreaker 就是 pytest 全量）
+python tools/testflow.py              # 跑默认 profile（默认即全量测试）
 python tools/testflow.py -k eta       # 额外参数透传给最后一个步骤
 python tools/testflow.py --profile lastfailed   # 只跑上次失败的
 python tools/testflow.py --json       # 只输出 JSON，给程序/CI 读
