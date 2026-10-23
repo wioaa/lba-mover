@@ -36,6 +36,9 @@ block_cipher = None
 BUILD_CONSOLE = os.environ.get("LBA_BUILD_CONSOLE") == "1"
 # 输出名可用环境变量覆盖（排查时避免覆盖正式产物）
 BUILD_NAME = os.environ.get("LBA_BUILD_NAME", "LBA-Tail-Mover")
+# 默认请求管理员；LBA_NO_ADMIN=1 可出免提权调试版（配合 LBA_BUILD_CONSOLE=1 用于
+# 在非交互/无 UAC 的环境里冒烟验证打包完整性，如跑 --selftest）
+BUILD_UAC_ADMIN = os.environ.get("LBA_NO_ADMIN") != "1"
 
 #: 只在函数体内动态 import、静态分析抓不到的模块（务必手工声明）。
 hiddenimports = [
@@ -87,7 +90,7 @@ exe = EXE(
     upx_exclude=[],
     runtime_tmpdir=None,
     console=BUILD_CONSOLE,
-    uac_admin=True,  # 默认以管理员启动：嵌入 requireAdministrator 清单，双击即请求 UAC 提权
+    uac_admin=BUILD_UAC_ADMIN,  # 默认以管理员启动：嵌入 requireAdministrator 清单，双击即请求 UAC 提权
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

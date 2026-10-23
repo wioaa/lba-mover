@@ -223,6 +223,22 @@ def read_volume_info(letter: str) -> VolumeInfo:
     return info
 
 
+def read_volume_serial(letter: str) -> Optional[int]:
+    """只读卷序列号（``GetVolumeInformation``，32 位 DWORD）；失败返回 ``None``。
+
+    与 :func:`read_volume_info` 里 ``info.serial`` **同源**。执行前的卷身份校验
+    必须两边用同一个 API：规划期取的是这个 32 位序列号，执行期若改用
+    ``FSCTL_GET_NTFS_VOLUME_DATA`` 的 64 位 ``VolumeSerialNumber`` 直接比全值，
+    两种 API 的表示 / 宽度不同，会把**同一卷**误报成「序列号已变化」而阻断执行。
+    """
+    root = f"{letter.upper()}:\\"
+    serial = api.wintypes.DWORD(0)
+    ok = api.kernel32.GetVolumeInformationW(
+        root, None, 0, api.ctypes.byref(serial), None, None, None, 0
+    )
+    return int(serial.value) if ok else None
+
+
 def list_volumes() -> List[VolumeInfo]:
     """枚举全部本地固定卷并读取信息。"""
     volumes: List[VolumeInfo] = []

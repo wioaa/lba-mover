@@ -1,0 +1,36 @@
+# testflow 配置 —— 见 tools/TESTFLOW.md
+#
+# 换了新项目只要改这个文件：命令、监视范围、产物清理全是声明式的，
+# tools/testflow.py 本身不含任何本项目专属逻辑。
+
+[project]
+name = "lba-mover"
+report = ".testflow/last-run.json"
+
+[profiles.default]
+# 参与"运行期间源码是否被改动"快照的 glob。跑测试时改这里列的文件，
+# 结论会直接判 INVALID（静态 import 会读到半新半旧的源码）。
+watch = [
+  "app/**/*.py",
+  "tests/**/*.py",
+  "tools/*.py",
+  "main.py",
+]
+
+# 测试会写出来的运行时文件，跑完自动清掉。lba-mover 的测试是纯逻辑 + 内存
+# fixture，目前不落盘；未来若新增临时产物，加到这里。
+artifacts = []
+
+timeout = 1200
+
+# lba-mover 的测试是「每个 tests/test_*.py 自带 _harness、独立退出码 0/1」，
+# 没有 pytest 那样的单一收集入口。tools/run_all_tests.py 把它们汇成一步，并
+# 转成 pytest 风格的摘要 / FAILED 行 —— 所以这里用内置 pytest 解析器，
+# tools/testflow.py 原样拷贝、不改一行。
+steps = [
+  { name = "unit", command = ["{python}", "tools/run_all_tests.py"], parser = "pytest" },
+]
+
+# 排查时只跑文件名含某子串的测试文件：
+#   python tools/testflow.py -k relay
+# （-k 由 run_all_tests.py 消费，经 testflow 的 passthrough 透传）

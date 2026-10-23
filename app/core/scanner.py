@@ -855,7 +855,16 @@ class MoveWorker(QThread):
         return build_tasks(self._plan.items, self._plan.evictions)
 
     def _verify_volume_identity(self) -> str:
-        """重读卷身份，返回错误信息（空串表示一致）。"""
+        """重读卷身份，返回错误信息（空串表示一致）。
+
+        ★ 序列号必须与规划期**同源比对**：``self._info.serial`` 来自
+        ``GetVolumeInformation``（32 位 DWORD，见 ``volume.read_volume_info``）。
+        早期实现改用 ``FSCTL_GET_NTFS_VOLUME_DATA`` 的 64 位
+        ``VolumeSerialNumber`` 直接比全值，两种 API 的表示 / 宽度不同，会把
+        **同一卷**误报成「序列号已变化」而阻断执行。故执行期也用
+        ``GetVolumeInformation`` 取序列号；总簇数继续用 FSCTL（规划期
+        ``total_clusters`` 即来自 FSCTL，两边同源）。
+        """
         handle = volume.VolumeHandle(self._info.letter)
         try:
             handle.open()
@@ -865,12 +874,17 @@ class MoveWorker(QThread):
         finally:
             handle.close()
 
+        current_serial = volume.read_volume_serial(self._info.letter)
         expected_serial = int(self._info.serial)
         expected_clusters = int(self._info.total_clusters)
-        if expected_serial and int(data.volume_serial) != expected_serial:
+        if (
+            expected_serial
+            and current_serial is not None
+            and (current_serial & 0xFFFFFFFF) != (expected_serial & 0xFFFFFFFF)
+        ):
             return (
                 f"卷序列号已变化（计划 {expected_serial:#x} → 现在 "
-                f"{int(data.volume_serial):#x}），拒绝执行"
+                f"{current_serial:#x}），拒绝执行"
             )
         if expected_clusters and int(data.total_clusters) != expected_clusters:
             return (
