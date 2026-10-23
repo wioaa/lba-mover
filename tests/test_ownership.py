@@ -173,15 +173,28 @@ def test_query_cost_does_not_scale_linearly() -> None:
     large = build(100_000)
     measure(small, 500)          # 预热
     measure(large, 500)
-    # 1.0.0D：计时类断言在整机负载下会偶发抖动（testflow 全量跑时一次
-    # ratio 超 3 的假阳性），改取 3 轮最优 —— 意图不变（查的是复杂度，
-    # 不是绝对速度），最优值对后台噪声最不敏感。
-    ratios = []
-    for _round in range(3):
-        ratios.append(measure(large) / max(1e-9, measure(small)))
-    ratio = min(ratios)
-    assert ratio < 3.0, (
-        f"查询耗时比 {ratio:.2f}（三轮最优；10× 数据不该近似 10× 耗时）"
+    # ★ 1.0.0E：计时类断言在整机负载下会偶发抖动 —— testflow 全量跑时出现过
+    # ratio 超 3 的假阳性，单独重跑 3 次全绿。三处加固（意图不变：查的是复杂度
+    # 退化，不是绝对速度）：
+    #   ①两侧各取 **5 轮最优**、比值取「两侧最优之比」（最优值对后台噪声最不敏感；
+    #      只对 ratio 取最优会在 small 被测快时虚高，之前就是这么抖的）；
+    #   ②打印实测值，让日志能区分「真回归」与「机器忙」；
+    #   ③阈值 3.0 → 4.0：实测稳定区间 2.0~2.2（10× 数据量），若退化成线性
+    #      比值会接近 10 —— 4.0 距实测 1.9× 余量、距线性回归 2.5×，仍能拦住回归。
+    small_times: List[float] = []
+    large_times: List[float] = []
+    for _round in range(5):
+        small_times.append(measure(small))
+        large_times.append(measure(large))
+    best_small = min(small_times)
+    best_large = min(large_times)
+    ratio = best_large / max(1e-9, best_small)
+    print(
+        f"\n[perf] query 10k → {best_small * 1000:.2f} ms / 100k → "
+        f"{best_large * 1000:.2f} ms（各 5 轮最优），比值 {ratio:.2f}"
+    )
+    assert ratio < 4.0, (
+        f"查询耗时比 {ratio:.2f}（两侧各 5 轮最优；10× 数据不该接近 10× 耗时）"
     )
 
 

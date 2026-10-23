@@ -12,7 +12,7 @@ __version__ = "1.0.0"
 #: 修订字母：与 ``__version__`` 组合成对外显示版本（如 ``v1.0.0A``）。
 #: 约定见用户规范——三段号只写在这里，字母另存字段；Windows 资源里的
 #: FileVersion 用三段转成的数字四元组（1.0.0.0），字母只在产品字符串里体现。
-__revision__ = "D"
+__revision__ = "E"
 
 
 def display_version() -> str:

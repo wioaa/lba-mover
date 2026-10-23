@@ -1077,11 +1077,19 @@ class MainWindow(QMainWindow):
         )
 
     def _on_scan_completed(self, entries: object) -> None:
+        # ★ 1.0.0E（QA P2）：取消也是走 ``completed``（部分结果），必须与「扫描
+        # 完成」区分 —— 否则用户按了取消却看到「扫描完成」+ 一份不完整列表，
+        # 且提示零残留，会误以为某个文件不在本卷上。
+        cancelled = bool(getattr(self.sender(), "cancelled", False))
         self._flush_scan_buffer()
         items: List[FileEntry] = list(entries) if isinstance(entries, list) else []
         self._table.file_model.set_entries(items)
         self._progress.set_indeterminate(False)
         self._scan_worker = None
+
+        if cancelled:
+            self._on_scan_cancelled(items)
+            return
 
         if not items:
             self._table.set_empty_state(
@@ -1113,6 +1121,51 @@ class MainWindow(QMainWindow):
         self._count_badge.set_state(f"{len(items)} 个", "accent")
         self._on_selection_changed()
         self._build_index()
+
+    def _on_scan_cancelled(self, items: List[FileEntry]) -> None:
+        """扫描被用户取消：如实报「已取消」，**不假装完成**（1.0.0E）。
+
+        与 :meth:`_on_scan_completed` 的差别是刻意的：
+
+        * 文案只出现「已取消」，绝不出现「扫描完成」（否则用户会用一份不完整
+          列表做判断，误以为某文件不在本卷）；
+        * **不自动勾选** —— 部分结果不应被当成完整全集；
+        * **不调用 ``_build_index()``** —— 拿部分文件表建全卷归属索引既浪费，
+          语义上也是错的（挡路者归属会缺项）；需要时用户会重新扫描。
+
+        Args:
+            items: 取消前已解析到的条目（可能为空）。
+        """
+        count = len(items)
+        # ★ 必须在这里自己退忙碌态：正常路径靠 `_build_index()` 之后的
+        # `_on_index_ready/_on_index_failed` 释放，而取消路径**不建索引**。
+        self._set_busy(False)
+        if items:
+            self._table.set_ready_state()
+            self._log.warn(
+                f"扫描已取消：仅显示已解析的 {count} 个文件，列表不完整（未自动勾选、"
+                "未建立归属索引）"
+            )
+            self._progress.set_state(
+                1, 1, "扫描已取消", f"仅显示已解析的 {count} 个文件（列表不完整）"
+            )
+        else:
+            self._table.set_empty_state(
+                "扫描已取消",
+                "已取消扫描，未解析到任何文件；可重新扫描获取完整列表",
+                "warning",
+            )
+            self._log.warn("扫描已取消：未解析到任何文件")
+            self._progress.reset("扫描已取消")
+        self._set_notice(
+            f"扫描已取消：仅显示已解析的 {count} 项，可重新扫描获取完整列表"
+            if count
+            else "扫描已取消，可重新扫描获取完整列表",
+            "warning",
+        )
+        self._count_badge.set_state(f"{count} 个", "accent")
+        self._on_selection_changed()
+        self._sync_buttons()
 
     def _annotate_front_half(self, items: List[FileEntry]) -> None:
         """卷前半大文件扫描（1.0.0C）：把占前部的大文件标注为「前半·候选」。只读。"""
@@ -1173,15 +1226,35 @@ class MainWindow(QMainWindow):
         )
 
     def _on_index_ready(self, payload: object) -> None:
+        # ★ 1.0.0E：取消也走 ``ready``（部分索引）—— 部分归属表不能当作
+        # 「就绪」使用，否则挡路者归属会缺项且用户毫不知情（与扫描取消同族）。
+        cancelled = bool(getattr(self.sender(), "cancelled", False))
         self._index_worker = None
         self._progress.set_indeterminate(False)
         self._set_busy(False)
         self._index_payload = payload
-        self._ownership = getattr(payload, "index", None)
         channel = getattr(payload, "channel", "handle")
         files = getattr(payload, "total_files", 0)
         extents = getattr(payload, "total_extents", 0)
         elapsed = getattr(payload, "elapsed", 0.0)
+        if cancelled:
+            self._ownership = None            # 部分索引不当归属依据
+            self._progress.reset("归属索引已取消")
+            self._log.warn(
+                f"归属索引已取消（未完成，仅 {files:,} 个文件 / {extents:,} 个 extent）："
+                "部分索引不作为归属依据，挡路者自动驱逐暂不可用"
+            )
+            self._target_panel.set_blockers_unavailable(
+                "归属信息未完成：索引已取消，部分结果不作为归属依据。"
+                "挡路者自动驱逐暂不可用，可重新扫描以建立完整索引。"
+            )
+            for note in getattr(payload, "notes", []) or []:
+                self._log.info(note)
+            self._plan_stale = True
+            self._schedule_feasibility()
+            self._sync_buttons()
+            return
+        self._ownership = getattr(payload, "index", None)
         if channel == "handle":
             self._scan_panel.set_handle_stats(files, extents, elapsed)
             self._log.warn(
@@ -1805,9 +1878,17 @@ class MainWindow(QMainWindow):
         （或自动重新规划期间反悔）后就会永久停在忙碌态：进度条一直转、按钮
         全禁、只能关窗。``QThread.finished`` 一定会发，本槽在「线程已结束但
         没有任何终态信号被处理过」（``_plan_worker`` 仍非空）时接管收尾。
+
+        ★ **本槽只由 ``QThread.finished`` 信号驱动，直调是 no-op**（1.0.0E）：
+        ``sender()`` 为 ``None`` 时若仍「接管收尾」，就会清掉一个**可能还在
+        运行**的规划槽位（``_plan_worker=None`` + ``_set_busy(False)`` 而线程
+        仍在跑）→ 界面误判空闲、用户可再点一次生成计划，旧线程的 ``completed``
+        回来时槽位已是新值。契约由 ``tests/test_ui_execute_flow.py`` 钉住。
         """
         worker = self.sender()
-        if worker is not None and worker is not self._plan_worker:
+        if worker is None:
+            return                          # 非信号调用：不做任何事（见 docstring）
+        if worker is not self._plan_worker:
             return                          # 已被新任务替换：收尾交给新任务
         pending = self._plan_worker
         if pending is None:

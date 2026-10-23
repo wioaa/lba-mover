@@ -393,32 +393,58 @@ def test_take_resume_intent_consumes_worker_and_window() -> None:
 
 # --------------------------------------------------------------------------- #
 # ⑩ 取消兜底：worker 结束但没发终态信号 → 必须退出忙碌态（QA ②）
+#     ★ 必须用**真 Qt 信号**驱动：本槽有 `sender() is None → no-op` 守卫
+#     （1.0.0E 加的防御），直调会绕过守卫并让断言失真。踩过两次，勿改回直调。
 # --------------------------------------------------------------------------- #
 def test_plan_cancel_fallback_clears_busy() -> None:
+    window, _mw = _make_window()
+    source = _SignalSource()               # 替身「规划线程」：有真 finished 信号
+    source.resume_after = True
+    source.finished.connect(window._on_plan_worker_finished)
+    window._plan_worker = source
+    window._set_busy(True)
+
+    source.finished.emit()                 # 线程结束且没发 completed/failed
+
+    assert window._plan_worker is None, "取消后必须放掉 worker 槽位"
+    assert window._busy is False, "取消后必须退出忙碌态（否则进度条一直转、按钮全禁）"
+    assert source.resume_after is False, "被取消的规划不得保留自动执行意图"
+    assert window._resume_execute_after_plan is False
+    assert "已取消" in window._notice.text(), window._notice.text()
+
+
+# --------------------------------------------------------------------------- #
+# ⑪ 正常收尾后 finished 事件到达 → no-op（不许误清别的任务的忙碌态）
+# --------------------------------------------------------------------------- #
+def test_plan_finished_is_noop_after_terminal_signal() -> None:
+    window, _mw = _make_window()
+    source = _SignalSource()
+    source.finished.connect(window._on_plan_worker_finished)
+    window._plan_worker = None            # completed / failed 已收尾
+    window._busy = True                   # 假设别的任务正忙
+    source.finished.emit()
+    assert window._busy is True, "没有未收尾的规划线程时 finished 必须什么都不做"
+    assert window._plan_worker is None
+
+
+# --------------------------------------------------------------------------- #
+# ⑪b 直调兜底槽必须 no-op（1.0.0E 契约钉：本槽只由 QThread.finished 驱动）
+#     动机：`sender()` 为 None 时若仍「接管收尾」，会清掉一个**可能还在跑**的
+#     规划槽位 → 界面误判空闲、用户可再点一次生成计划，旧线程 completed 回来
+#     时槽位已是新值（双重规划线程）。QA 提的两个改动要点之一。
+# --------------------------------------------------------------------------- #
+def test_plan_finished_direct_call_is_noop() -> None:
     window, _mw = _make_window()
     worker = _FakePlanWorker()
     worker.resume_after = True
     window._plan_worker = worker
     window._set_busy(True)
 
-    window._on_plan_worker_finished()      # 模拟：线程结束且没发 completed/failed
+    window._on_plan_worker_finished()      # 直调：不是 finished 信号驱动
 
-    assert window._plan_worker is None, "取消后必须放掉 worker 槽位"
-    assert window._busy is False, "取消后必须退出忙碌态（否则进度条一直转、按钮全禁）"
-    assert worker.resume_after is False, "被取消的规划不得保留自动执行意图"
-    assert window._resume_execute_after_plan is False
-    assert "已取消" in window._notice.text(), window._notice.text()
-
-
-# --------------------------------------------------------------------------- #
-# ⑪ 正常收尾后 finished 必须是 no-op（不许误清别的任务的忙碌态）
-# --------------------------------------------------------------------------- #
-def test_plan_finished_is_noop_after_terminal_signal() -> None:
-    window, _mw = _make_window()
-    window._plan_worker = None            # completed / failed 已收尾
-    window._busy = True                   # 假设别的任务正忙
-    window._on_plan_worker_finished()
-    assert window._busy is True, "没有未收尾的规划线程时 finished 必须什么都不做"
+    assert window._plan_worker is worker, "直调不得清掉规划槽位"
+    assert window._busy is True, "直调不得退出忙碌态"
+    assert worker.resume_after is True, "直调不得消费接续意图"
 
 
 # --------------------------------------------------------------------------- #

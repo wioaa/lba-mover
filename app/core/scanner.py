@@ -323,6 +323,16 @@ class ScanWorker(QThread):
         """请求取消扫描。"""
         self._cancel = True
 
+    @property
+    def cancelled(self) -> bool:
+        """是否收到过取消请求（1.0.0E：只读，供 UI 如实报「已取消」）。
+
+        句柄通道取消时仍会 ``completed.emit(已扫到的部分结果)`` —— 上层的
+        ``_on_scan_completed`` 必须据此区分「扫描完成」与「扫描已取消」，
+        不能把部分结果当完整结果（QA P2）。
+        """
+        return bool(self._cancel)
+
     def run(self) -> None:  # noqa: D102 - QThread 钩子
         if self._mode == "mft" and self._info is not None:
             if self._run_mft_scan():
@@ -520,6 +530,16 @@ class IndexWorker(QThread):
 
     def request_cancel(self) -> None:
         self._cancel = True
+
+    @property
+    def cancelled(self) -> bool:
+        """是否被取消（1.0.0E：只读，供 UI 如实报「已取消」）。
+
+        取消时 ``_run_handle`` 会 break 后照常返回**部分**索引 → ``ready``
+        仍然发出；UI 必须据此区分「归属索引就绪」与「归属索引已取消（未完成）」，
+        部分索引不可当作完整归属依据（与扫描取消同族的问题）。
+        """
+        return bool(self._cancel)
 
     # ------------------------------------------------------------------ #
     def run(self) -> None:  # noqa: D102 - QThread 钩子
@@ -729,6 +749,16 @@ class MftScanWorker(QThread):
         """请求取消（MFT 扫描每 512 条记录检查一次；取消也发 completed）。"""
         self._cancel = True
 
+    @property
+    def cancelled(self) -> bool:
+        """是否被取消（1.0.0E）。
+
+        取消时 ``run`` 仍走**成功**分支（``MftScanOutcome.ok`` 语义是「数据可用」，
+        取消不是失败），但会 emit ``completed`` 一份**不完整**结果 —— UI 必须
+        用本属性把「已取消，仅显示已解析的 N 项」如实报出（QA P2）。
+        """
+        return bool(self._cancel)
+
     def run(self) -> None:  # noqa: D102 - QThread 钩子
         from app.core import mft as mft_mod
         from app.win32 import mft_reader
@@ -752,6 +782,12 @@ class MftScanWorker(QThread):
             return
 
         self.stats.emit(outcome.stats)
+        # ★ 1.0.0E（QA P2）：取消不是失败 —— ``ok`` 仍为 True（已解析数据可用），
+        # 但必须把「已取消」的事实带出去：同步 worker 自己的取消标记（供 UI 读
+        # ``cancelled`` 属性），并在 `completed` 之前把阶段文案改成「已取消」，
+        # 否则用户按了取消却看到「扫描完成」+ 一份不完整列表且零提示。
+        if outcome.cancelled:
+            self._cancel = True
         if not outcome.ok:
             self._emit_fallback(outcome.fallback_code, outcome.stats.fatal_error)
             return
@@ -765,7 +801,16 @@ class MftScanWorker(QThread):
         )
         if advice:
             self.progress.emit(len(outcome.entries), len(entries), advice)
-        self.progress.emit(len(outcome.entries), len(entries), outcome.stats.summary_line())
+        if outcome.cancelled:
+            self.progress.emit(
+                len(entries),
+                max(1, len(entries)),
+                f"扫描已取消，仅显示已解析的 {len(entries):,} 项",
+            )
+        else:
+            self.progress.emit(
+                len(outcome.entries), len(entries), outcome.stats.summary_line()
+            )
         self.completed.emit(entries)
 
     # ------------------------------------------------------------------ #
@@ -821,8 +866,10 @@ class PlanWorker(QThread):
         """请求取消（规划是单次纯计算，取消的语义是「丢弃结果」）。
 
         ★ 契约：取消后 ``run`` 直接返回，**``completed`` 与 ``failed`` 都不发**。
-        调用方必须自己用 ``QThread.finished`` 兜底收尾（否则会永久停在忙碌态
-        —— 主窗口的 :meth:`MainWindow._on_plan_worker_finished` 就是这层兜底）。
+        调用方必须自己用 ``QThread.finished`` 兜底收尾（否则会永久停在忙碌态）。
+        在所有 QThread worker 里，**唯一需要新增 finished 兜底的是 PlanWorker**
+        —— ``FeasibilityWorker`` 同为「取消即裸 return」，但它早已接 ``finished``
+        且不参与 ``_busy``，因此不缺这层兜底。
         """
         self._cancel = True
 

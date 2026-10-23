@@ -56,6 +56,22 @@ class MftReadError(RuntimeError):
     """MFT 原始读取失败（无法定位 / 无法读取 / 逻辑流有空洞）。"""
 
 
+def mark_cancelled(outcome: MftScanOutcome, note: str = "扫描已取消（结果不完整）") -> None:
+    """把「用户请求取消」记到扫描结果上（1.0.0E，无设备依赖、可单测）。
+
+    单独抽成函数是为了让这条**语义**能被离线钉住：取消分支如果只 ``break``
+    而不置 ``cancelled``，``MftScanOutcome.ok`` 仍为 ``True``，上层会把用户取消
+    当成「扫描完成」并交出一份不完整结果（QA P2）。``cancelled`` 与
+    ``fallback_code`` 是两件事：**取消不是通道不可用，也不是失败**。
+
+    Args:
+        outcome: 待标记的扫描结果。
+        note: 追加到 ``notes`` 的说明（默认「扫描已取消（结果不完整）」）。
+    """
+    outcome.cancelled = True
+    outcome.notes.append(note)
+
+
 @dataclass(slots=True)
 class MftScanOutcome:
     """一次 MFT 通道扫描的全部产出（**纯数据**，便于单测与信号传递）。"""
@@ -67,6 +83,11 @@ class MftScanOutcome:
     #: 非空 = 本通道不可用，调用方应改用句柄通道（原因码见 ``mft.FALLBACK_*``）
     fallback_code: str = ""
     notes: List[str] = field(default_factory=list)
+    #: 1.0.0E：用户请求取消（**不是失败**）。取消时已解析的结果仍然可用
+    #: （``ok`` 保持 ``True``），但**不完整** —— 调用方必须据此把「已取消」
+    #: 如实报给用户，绝不能当「扫描完成」（QA P2：取消曾被静默报成完成，
+    #: 用户看到一份不完整文件列表却零提示）。
+    cancelled: bool = False
 
     @property
     def ok(self) -> bool:
@@ -500,7 +521,10 @@ def scan_volume_mft(
         try:
             for number, raw in reader.iter_records(0, total_records):
                 if should_cancel is not None and (number % 512 == 0) and should_cancel():
-                    outcome.notes.append("扫描已取消（结果不完整）")
+                    # ★ 1.0.0E：取消必须显式留痕 —— 只 break 会让 outcome 仍
+                    # ``ok=True``，上层把「用户取消」当成「扫描完成」并交出
+                    # 一份不完整的结果（QA P2 实测：completed=1 / fallback=[]）。
+                    mark_cancelled(outcome)
                     break
                 stats.total_records += 1
                 try:
