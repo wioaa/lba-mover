@@ -10,6 +10,14 @@
 3. :func:`plan_size_zones` —— **按文件大小分区段**：把区间按尺寸类切成连续区段，
    同尺寸的文件聚在同一段里装箱，空隙更均匀、密实性更高。
 
+1.0.0F 追加（分块流式自动模式用）：
+
+4. :func:`auto_stream_selection` —— 为**用户态分块流式迁移**自动挑选文件：全池
+   可移动文件**按占用簇降序**（大文件优先），在「自动迁移容量」上限内尽量装满，
+   单个放不下就**跳过**继续挑更小的（与 :func:`auto_fill_tail` 同一取舍）。
+   它**不算落点**（流式迁移的落点由文件系统在空闲区分配），所以返回的是一份
+   ``(选中文件, 统计, 说明)`` 而不是 ``MovePlan``。
+
 约定：本模块只算「目标布局」，不决定搬运顺序 / 中转（那由 ``scheduler`` 负责）；
 因此返回的结构与现有 ``MovePlan`` / ``{path: target}`` 一致，日后接 UI / 执行器时
 可复用既有依赖排序与 relay 逻辑。
@@ -425,3 +433,118 @@ def zone_plan(
     moved = sum(1 for i in plan.items if not i.skipped_reason)
     plan.note = f"按大小分区：{moved} 个文件装入 {len(zones)} 个尺寸区段 [{lo:,}, {hi:,})"
     return plan
+
+
+# ---------------------------------------------------------------- 策略④（1.0.0F）
+
+
+@dataclass
+class AutoStreamSelection:
+    """分块流式自动模式的挑选结果（**不含落点**）。
+
+    Attributes:
+        selected: 选中待流式迁移的文件（已按占用簇降序）。
+        total_bytes: ``selected`` 的净数据量（按 ``size`` 求和）。
+        total_clusters: ``selected`` 占用的簇数合计。
+        capacity_bytes: 实际生效的容量上限（``0`` = 不限）。
+        skipped_unmovable: 因不可移动被排除的数量。
+        skipped_oversize: 因超出剩余容量被跳过的数量（大文件优先时放不下即跳过）。
+        note: 一句话说明（含填充率），供 UI 直接显示。
+    """
+
+    selected: List[FileEntry]
+    total_bytes: int
+    total_clusters: int
+    capacity_bytes: int
+    skipped_unmovable: int = 0
+    skipped_oversize: int = 0
+    note: str = ""
+
+
+def auto_stream_selection(
+    entries: Sequence[FileEntry],
+    *,
+    capacity_bytes: int = 0,
+    bytes_per_cluster: int = 4096,
+    free_bytes: int = 0,
+    min_clusters: int = 0,
+) -> AutoStreamSelection:
+    """全池自动挑选文件（大文件优先）交给**分块流式迁移**（1.0.0F）。
+
+    与 :func:`auto_fill_tail` 的区别：后者要算**簇级落点**（填末端预留区）并产出
+    ``MovePlan``；本函数**不算落点**——分块流式迁移走用户态 Read/Write，落点由文件
+    系统在空闲区分配（保证连续、不保证精确 LCN），所以只负责「挑谁」。
+
+    Args:
+        entries: 扫描到的大文件（含不可移动项，会被排除）。
+        capacity_bytes: 自动迁移容量上限（字节）。``<=0`` 表示**不限**，此时以
+            ``free_bytes``（卷可用空间）作为兜底上限；``free_bytes`` 也为 0 时视为
+            不限（UI 侧应提示用户确认规模）。
+        bytes_per_cluster: 簇大小，用于把簇数换算成字节。
+        free_bytes: 卷当前可用字节数（``capacity_bytes<=0`` 时的兜底上限）。
+        min_clusters: 小于该簇数的文件不参与挑选（默认 0 = 都参与）。
+
+    Returns:
+        :class:`AutoStreamSelection`；``note`` 里给出填充率与跳过统计。
+    """
+    bpc = max(1, int(bytes_per_cluster))
+    limit = int(capacity_bytes)
+    if limit <= 0:
+        limit = max(0, int(free_bytes))
+    floor_clusters = max(0, int(min_clusters))
+
+    movable: List[FileEntry] = []
+    skipped_unmovable = 0
+    for entry in entries:
+        clusters = int(getattr(entry, "allocated_clusters", 0) or 0)
+        if not getattr(entry, "movable", False) or clusters <= 0:
+            skipped_unmovable += 1
+            continue
+        if clusters < floor_clusters:
+            skipped_unmovable += 1
+            continue
+        movable.append(entry)
+
+    # 大文件优先（按占用簇降序；簇数相同时按数据量降序，保证结果稳定）
+    movable.sort(
+        key=lambda e: (int(getattr(e, "allocated_clusters", 0) or 0), int(getattr(e, "size", 0) or 0)),
+        reverse=True,
+    )
+
+    selected: List[FileEntry] = []
+    total_bytes = 0
+    total_clusters = 0
+    skipped_oversize = 0
+    for entry in movable:
+        need_bytes = int(getattr(entry, "size", 0) or 0)
+        need_clusters = int(getattr(entry, "allocated_clusters", 0) or 0)
+        if limit > 0 and need_bytes > 0 and total_bytes + need_bytes > limit:
+            # 放不下就跳过（不是停止）：继续挑更小的，尽量把容量填满
+            skipped_oversize += 1
+            continue
+        selected.append(entry)
+        total_bytes += need_bytes
+        total_clusters += need_clusters
+
+    if limit > 0:
+        rate = total_bytes / limit * 100.0 if limit else 0.0
+        scope = f"容量上限 {limit / (1024 ** 3):.2f} GiB"
+        fill = f"，填充率 {rate:.1f}%"
+    else:
+        scope = "未设容量上限（受卷可用空间约束）"
+        fill = ""
+    note = (
+        f"自动挑选（大文件优先）：{len(selected)} 个文件 · "
+        f"{total_clusters:,} 簇 ≈ {total_bytes / (1024 ** 3):.2f} GiB；"
+        f"{scope}{fill}；跳过 {skipped_unmovable} 个不可移动/过小、"
+        f"{skipped_oversize} 个超剩余容量"
+    )
+    return AutoStreamSelection(
+        selected=selected,
+        total_bytes=total_bytes,
+        total_clusters=total_clusters,
+        capacity_bytes=limit,
+        skipped_unmovable=skipped_unmovable,
+        skipped_oversize=skipped_oversize,
+        note=note,
+    )

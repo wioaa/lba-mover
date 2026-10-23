@@ -572,11 +572,42 @@ class MainWindow(QMainWindow):
 
     # ---------------- 右栏：LBA 迁移（分块流式已并入 IoPanel 执行引擎）---------------- #
     def _start_stream_move(self) -> None:
-        """分块流式引擎：同卷「前端 → 卷尾」，免规划，按 IoPanel 配置执行。"""
-        entries = self._table.file_model.checked_entries()
-        if not entries:
-            self._set_notice("请先勾选要搬迁的文件", "warning")
-            return
+        """分块流式引擎：同卷「前端 → 卷尾」，免规划，按 IoPanel 配置执行。
+
+        1.0.0F：若开启**自动模式**，文件由 :func:`densify.auto_stream_selection`
+        自动挑选（全池可移动文件按占用簇降序、容量上限内尽量装满、放不下就跳过），
+        挑选结果写进日志 / 摘要后**仍走危险确认框**才执行。
+        """
+        info = self._volume
+        bpc = (info.bytes_per_cluster if info else 4096) or 4096
+        auto = self._io_panel.stream_auto()
+        if auto:
+            pick = densify_mod.auto_stream_selection(
+                self._table.file_model.rows(),
+                capacity_bytes=self._io_panel.stream_capacity_bytes(),
+                bytes_per_cluster=bpc,
+                free_bytes=int(getattr(info, "free_clusters", 0) or 0) * bpc,
+            )
+            entries = pick.selected
+            if not entries:
+                self._set_notice(
+                    "自动模式没有挑出可迁移的文件（可能全部不可移动，或容量上限过小）",
+                    "warning",
+                )
+                return
+            # 列出清单：日志 + 摘要各写一份，用户确认前就能看到规模
+            self._log.info(pick.note)
+            self._summary.set_selection(len(entries), pick.total_bytes)
+            self._set_notice(
+                f"自动挑选 {len(entries)} 个文件 / {pick.total_clusters:,} 簇 ≈ "
+                f"{human_bytes(pick.total_bytes)}（按危险确认框核对后执行）",
+                "warning",
+            )
+        else:
+            entries = self._table.file_model.checked_entries()
+            if not entries:
+                self._set_notice("请先勾选要搬迁的文件", "warning")
+                return
         mode = self._io_panel.stream_cache_mode()
         cache_dir = self._io_panel.stream_cache_dir() or None
         # 1.0.0D 方案 D：disk 模式暂存目录可为空 —— 默认暂存在源文件所在卷根
@@ -587,13 +618,18 @@ class MainWindow(QMainWindow):
         info = self._volume
         bpc = (info.bytes_per_cluster if info else 4096) or 4096
         dialog = dialogs.DangerConfirmDialog(
-            volume_name="分块流式迁移（前端 → 卷尾，同卷内）",
+            volume_name=(
+                "分块流式迁移 · 自动模式（前端 → 卷尾，同卷内）" if auto
+                else "分块流式迁移（前端 → 卷尾，同卷内）"
+            ),
             files=list(entries),
             total_clusters=sum(e.allocated_clusters for e in entries),
             bytes_per_cluster=bpc,
             parent=self,
         )
         if not dialog.exec():
+            if auto:
+                self._set_notice("", "warning")
             return
 
         self._set_notice("", "warning")
@@ -1627,7 +1663,12 @@ class MainWindow(QMainWindow):
             self._plan.tasks or self._plan.movable_items
         )
         feasible = self._feasibility is not None and self._feasibility.ok
-        window_ok = self._target_panel.has_window()
+        # ★ 1.0.0F：按钮的「需要区间」要按**策略**判定 —— 「自动填满末端」只用卷尾
+        # 保留区、不需要目标区间，此前一律要求区间非空，导致切到该策略后主按钮
+        # 一直禁用（表现为「切换策略没效果、计划生成不了、一簇都不搬」）。
+        strategy = self._target_panel.strategy()
+        needs_window = strategy in ("range", "compact", "zone")
+        window_ok = (not needs_window) or self._target_panel.has_window()
 
         self._scan_button.setEnabled(has_volume and not self._busy)
         self._scan_button.setText(
@@ -1637,10 +1678,15 @@ class MainWindow(QMainWindow):
         self._invert_button.setEnabled(not self._busy and has_volume)
 
         if self._io_panel.engine() == ENGINE_STREAM:
-            # 分块流式引擎：免规划，选中文件即可执行（用户态，不要求卷特权）
+            # 分块流式引擎：免规划（用户态，不要求卷特权）。
+            # 1.0.0F：自动模式下文件由程序挑选，不需要用户预先勾选。
+            auto = self._io_panel.stream_auto()
             self._apply_action_button(
-                ("开始分块流式迁移", "danger"),
-                selected > 0 and self._snapshot is not None and not self._busy,
+                ("开始自动流式迁移", "danger") if auto
+                else ("开始分块流式迁移", "danger"),
+                self._snapshot is not None
+                and not self._busy
+                and (auto or selected > 0),
             )
             return
 

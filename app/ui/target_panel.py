@@ -432,8 +432,31 @@ class TargetPanel(QWidget):
                 return
 
     def _on_strategy_changed(self, _index: int) -> None:
+        """策略切换走**直通**路径（立即提交），不进「应用配置」暂存。
+
+        理由：规划策略只决定「怎么算计划」，不是写盘参数；切换后计划必然重新生成
+        （``_plan_stale``），不存在「用旧参数执行」的风险。与拖选区间、排除挡路者
+        同属即时生效类；**区间 / 保留区 / IO 参数仍需「应用配置」确认**
+        （它们会进入真实写盘流程）。
+        """
         if self._guard:
             return
+        self._commit_strategy()
+
+    def _commit_strategy(self) -> None:
+        """只提交策略一项（其余仍留在暂存里），并发出 ``strategyChanged``。"""
+        current = self._snapshot()
+        if current[self._STRATEGY_INDEX] == self._committed[self._STRATEGY_INDEX]:
+            self._emit_pending()
+            return
+        self._guard = True
+        self._committed = (
+            self._committed[: self._STRATEGY_INDEX]
+            + (current[self._STRATEGY_INDEX],)
+            + self._committed[self._STRATEGY_INDEX + 1 :]
+        )
+        self._guard = False
+        self.strategyChanged.emit(self.strategy())
         self._emit_pending()
 
     def _emit_pending(self) -> None:

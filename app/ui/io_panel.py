@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from app.core.io_profile import PREWARM_MIN_BUFFER_MB, IoProfile
 from app.core.models import (
+    GB,
     MEDIA_HDD,
     MEDIA_SSD,
     MEDIA_UNKNOWN,
@@ -87,6 +88,8 @@ class IoPanel(QWidget):
 
     profileChanged = Signal()
     engineChanged = Signal(str)
+    #: 1.0.0F：流式自动模式的开关/容量变更（已提交后发出）
+    streamAutoChanged = Signal(bool)
     #: (是否待定, 变更项数)。变更项：引擎 / 缓冲 / 预热 / 流式缓存。
     pendingChanged = Signal(bool, int)
 
@@ -210,6 +213,31 @@ class IoPanel(QWidget):
             "暂存盘会多一倍写入，内存充足时建议内存缓存。", "caption", self._stream_box, True,
         ))
 
+        # ---- 1.0.0F：基于流式处理的自动模式 ---- #
+        stream.addWidget(cards.Divider())
+        stream.addWidget(cards.label("自动模式", "dim", self._stream_box))
+        self._stream_auto_switch = cards.SegmentedControl(
+            ["手动勾选", "自动挑选（全池大文件优先）"], 0, self._stream_box
+        )
+        self._stream_auto_switch.changed.connect(self._on_stream_auto_changed)
+        stream.addWidget(self._stream_auto_switch)
+
+        cap_row = QHBoxLayout()
+        cap_row.setSpacing(8)
+        cap_row.addWidget(cards.label("自动迁移容量", "dim", self._stream_box), 0)
+        self._stream_capacity_spin = QSpinBox(self._stream_box)
+        self._stream_capacity_spin.setRange(0, 2_000_000)   # 0 = 不限（受卷可用空间约束）
+        self._stream_capacity_spin.setSuffix(" GB")
+        self._stream_capacity_spin.setValue(0)
+        self._stream_capacity_spin.setFixedWidth(120)
+        self._stream_capacity_spin.setEnabled(False)
+        self._stream_capacity_spin.valueChanged.connect(self._on_stream_capacity_changed)
+        cap_row.addWidget(self._stream_capacity_spin, 0)
+        cap_row.addStretch(1)
+        stream.addLayout(cap_row)
+        self._stream_capacity_label = cards.label("", "caption", self._stream_box, True)
+        stream.addWidget(self._stream_capacity_label)
+
         buf_row = QHBoxLayout()
         buf_row.setSpacing(8)
         buf_row.addWidget(cards.label("缓冲（block 倍数）", "dim", self._stream_box), 0)
@@ -241,7 +269,7 @@ class IoPanel(QWidget):
     # 暂存层（1.0.0D）
     # ------------------------------------------------------------------ #
     def _snapshot(self) -> tuple:
-        """控件级快照：引擎 / 缓冲 / 预热 / 流式缓存配置。"""
+        """控件级快照：引擎 / 缓冲 / 预热 / 流式（缓存 + 自动模式）配置。"""
         return (
             int(self._engine_switch.current_index),
             int(self._buffer_switch.current_index),
@@ -250,7 +278,36 @@ class IoPanel(QWidget):
             int(self._stream_cache_switch.current_index),
             self._stream_cache_dir.text().strip(),
             int(self._stream_buffer_spin.value()),
+            int(self._stream_auto_switch.current_index),
+            int(self._stream_capacity_spin.value()),
         )
+
+    # ---------------- 自动模式（1.0.0F）---------------- #
+    def _on_stream_auto_changed(self, index: int) -> None:
+        self._stream_capacity_spin.setEnabled(int(index) == 1)
+        self._refresh_stream_capacity_label()
+        self._emit_pending()
+
+    def _on_stream_capacity_changed(self, _value: int) -> None:
+        self._refresh_stream_capacity_label()
+        self._emit_pending()
+
+    def _refresh_stream_capacity_label(self, *_args) -> None:
+        if self._stream_auto_switch.current_index != 1:
+            self._stream_capacity_label.setText(
+                "手动勾选：按左侧列表的勾选执行；未勾选则不搬任何文件。"
+            )
+            return
+        gb = int(self._stream_capacity_spin.value())
+        if gb <= 0:
+            self._stream_capacity_label.setText(
+                "容量不限：以卷当前可用空间为上限（挑选结果会在执行前列出并二次确认）。"
+            )
+        else:
+            self._stream_capacity_label.setText(
+                f"容量上限 {gb:,} GB：全池可移动文件**按占用簇降序**挑选，"
+                f"单个放不下就跳过、继续挑更小的（大文件优先）。"
+            )
 
     def is_pending(self) -> bool:
         """是否存在未应用的修改。"""
@@ -266,6 +323,8 @@ class IoPanel(QWidget):
             count += 1
         if current[4:7] != self._committed[4:7]:
             count += 1
+        if current[7:9] != self._committed[7:9]:
+            count += 1
         return count
 
     def commit_pending(self) -> None:
@@ -280,6 +339,8 @@ class IoPanel(QWidget):
             self.engineChanged.emit(self.engine())
         if old[1:4] != current[1:4]:
             self.profileChanged.emit()
+        if old[7:9] != current[7:9]:
+            self.streamAutoChanged.emit(self.stream_auto())
         self.pendingChanged.emit(False, 0)
 
     def discard_pending(self) -> None:
@@ -294,6 +355,8 @@ class IoPanel(QWidget):
             cache_index,
             cache_dir,
             buffer_blocks,
+            auto_index,
+            capacity_gb,
         ) = self._committed
         self._guard = True
         self._engine_switch.set_current(engine_index, emit=False)
@@ -303,11 +366,15 @@ class IoPanel(QWidget):
         self._stream_cache_switch.set_current(cache_index, emit=False)
         self._stream_cache_dir.setText(cache_dir)
         self._stream_buffer_spin.setValue(buffer_blocks)
+        self._stream_auto_switch.set_current(auto_index, emit=False)
+        self._stream_capacity_spin.setValue(capacity_gb)
         self._guard = False
         self._custom_row.setVisible(buffer_index == CUSTOM_INDEX)
         self._stream_cache_dir.setEnabled(cache_index == 1)
+        self._stream_capacity_spin.setEnabled(auto_index == 1)
         self._apply_engine_visual(engine_index)
         self._refresh()
+        self._refresh_stream_capacity_label()
         self.pendingChanged.emit(False, 0)
 
     # ------------------------------------------------------------------ #
@@ -330,6 +397,15 @@ class IoPanel(QWidget):
 
     def stream_buffer_blocks(self) -> int:
         return int(self._committed[6])
+
+    def stream_auto(self) -> bool:
+        """已提交的流式「自动模式」是否开启（True = 自动挑选文件）。"""
+        return self._committed[7] == 1
+
+    def stream_capacity_bytes(self) -> int:
+        """已提交的自动迁移容量（字节）；``0`` = 不限（执行侧以卷可用空间为上限）。"""
+        gb = int(self._committed[8])
+        return gb * GB if gb > 0 else 0
 
 
     # ------------------------------------------------------------------ #
@@ -398,6 +474,10 @@ class IoPanel(QWidget):
             not busy and self._stream_cache_switch.current_index == 1
         )
         self._stream_buffer_spin.setEnabled(not busy)
+        self._stream_auto_switch.setEnabled(not busy)
+        self._stream_capacity_spin.setEnabled(
+            not busy and self._stream_auto_switch.current_index == 1
+        )
 
     # ------------------------------------------------------------------ #
     # 内部
