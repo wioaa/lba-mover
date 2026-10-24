@@ -87,6 +87,15 @@
 - **反向验证彩蛋**：第 4 条钉在修前版本下的失败形态是 `Win32Error: ReadFile@0 未读满即 EOF（请求 2048 字节，实得 7 字节）` —— 旧 `write_at` 在持续短写下只往暂存盘写了 7 字节，随后被**读侧 D-003 的新校验**抓住。反向印证 D-003 与 D-011 是互相兜底的一套，缺哪一侧都会在另一处暴露或静默。
 - **提交**：`fc627d0`（`write_at` + `staged_copy`）、`fd7248a`（`memory_copy` 补齐）。
 
+### D-012 · [Glue/journal · 高] `_on_move_completed` 关闭流水后保留引用，回滚无法写入、半途中断 — 已修复
+- **位置**：`app/ui/main_window.py`（`_on_move_completed`）；关联 `app/core/journal.py:123`（`MoveJournal.append` 的 `if self._closed: raise RuntimeError("流水已关闭，无法继续写入")`）
+- **发现经过**：修复 D-006（journal 句柄泄漏）时连带审计 `_journal` 全量读写点发现——`_on_move_completed` 会 `self._journal.close()` 但**保留** `self._journal` 引用，而后续「回滚」走的正是这个已关闭对象。
+- **根因与后果**：迁移完成后点回滚 → `_start_rollback` → `RollbackWorker(journal=self._journal)` → 第 1 段 FSCTL 已真实执行 → `_record` 抛 `RuntimeError` → `execute_segments` 不捕获该异常 → **剩余段不再执行** → 整文件被 per-file `except` 报成「回滚异常」。即**回滚半途中断并报错**，工具的兜底安全网失效（严重程度高于本轮多数条目）。
+- **改前实测栈（粘 bug 的直接证据）**：`mover.py:371 rollback_segments → execute_segments → _record → RuntimeError: 流水已关闭，无法继续写入`。
+- **修复**：`_on_move_completed` 不再 `close()`，改为只 `force_fsync()` —— 已 flush 的记录确实落盘（durability 不减），句柄留给后续回滚；关闭统一交给关窗 / 切卷 / 新迁移时本版新增的 `_release_journal()` 兜底，故 D-006 修复的路径不回退。
+- **回归钉**：`tests/test_ui_execute_flow.py` 5 例 —— `test_journal_stays_writable_after_move_completed`（粘 bug 主钉，改前必失败）、`test_move_completed_keeps_records_durable`（durability 守卫，证明改 fsync 未牺牲落盘）、`test_rollback_writer_can_continue_on_same_journal`、`test_close_event_still_closes_the_journal`、`test_new_migration_releases_previous_journal`（后两条兼作 D-006 不回退的守卫）。
+- **提交**：`9b80db0`。
+
 ---
 
 ## 非缺陷（已坐实）
