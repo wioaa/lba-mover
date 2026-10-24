@@ -24,6 +24,13 @@
 - **修复**：在 `_cancel_current` 遍历元组中加入 `self._stream_worker`（其 `request_cancel`/`isRunning` 均受支持，见 `app/core/scanner.py`）。
 - **提交**：待提交（与 D-003~D-008 同批）。
 
+### D-010 · [Glue/UI · 中] 分块流式迁移的危险确认框漏传必填参数 `target_range` → TypeError 崩溃 — 已修复
+- **位置**：`app/ui/main_window.py:620`（`_start_stream_move` 构造 `DangerConfirmDialog` 处）
+- **根因**：v2 给 `DangerConfirmDialog.__init__` 增加了必填参数 `target_range: Tuple[int, int]`（无默认值，用于渲染「目标区间」行）。LBA 迁移（`main_window.py:2067` 传 `target_range=(start, end)`）与回滚（`main_window.py:2200` 传 `(0, 0)`）调用点都已补，唯独**分块流式调用点漏传**。用户点「开始分块流式迁移」→ 构造对话框时 `TypeError: __init__() missing 1 required positional argument: 'target_range'`，**流式引擎完全无法启动**。testflow 不驱动真实 UI，故此前未被发现。
+- **修复**：流式无显式目标 LCN 窗口（落点由文件系统分配），与回滚一致传占位 `target_range=(0, 0)`。
+- **回归钉**：`tests/test_ui_execute_flow.py` ⑱（`test_stream_move_dialog_receives_target_range`，记录型假对话框捕获构造关键字参、断言 `target_range` 存在且为 `(0, 0)`）。
+- **提交**：待提交（本轮 UI 层复查发现并修复）。
+
 ---
 
 ## 待修复

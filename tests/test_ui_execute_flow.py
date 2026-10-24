@@ -562,6 +562,53 @@ def test_engine_switch_passthrough_no_pending_stream_button() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# ⑱ D-010 回归钉：分块流式迁移的危险确认框**必须**收到 target_range。
+#     1.0.0F 时期 DangerConfirmDialog 的 target_range 改为必填（v2 新增），
+#     LBA 迁移 / 回滚调用点都已传，唯独 _start_stream_move 漏传 —— 用户点
+#     「开始分块流式迁移」会 TypeError 崩溃。本钉用记录型假对话框捕获构造
+#     关键字参，断言 target_range 存在且为占位 (0, 0)，缺参即失败。
+# --------------------------------------------------------------------------- #
+class _RecordDangerDialog:
+    """记录型假对话框：捕获构造关键字参，``exec()`` 一律「拒绝」避免起线程。"""
+
+    last_kwargs: dict = {}
+
+    def __init__(self, *args, **kwargs) -> None:
+        _RecordDangerDialog.last_kwargs = dict(kwargs)
+
+    def exec(self):
+        return False
+
+
+def _patch_record_danger_dialog(mw):
+    original = mw.dialogs.DangerConfirmDialog
+    _RecordDangerDialog.last_kwargs = {}
+    mw.dialogs.DangerConfirmDialog = _RecordDangerDialog
+    return original
+
+
+def test_stream_move_dialog_receives_target_range() -> None:
+    window, mw = _make_window()
+    window._io_panel._engine_switch.set_current(1, emit=True)  # → 分块流式
+    _select_one_file(window)
+
+    original = _patch_record_danger_dialog(mw)
+    try:
+        window._start_stream_move()
+    finally:
+        mw.dialogs.DangerConfirmDialog = original
+
+    kwargs = _RecordDangerDialog.last_kwargs
+    assert kwargs, "分块流式迁移必须弹出危险确认框（构造 DangerConfirmDialog）"
+    assert "target_range" in kwargs, (
+        "DangerConfirmDialog 必填参数 target_range 缺失 → 真机会 TypeError 崩溃"
+    )
+    assert kwargs["target_range"] == (0, 0), (
+        f"流式无固定目标区间应传占位 (0,0)，实际 {kwargs['target_range']}"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # ⑰ 1.0.0F 修复②续：io_panel._emit_pending 发**实算**的待定（不再硬编码 True）。
 #     此前硬编码 True 会让引擎直通后的补刷把「配置未应用」徽章假亮。
 # --------------------------------------------------------------------------- #

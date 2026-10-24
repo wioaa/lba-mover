@@ -625,6 +625,10 @@ class MainWindow(QMainWindow):
             files=list(entries),
             total_clusters=sum(e.allocated_clusters for e in entries),
             bytes_per_cluster=bpc,
+            # ★ D-010 修复：DangerConfirmDialog 的 target_range 是必填参数
+            # （v2 新增，LBA/回滚调用点都已传）。分块流式没有固定目标 LCN
+            # 窗口（落点由文件系统分配），与回滚一致传占位 (0, 0)。
+            target_range=(0, 0),
             parent=self,
         )
         if not dialog.exec():
