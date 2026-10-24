@@ -145,6 +145,82 @@ def test_progress_is_monotonic_and_ends_at_total() -> None:
     assert outcome.failures and outcome.moved_clusters < total
 
 
+# --------------------------------------------------------------------------- #
+# D-005 回归钉：moved_files 的口径必须是「有任意段真的搬成功」
+# --------------------------------------------------------------------------- #
+def test_partial_success_counts_file_and_keeps_failure() -> None:
+    """部分段失败：``moved_files`` 必须计 1（早期实现给 0，UI 漏算）。
+
+    同时必须保持既有语义：失败段照旧进 ``failures``、``moved_clusters`` 只算
+    真正成功的簇。
+    """
+    segments = _segments(3, 10)                    # dst = 5000 / 5010 / 5020
+    with _MoverStub(fail_on=(5010,)) as stub:
+        outcome = mover.execute_segments(
+            0xBEEF, "R:\\partial.bin", segments, None, None, None, guard=_Guard(True)
+        )
+    assert [dst for _vcn, dst, _c, _h in stub.calls] == [5000, 5010, 5020]
+    assert outcome.moved_clusters == 20
+    assert outcome.moved_files == 1, "部分成功的文件必须计入 moved_files（D-005）"
+    assert len(outcome.failures) == 1
+    assert outcome.failures[0].dst_lcn == 5010
+    assert outcome.cancelled is False
+
+
+def test_partial_then_cancel_counts_file() -> None:
+    """先成功一段、随后被取消：已搬成的那段算数（``moved_files == 1``）。
+
+    早期实现里 ``cancelled`` 会把 ``moved_files`` 压成 0，于是 UI 出现
+    「移动了 10 簇 / 0 个文件」这种自相矛盾的文案。
+    """
+    decisions = {"checked": 0}
+
+    def should_cancel() -> bool:
+        decisions["checked"] += 1
+        return decisions["checked"] > 1            # 第 2 段开始前取消
+
+    with _MoverStub() as stub:
+        outcome = mover.execute_segments(
+            0xBEEF,
+            "R:\\cancel.bin",
+            _segments(3, 10),
+            None,
+            should_cancel,
+            None,
+            guard=_Guard(True),
+        )
+    assert len(stub.calls) == 1, "取消点之后的段不许再执行"
+    assert outcome.cancelled is True
+    assert outcome.moved_clusters == 10
+    assert outcome.moved_files == 1, "取消前已成功的部分必须计入文件数（D-005）"
+    assert outcome.failures == []
+
+
+def test_nothing_moved_never_counts_file() -> None:
+    """反向钉：一段都没搬成功 ⇒ ``moved_files`` 必须仍是 0（不许虚报成功）。"""
+    with _MoverStub(fail_on=(5000, 5010, 5020)) as stub:
+        outcome = mover.execute_segments(
+            0xBEEF, "R:\\allfail.bin", _segments(3, 10), None, None, None,
+            guard=_Guard(True),
+        )
+    assert len(stub.calls) == 3
+    assert outcome.moved_clusters == 0
+    assert outcome.moved_files == 0
+    assert len(outcome.failures) == 3
+
+
+def test_guard_rejected_file_never_counts_file() -> None:
+    """反向钉：守卫全拒 ⇒ 零簇搬动 ⇒ ``moved_files == 0``。"""
+    with _MoverStub() as stub:
+        outcome = mover.execute_segments(
+            0xBEEF, "R:\\blocked.bin", _segments(2, 10), None, None, None,
+            guard=_Guard(False, "目标区间未通过安全校验（测试）"),
+        )
+    assert stub.calls == []
+    assert outcome.moved_clusters == 0
+    assert outcome.moved_files == 0
+
+
 def test_plan_total_move_clusters_counts_evictions_and_relay() -> None:
     place = PlanItem(entry=FileEntry(path="R:\\a"), segments=_segments(1, 100))
     evict = PlanItem(entry=FileEntry(path="R:\\b"), role="evict", segments=_segments(1, 50))

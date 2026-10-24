@@ -146,6 +146,16 @@ def execute_segments(
 
     Returns:
         :class:`MoveOutcome`，失败项带完整 Win32 错误信息。
+
+    Note:
+        ★ **文件级统计口径（D-005）**：``moved_files == 1`` 的含义是
+        「**至少有一段**真的搬成功了」（等价于 ``moved_clusters > 0``），
+        因此它**允许与 ``failures`` 同时出现** —— 那表示"部分成功"。
+        早期实现只在 ``not failures and not cancelled`` 时置 1，于是「部分段
+        失败」的文件会出现 ``moved_clusters > 0`` 而 ``moved_files == 0``，
+        UI 的「移动 N 个文件」漏算。失败/取消语义未变：``failures`` 清单、
+        ``cancelled`` 标志与逐段的流水记录都照旧产生，只是不再把它们当成
+        "这个文件一次都没动"的判据。
     """
     outcome = MoveOutcome()
     total = sum(seg.clusters for seg in segments)
@@ -246,7 +256,9 @@ def execute_segments(
     finally:
         api.close_handle(file_handle)
 
-    if not outcome.failures and not outcome.cancelled:
+    # ★ D-005：「有任意段真的搬成功」即计 1 个文件（可能与 failures 并存＝部分成功）。
+    # moved_clusters 只在 FSCTL 真正成功时累加，是唯一的权威判据。
+    if outcome.moved_clusters > 0:
         outcome.moved_files = 1
     return outcome
 

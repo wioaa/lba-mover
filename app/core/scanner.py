@@ -78,6 +78,36 @@ def force_fsync_journal(journal) -> None:
         except OSError:
             pass
 
+
+def account_move_result(outcome: MoveOutcome, result) -> bool:
+    """把一次「任务 / 文件」的执行结果并入总 ``outcome``（**唯一的汇总口径**）。
+
+    ★ **文件数按「是否有任意段真的搬成功」计（D-005）**：``moved_clusters`` 是
+    ``app.win32.mover`` 里唯一可靠的成功判据（只在 FSCTL 真正成功时累加），
+    因此只要它 > 0 就计 1 个文件 —— **允许与 ``failures`` 并存**，那表示
+    "部分成功"。早期实现只在「零失败且未取消」时计 1，于是「部分段失败」的
+    任务会出现 ``moved_clusters > 0`` 而 ``moved_files == 0``，UI 的
+    「移动 N 个文件」漏算（失败/取消语义未变：``failures`` 清单与
+    ``cancelled`` 标志照旧）。
+
+    ``MoveWorker``（按任务汇总）与 ``RollbackWorker``（按文件汇总）共用本函数，
+    保证两个出口的统计口径一致。
+
+    Args:
+        outcome: 总结果（**原地累加** ``moved_clusters`` / ``moved_files``）。
+        result: 单次 ``mover.execute_task`` / ``mover.rollback_segments`` 的返回。
+
+    Returns:
+        是否计入了 1 个"已搬运文件"（即是否有任意段成功）。
+    """
+    moved = int(getattr(result, "moved_clusters", 0) or 0)
+    outcome.moved_clusters += moved
+    if moved <= 0:
+        return False
+    outcome.moved_files += 1
+    return True
+
+
 #: 执行期局部核验的余量（簇）。每段执行前只重读
 #: ``[min(区间) - margin, max(区间) + margin)`` 这一片位图，
 #: 4096 簇 ≈ 16 MB（4K 簇），足够覆盖对齐误差与相邻簇的边界效应。
@@ -1306,7 +1336,9 @@ class MoveWorker(QThread):
                     should_cancel=lambda: self._cancel,
                 )
                 outcome.failures.extend(result.failures)
-                outcome.moved_clusters += result.moved_clusters
+                # ★ D-005：簇数与文件数的唯一汇总口径（见 account_move_result）。
+                # 必须在任何 break 之前计入，否则 on_error=halt 会吞掉本次成果。
+                account_move_result(outcome, result)
                 executed += sum(seg.clusters for seg in task.segments)
                 if result.cancelled:
                     outcome.cancelled = True
@@ -1353,7 +1385,6 @@ class MoveWorker(QThread):
                         break
                 else:
                     consecutive_failures = 0
-                    outcome.moved_files += 1
                     self.file_result.emit(path, True, "移动完成")
 
                 done = min(total, done + task.clusters)
@@ -1552,7 +1583,8 @@ class RollbackWorker(QThread):
                     continue
 
                 outcome.failures.extend(result.failures)
-                outcome.moved_clusters += result.moved_clusters
+                # ★ D-005：与 MoveWorker 同一口径（见 account_move_result）
+                account_move_result(outcome, result)
                 if result.cancelled:
                     outcome.cancelled = True
                 if result.failures:
@@ -1563,7 +1595,6 @@ class RollbackWorker(QThread):
                         f"{first.message}（错误码 {first.winerror}）",
                     )
                 else:
-                    outcome.moved_files += 1
                     self.file_result.emit(path, True, "已回滚")
                 done = min(total, done + sum(s.clusters for s in grouped[path]))
                 self.progress.emit(done, total, f"回滚 {path}")

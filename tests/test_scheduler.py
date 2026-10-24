@@ -383,6 +383,55 @@ def test_move_worker_rejects_identity_mismatch() -> None:
     assert "completed" not in captured
 
 
+# --------------------------------------------------------------------------- #
+# D-005 回归钉：worker 侧的汇总口径（MoveWorker / RollbackWorker 共用）
+# --------------------------------------------------------------------------- #
+def test_account_move_result_counts_partial_success() -> None:
+    """有任意段成功 ⇒ 计 1 个文件；全失败（0 簇）⇒ 不计。
+
+    ``app.core.scanner.account_move_result`` 是 UI 上「移动 N 个文件」的唯一
+    汇总点，两个 worker 都走它，保证口径一致。
+    """
+    from app.core.models import MoveFailure, MoveOutcome
+    from app.core.scanner import account_move_result
+
+    failure = MoveFailure(
+        path="R:\\a.bin", src_lcn=5010, dst_lcn=1010,
+        clusters=10, winerror=5, message="移动失败（测试）",
+    )
+    total = MoveOutcome(failures=[])
+
+    # ① 部分成功：20 簇 + 1 条失败 ⇒ 算 1 个文件
+    assert account_move_result(total, MoveOutcome(moved_clusters=20, failures=[failure])) is True
+    assert total.moved_clusters == 20
+    assert total.moved_files == 1, "部分成功必须计入文件数（D-005）"
+
+    # ② 全失败：0 簇 ⇒ 不许算文件（也不许改坏已累计的簇数）
+    assert account_move_result(total, MoveOutcome(moved_clusters=0, failures=[failure])) is False
+    assert total.moved_clusters == 20
+    assert total.moved_files == 1
+
+    # ③ 空结果（零段）同样不许算
+    assert account_move_result(total, MoveOutcome()) is False
+    assert total.moved_files == 1
+
+
+def test_both_workers_use_the_shared_accounting_rule() -> None:
+    """两个 worker 的执行循环都必须调用 ``account_move_result``（口径不许分叉）。"""
+    import inspect
+
+    from app.core.scanner import MoveWorker, RollbackWorker
+
+    for owner in (MoveWorker.run, RollbackWorker.run):
+        source = inspect.getsource(owner)
+        assert "account_move_result" in source, (
+            f"{owner.__qualname__} 未使用统一汇总（口径可能分叉）"
+        )
+        assert "outcome.moved_files += 1" not in source, (
+            f"{owner.__qualname__} 仍在内联自增 moved_files（绕过统一口径）"
+        )
+
+
 if __name__ == "__main__":
     from tests._harness import exit_with
 
