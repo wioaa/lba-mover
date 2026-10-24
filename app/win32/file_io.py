@@ -16,12 +16,14 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 import tempfile
 from typing import List, Optional, Tuple
 
 from app.core.block_stream import (
     BLOCK_CLUSTERS,
+    Block,
     plan_blocks,
     stream_schedule,
 )
@@ -108,14 +110,42 @@ def close(handle: int) -> None:
 
 
 def read_at(handle: int, offset: int, size: int) -> bytes:
-    """从 ``offset`` 读 ``size`` 字节（定位 + ReadFile）。"""
+    """从 ``offset`` 读 **恰好** ``size`` 字节（定位 + 循环 ReadFile）。
+
+    D-003：``ReadFile`` 允许返回**少于请求**的字节数（短读：压缩 / 稀疏文件、
+    某些过滤驱动、跨缓存边界等）。早期实现直接 ``return buf.raw[:done.value]``，
+    一次短读就让该块被**静默截断**——紧随其后的 :func:`write_at` 只写入短数据，
+    分块流式迁移（本模式的正确性前提）因此产生**数据不一致**。
+
+    这里改为循环读满 ``size``：只有遇到真 EOF（``ReadFile`` 返回 0 字节）才停止，
+    且此时**必须显式抛错**，绝不静默返回短数据。
+
+    Raises:
+        api.Win32Error: 定位 / 读取失败；或未读满 ``size`` 即遇到 EOF
+            （错误码 :data:`app.win32.api.ERROR_HANDLE_EOF`）。
+    """
+    size = int(size)
+    if size <= 0:
+        return b""
     if not kernel32.SetFilePointerEx(handle, int(offset), None, FILE_BEGIN):
         raise api.Win32Error(kernel32.GetLastError(), f"SetFilePointerEx@{offset}")
-    buf = ctypes.create_string_buffer(int(size))
+
+    buf = ctypes.create_string_buffer(size)
     done = wintypes.DWORD(0)
-    if not kernel32.ReadFile(handle, buf, int(size), ctypes.byref(done), None):
-        raise api.Win32Error(kernel32.GetLastError(), f"ReadFile@{offset}")
-    return buf.raw[: done.value]
+    got = 0
+    while got < size:
+        # 在**同一块缓冲**里按已读进度切一段视图续读，避免每次短读都重新分配
+        view = (ctypes.c_char * (size - got)).from_buffer(buf, got)
+        if not kernel32.ReadFile(handle, view, size - got, ctypes.byref(done), None):
+            raise api.Win32Error(kernel32.GetLastError(), f"ReadFile@{offset}")
+        if done.value <= 0:
+            # 真 EOF：还没读满 size 就没数据了 → 报错，而不是返回截断的数据
+            raise api.Win32Error(
+                api.ERROR_HANDLE_EOF,
+                f"ReadFile@{offset} 未读满即 EOF（请求 {size} 字节，实得 {got} 字节）",
+            )
+        got += int(done.value)
+    return buf.raw[:size]
 
 
 def write_at(handle: int, offset: int, data: bytes) -> int:
@@ -144,6 +174,66 @@ def _contiguous_runs(indices) -> "List[List[int]]":
         else:
             runs.append([index])
     return runs
+
+
+#: 攒批落盘时**单次合并写入**的字节上限（D-008）。
+#: 整段 ``b"".join`` 会额外复制出一份与段等长的连续 buffer，内存峰值约为
+#: 1 个 block 的 2 倍；超过本上限即切成多段顺序写（**落盘字节完全一致**），
+#: 峰值削到 ``min(段长, MAX_MERGE_BYTES)``。默认 8 MiB：远大于常规 block，
+#: 保留原有的「连续块拼成单次大写」收益，同时封住超大 block 的翻倍峰值。
+MAX_MERGE_BYTES = 8 << 20
+
+
+def _write_run(
+    scratch: int,
+    blocks: List[Block],
+    pending: dict,
+    run: List[int],
+    max_merge: Optional[int] = None,
+) -> None:
+    """把一段**连续块**写进暂存盘：连续块仍合并，但单次合并长度受上限约束。
+
+    D-008：``b"".join(...)`` 会把整段再复制一份（峰值 ≈ 2 个 block）；这里按
+    ``max_merge`` 切成若干段顺序写——**落盘字节与整段 join 完全一致**，峰值
+    削到 ``min(段长, max_merge)``。单个块本身就超过上限时不再复制，直接整块写。
+
+    Args:
+        scratch: 暂存盘句柄。
+        blocks: :func:`plan_blocks` 的块计划（取块内偏移）。
+        pending: 块下标 -> bytes 的攒批字典。
+        run: 一段连续（下标递增 1）的块下标。
+        max_merge: 单次合并字节上限；``None`` 用 :data:`MAX_MERGE_BYTES`。
+    """
+    limit = int(MAX_MERGE_BYTES if max_merge is None else max_merge)
+    if limit <= 0:
+        limit = 1
+    offset = blocks[run[0]].offset
+    segment: List[bytes] = []
+    segment_len = 0
+
+    def _flush_segment() -> None:
+        """把当前攒下的小段落盘（单块时不复制，直接写）。"""
+        nonlocal segment, segment_len, offset
+        if not segment:
+            return
+        write_at(scratch, offset, segment[0] if len(segment) == 1 else b"".join(segment))
+        offset += segment_len
+        segment = []
+        segment_len = 0
+
+    for index in run:
+        chunk = pending[index]
+        if len(chunk) >= limit:
+            # 单个块已达上限：先落掉攒下的段，再整块直写（省掉一次 join 复制）
+            _flush_segment()
+            write_at(scratch, offset, chunk)
+            offset += len(chunk)
+            continue
+        if segment and segment_len + len(chunk) > limit:
+            _flush_segment()
+        segment.append(chunk)
+        segment_len += len(chunk)
+    _flush_segment()
 
 
 def staged_copy(
@@ -185,14 +275,12 @@ def staged_copy(
     pending: dict = {}          # 块下标 -> bytes（攒批，待合并落盘）
 
     def _flush_pending() -> None:
-        """把攒住的块按**连续段**合并写进暂存盘（一段一次 write_at）。"""
+        """把攒住的块按**连续段**合并写进暂存盘（每段一次或多次 write_at）。"""
         nonlocal pending
         if not pending:
             return
         for run in _contiguous_runs(sorted(pending)):
-            data = b"".join(pending[index] for index in run)
-            offset = blocks[run[0]].offset
-            write_at(scratch, offset, data)
+            _write_run(scratch, blocks, pending, run)
         pending = {}
 
     result: Tuple[int, int] = (0, 0)
@@ -314,6 +402,21 @@ def default_scratch_dir(src_path: str) -> str:
     return fallback
 
 
+def _scratch_name(dst_path: str) -> str:
+    """disk 模式的暂存文件名：``<sha1(目标绝对路径)>.stage``（D-004）。
+
+    早期实现取 ``basename(dst_path) + ".stage"`` —— 只按文件名、**不区分目录**，
+    不同目录下的同名目标会复用同一个暂存盘（崩溃残留复用 / 外部共享
+    ``cache_dir`` / 将来改并发时互相覆盖、数据错乱）。
+
+    改用目标**完整路径**的 sha1 摘要：跨目录唯一、同一目标可复现（大小写与
+    相对路径差异归一化），且不含用户文件名（避免超长名 / 非法字符）。仍以
+    ``.stage`` 结尾——worker 收尾按该后缀清理残留。
+    """
+    key = os.path.normcase(os.path.abspath(str(dst_path)))
+    return hashlib.sha1(key.encode("utf-8", "surrogatepass")).hexdigest() + ".stage"
+
+
 def copy_stream(
     src_path: str,
     dst_path: str,
@@ -333,6 +436,7 @@ def copy_stream(
       ``cache_dir`` 为空时**默认暂存在源文件所在卷根**的
       ``.lba-tmp-scratch\\``（同卷；卷根不可写回落 ``%TEMP%``）——
       注意暂存盘会多一倍写入，内存充足时建议内存缓存。
+      暂存文件名由 :func:`_scratch_name` 按目标**完整路径**哈希生成，跨目录唯一。
     * ``preallocate_dst=True``：先按总大小**预填充一段（尽量连续）的簇**，再流式覆盖
       （「预先填充 → 流式覆盖」，实现前端→后端整体直搬；落点 LBA 由文件系统在空闲区
       分配，预分配保证连续性）。
@@ -352,7 +456,8 @@ def copy_stream(
         if not cache_dir:
             cache_dir = default_scratch_dir(src_path)   # 1.0.0D 方案 D：同卷默认暂存
         os.makedirs(cache_dir, exist_ok=True)
-        scratch = os.path.join(cache_dir, os.path.basename(dst_path) + ".stage")
+        # D-004：暂存名按**目标完整路径**哈希，跨目录唯一（不再撞同名目标）
+        scratch = os.path.join(cache_dir, _scratch_name(dst_path))
         return staged_copy(
             src_path, scratch, dst_path,
             buffer_blocks=buffer_blocks,

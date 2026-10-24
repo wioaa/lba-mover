@@ -5,17 +5,23 @@
 * 两种可调缓存模式经 :func:`copy_stream` 都能无损搬运：
   - ``memory``：内存分配缓存（块在 RAM 中转）；
   - ``disk``：设定缓存目录的硬盘缓存（块落暂存盘再读出）。
+
+缺陷回归钉（Debug 文档第六节）：
+* D-003 短读截断 → ``test_read_at_*``；
+* D-004 暂存名撞车 → ``test_scratch_name_*`` / ``test_copy_stream_disk_scratch_*``；
+* D-008 攒批 join 峰值 → ``test_staged_copy_segmented_write_*``。
 """
 
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.win32 import file_io  # noqa: E402
+from app.win32 import api, file_io  # noqa: E402
 
 # 用小 block 让 10KB 数据跨多个块（block = 4 簇 × 512 B = 2048 B → 5 块）
 _BPC = 512
@@ -370,6 +376,232 @@ def test_block_stream_worker_end_to_end() -> None:
         assert not os.path.exists(p1 + ".lbastream.tmp")
         assert not os.path.exists(p2 + ".lbastream.tmp")
         assert summary.get("moved") == 2 and summary.get("failed") == 0, summary
+
+
+class _ShortReadKernel32:
+    """代理真实 ``kernel32``，只把 ``ReadFile`` 换成「每次最多返回 chunk 字节」。
+
+    D-003 的模拟手段：本地 NTFS 上真实 ``ReadFile`` 几乎总是读满，无法复现短读，
+    因此把 ``file_io.kernel32`` 临时换成这个代理（其余函数原样转发给真实 DLL）。
+    """
+
+    def __init__(self, real, content: bytes, chunk: int) -> None:
+        self._real = real
+        self._content = content
+        self._chunk = max(1, int(chunk))
+        self._pos = 0
+        self.calls = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+    def ReadFile(self, handle, buffer, size, done_ref, overlapped):  # noqa: N802
+        self.calls += 1
+        take = max(0, min(int(size), self._chunk, len(self._content) - self._pos))
+        if take:
+            ctypes.memmove(buffer, self._content[self._pos:self._pos + take], take)
+            self._pos += take
+        target = getattr(done_ref, "_obj", None)
+        if target is None:  # pragma: no cover - 只防实现改用非 byref 传参
+            raise AssertionError("ReadFile 的 done 参数必须是 ctypes.byref(...)")
+        target.value = take
+        return 1
+
+
+def test_read_at_retries_until_full_size_on_short_reads() -> None:
+    """D-003 ①：ReadFile 每次只返回部分字节（短读）时，read_at 必须循环读满 size。"""
+    content = os.urandom(5000)
+    for chunk in (1, 7, 512, 4999):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "src.bin")
+            with open(path, "wb") as fh:
+                fh.write(content)
+            handle = file_io.open_read(path)
+            original = file_io.kernel32
+            fake = _ShortReadKernel32(original, content, chunk)
+            file_io.kernel32 = fake
+            try:
+                got = file_io.read_at(handle, 0, len(content))
+            finally:
+                file_io.kernel32 = original
+                file_io.close(handle)
+            assert len(got) == len(content), (
+                f"chunk={chunk}：短读后未读满（{len(got)} < {len(content)}）"
+            )
+            assert got == content, f"chunk={chunk}：短读拼出来的内容与源不一致"
+            assert fake.calls > 1, f"chunk={chunk}：应发生多次 ReadFile（确实短读）"
+    print("\n[D-003] 短读补齐：chunk=1/7/512/4999 四种短读步长均读满且内容一致")
+
+
+def test_read_at_raises_on_premature_eof() -> None:
+    """D-003 ②：未读满 size 就遇到真 EOF → 显式抛 Win32Error，绝不静默返回短数据。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "short.bin")
+        with open(path, "wb") as fh:
+            fh.write(b"0123456789")          # 只有 10 字节
+        handle = file_io.open_read(path)
+        try:
+            # 请求量 = 文件长度：正常返回（不误报）
+            assert file_io.read_at(handle, 0, 10) == b"0123456789"
+
+            # 请求 100 字节：读到 10 字节后 EOF → 必须报错
+            try:
+                file_io.read_at(handle, 0, 100)
+            except api.Win32Error as exc:
+                assert exc.winerror == api.ERROR_HANDLE_EOF, exc
+                assert isinstance(exc, OSError)  # 沿用项目既有异常类型（OSError 子类）
+            else:
+                raise AssertionError("提前 EOF 必须抛错，不能静默返回截断数据")
+
+            # 起点就在 EOF 之后：同样报错（第一次 ReadFile 即 0 字节）
+            try:
+                file_io.read_at(handle, 10_000, 8)
+            except api.Win32Error as exc:
+                assert exc.winerror == api.ERROR_HANDLE_EOF, exc
+            else:
+                raise AssertionError("EOF 之后读取必须抛错")
+        finally:
+            file_io.close(handle)
+
+
+def test_scratch_name_unique_across_directories() -> None:
+    """D-004：暂存文件名按目标**完整路径**哈希 —— 跨目录唯一、同目标可复现。"""
+    a = file_io._scratch_name(os.path.join("D:" + os.sep, "dir-a", "same.bin"))
+    b = file_io._scratch_name(os.path.join("D:" + os.sep, "dir-b", "same.bin"))
+    assert a != b, "不同目录下的同名目标不得复用同一个暂存文件"
+    assert a.endswith(".stage") and b.endswith(".stage"), (
+        "必须以 .stage 结尾（worker 按该后缀清理残留）"
+    )
+    # 同一目标（相对路径 / 大小写差异）→ 同一名字（可复现，残留能被再次清理）
+    assert file_io._scratch_name(os.path.join("D:" + os.sep, "dir-a", "SAME.bin")) == a
+    assert os.path.basename(a) == a, "纯摘要名：不含用户文件名（避免超长 / 非法字符）"
+
+
+def test_copy_stream_disk_scratch_unique_per_directory() -> None:
+    """D-004：同一 cache_dir 下，不同目录的**同名目标**各用各的暂存盘，内容不串。"""
+    seen: list = []
+    original_open = file_io.open_readwrite
+
+    def spy_open(path: str) -> int:
+        seen.append(path)
+        return original_open(path)
+
+    with tempfile.TemporaryDirectory() as cache:
+        file_io.open_readwrite = spy_open
+        try:
+            for payload in (os.urandom(7000), os.urandom(3000)):
+                with tempfile.TemporaryDirectory() as work:
+                    src = os.path.join(work, "src.bin")
+                    with open(src, "wb") as fh:
+                        fh.write(payload)
+                    dst = os.path.join(work, "same.bin")   # 两个目录里**同名**的目标
+                    written, _nblocks = file_io.copy_stream(
+                        src, dst, mode="disk", cache_dir=cache, buffer_blocks=2,
+                        bytes_per_cluster=_BPC, block_clusters=_BLOCK_CLUSTERS,
+                    )
+                    with open(dst, "rb") as fh:
+                        assert fh.read() == payload, "同名目标内容被覆盖 / 错乱"
+                    assert written == len(payload)
+        finally:
+            file_io.open_readwrite = original_open
+
+        assert len(seen) == 2, seen
+        assert seen[0] != seen[1], "两次搬运必须走不同的暂存文件"
+        assert os.path.basename(seen[0]) != os.path.basename(seen[1])
+        assert os.listdir(cache) == [], "暂存文件必须都被清理干净"
+
+
+def test_staged_copy_segmented_write_matches_joined_bytes() -> None:
+    """D-008：限制单次合并长度后分段写入，落盘字节与「整段 join」版逐字节一致。"""
+    baseline: bytes = b""
+    stats_by_cap: dict = {}
+
+    for cap in (1 << 20, 3000, 1):     # 大=原 join 行为；3000=跨块拆两段；1=逐块写
+        with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as cache:
+            src = _write_src(work)
+            dst = os.path.join(work, "dst.bin")
+
+            scratch_handles: set = set()
+            original_open = file_io.open_readwrite
+            original_write = file_io.write_at
+            original_cap = file_io.MAX_MERGE_BYTES
+            stats = {"calls": 0, "bytes": 0}
+
+            def spy_open(path: str) -> int:
+                handle = original_open(path)
+                scratch_handles.add(handle)
+                return handle
+
+            def spy_write(handle: int, offset: int, data: bytes) -> int:
+                if handle in scratch_handles:
+                    stats["calls"] += 1
+                    stats["bytes"] += len(data)
+                return original_write(handle, offset, data)
+
+            file_io.open_readwrite = spy_open
+            file_io.write_at = spy_write
+            file_io.MAX_MERGE_BYTES = cap
+            try:
+                written, nblocks = file_io.copy_stream(
+                    src, dst, mode="disk", cache_dir=cache, buffer_blocks=2,
+                    bytes_per_cluster=_BPC, block_clusters=_BLOCK_CLUSTERS,
+                )
+            finally:
+                file_io.open_readwrite = original_open
+                file_io.write_at = original_write
+                file_io.MAX_MERGE_BYTES = original_cap
+
+            with open(dst, "rb") as fh:
+                data = fh.read()
+            assert data == _DATA, f"cap={cap}：落盘内容与源不一致"
+            assert written == len(_DATA) and nblocks == _NBLOCKS
+            if not baseline:
+                baseline = data
+            assert data == baseline, f"cap={cap}：与整段 join 版落盘字节不一致"
+            assert stats["bytes"] == len(_DATA), f"cap={cap}：暂存写入总字节变了"
+            stats_by_cap[cap] = stats["calls"]
+
+    # 分段确实生效：上限越小 → WriteFile 次数越多（但字节与内容完全不变）
+    assert stats_by_cap[1] >= stats_by_cap[3000] > stats_by_cap[1 << 20], stats_by_cap
+    assert stats_by_cap[1 << 20] < _NBLOCKS, "默认上限下仍保留连续块合并收益"
+    print(
+        f"\n[D-008] 分段写：{_NBLOCKS} 块 → cap=1MiB {stats_by_cap[1 << 20]} 次 / "
+        f"cap=3000 {stats_by_cap[3000]} 次 / cap=1 {stats_by_cap[1]} 次 WriteFile，"
+        "落盘字节三者一致"
+    )
+
+
+def test_write_run_splits_long_run_and_preserves_bytes() -> None:
+    """D-008：超长连续段被拆成多段写 —— 每段 ≤ 上限、首尾相接、拼回与 join 版一致。"""
+    blocks = file_io.plan_blocks(len(_DATA), _BPC, _BLOCK_CLUSTERS)
+    pending = {b.index: _DATA[b.offset:b.offset + b.length] for b in blocks}
+    run = list(range(len(blocks)))
+
+    writes: list = []
+    original_write = file_io.write_at
+
+    def record(handle: int, offset: int, data: bytes) -> int:
+        writes.append((offset, data))
+        return len(data)
+
+    file_io.write_at = record
+    try:
+        file_io._write_run(-1, blocks, pending, run, max_merge=3000)
+    finally:
+        file_io.write_at = original_write
+
+    assert len(writes) > 1, "上限小于整段长度时必须拆成多段写"
+    assert all(len(data) <= 3000 for _offset, data in writes), (
+        "单次写入长度必须 ≤ 合并上限（内存峰值不再随段长线性翻倍）"
+    )
+    cursor = blocks[0].offset
+    for offset, data in writes:          # 段首尾相接：无空洞、无重叠
+        assert offset == cursor, (offset, cursor)
+        cursor += len(data)
+    assert cursor == blocks[0].offset + len(_DATA)
+    assert b"".join(data for _offset, data in writes) == _DATA, (
+        "分段写入拼回来必须与整段 join 逐字节一致"
+    )
 
 
 if __name__ == "__main__":
