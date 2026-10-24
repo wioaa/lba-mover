@@ -113,6 +113,64 @@ def account_move_result(outcome: MoveOutcome, result) -> bool:
 #: 4096 簇 ≈ 16 MB（4K 簇），足够覆盖对齐误差与相邻簇的边界效应。
 SEGMENT_VERIFY_MARGIN = 4096
 
+#: 分块流式搬迁的临时文件后缀（``<源路径>.lbastream.tmp``）。
+#: 必须与 :meth:`BlockStreamWorker.run` 里使用的名字一致 —— 残留清理（D-009）
+#: 就靠它认出"上次运行留下的临时文件"。
+STREAM_TMP_SUFFIX = ".lbastream.tmp"
+
+
+def resolve_stream_residue(
+    src: str,
+    tmp: str,
+    recycle: Callable[[str], bool],
+) -> str:
+    """处理上一次运行遗留的临时文件 ``tmp``（D-009）。
+
+    ``BlockStreamWorker`` 的每步是「写 ``tmp`` → 源移回收站 → ``os.replace(tmp, src)``」。
+    若在**最后两步之间**被杀/断电，源已进回收站、``tmp`` 残留在源目录；
+    下次再挑中同一文件时 ``copy_stream(preallocate_dst=True)`` 会向这个已存在的
+    ``tmp`` 继续写，可能被旧残留污染。
+
+    本函数在写之前把这批残留管起来，两种情形分别处理：
+
+    1. **``src`` 已不在**（源已入回收站，改名没来得及做）——``tmp`` 是这份数据的
+       **唯一幸存副本**，必须**补完那一步改名**（``os.replace(tmp, src)``），
+       绝不许删除；随后照常走完整流程（重新落位），由业务代码决定成败；
+    2. **``src`` 仍在** —— ``tmp`` 只是中断产生的重复数据，回收后继续
+       （不删也可以跑，但会污染下一次预填充）。
+
+    Args:
+        src: 源文件完整路径。
+        tmp: 同名临时文件路径（``src + STREAM_TMP_SUFFIX``）。
+        recycle: 移到回收站的可调用物（``file_io.recycle`` 的替身亦可）。
+
+    Returns:
+        处理说明（空串表示没有残留，无需任何动作）。
+
+    Raises:
+        OSError: 残留无法清除（调用方必须**跳过**该文件，不能带着残留继续写）。
+    """
+    if not os.path.exists(tmp):
+        return ""
+    if not os.path.exists(src):
+        os.replace(tmp, src)
+        return (
+            "发现上次中断的临时文件（源已入回收站、改名未完成），"
+            "已先补完改名恢复源文件"
+        )
+    # src 完好：tmp 是重复数据 —— 先移回收站（可恢复），失败再直接删
+    removed = False
+    try:
+        removed = bool(recycle(tmp))
+    except Exception:  # noqa: BLE001 - 回收失败退化为删除
+        removed = False
+    if not removed and os.path.exists(tmp):
+        os.remove(tmp)
+    if os.path.exists(tmp):
+        raise OSError(f"残留临时文件无法清除：{tmp}")
+    return "已清理上次残留的临时文件"
+
+
 #: 抽样复核默认规模（D7：默认 32，每次扫描都做；候选不足则全量复核）
 DEFAULT_SAMPLE_SIZE = 32
 
@@ -1721,8 +1779,12 @@ class BlockStreamWorker(QThread):
             src = entry.path
             # 同卷临时文件：读出 src（腾空前部簇）→ 写 tmp（FS 在空闲区分配落点）→
             # 校验 → 源移回收站 → 改回原路径。**无外部目的地**，全程同卷内。
-            tmp = src + ".lbastream.tmp"
+            tmp = src + STREAM_TMP_SUFFIX
             try:
+                # ★ D-009：动笔之前先处理上次运行可能遗留的 tmp ——
+                # 否则 preallocate_dst=True 会向残留文件继续写（旧数据污染），
+                # 而源已入回收站的残留更是**唯一幸存副本**（只能改名恢复，不能删）。
+                residue_note = resolve_stream_residue(src, tmp, file_io.recycle)
                 src_size = os.path.getsize(src)
                 written, nblocks = file_io.copy_stream(
                     src, tmp,
@@ -1740,7 +1802,10 @@ class BlockStreamWorker(QThread):
                 os.replace(tmp, src)  # 簇已由文件系统重分配到空闲区，改回原路径
                 moved += 1
                 moved_clusters += entry.allocated_clusters
-                self.file_result.emit(entry.path, True, f"{nblocks} 块 / {entry.allocated_clusters:,} 簇")
+                detail = f"{nblocks} 块 / {entry.allocated_clusters:,} 簇"
+                if residue_note:
+                    detail = f"{residue_note}；{detail}"
+                self.file_result.emit(entry.path, True, detail)
             except Exception as exc:  # noqa: BLE001
                 try:
                     if os.path.exists(tmp):
