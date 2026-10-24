@@ -408,6 +408,41 @@ class _ShortReadKernel32:
         return 1
 
 
+class _ShortWriteKernel32:
+    """代理真实 ``kernel32``，把 ``WriteFile`` 限制成短写 / 写不动两种病态行为。
+
+    D-011 的模拟手段：本地磁盘上真实 ``WriteFile`` 几乎总是写满，无法复现短写，
+    因此把 ``file_io.kernel32`` 临时换成这个代理（其余函数原样转发）。
+
+    * ``chunk``：每次最多写这么多字节（短写，触发循环续写）；
+    * ``stall_after``：累计写到这么多字节后，``WriteFile`` 返回 0 字节（写不动）。
+    """
+
+    def __init__(self, real, chunk: "int | None" = None, stall_after: "int | None" = None) -> None:
+        self._real = real
+        self._chunk = chunk
+        self._stall_at = stall_after
+        self._written = 0
+        self.calls = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+    def WriteFile(self, handle, buffer, size, done_ref, overlapped):  # noqa: N802
+        self.calls += 1
+        size = int(size)
+        if self._chunk is not None:
+            size = min(size, int(self._chunk))
+        if self._stall_at is not None and self._written >= int(self._stall_at):
+            done_ref._obj.value = 0          # 真写不进去了
+            return 1
+        if self._stall_at is not None:
+            size = min(size, int(self._stall_at) - self._written)
+        ok = self._real.WriteFile(handle, buffer, size, done_ref, overlapped)
+        self._written += int(done_ref._obj.value)
+        return ok
+
+
 def test_read_at_retries_until_full_size_on_short_reads() -> None:
     """D-003 ①：ReadFile 每次只返回部分字节（短读）时，read_at 必须循环读满 size。"""
     content = os.urandom(5000)
@@ -464,6 +499,106 @@ def test_read_at_raises_on_premature_eof() -> None:
             file_io.close(handle)
 
 
+def test_write_at_retries_until_full_length_on_short_writes() -> None:
+    """D-011 ①：WriteFile 每次只写部分字节（短写）时，write_at 必须循环写满。"""
+    payload = os.urandom(5000)
+    for chunk in (1, 7, 512, 4999):
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "out.bin")
+            handle = file_io.open_write(path)
+            original = file_io.kernel32
+            fake = _ShortWriteKernel32(original, chunk=chunk)
+            file_io.kernel32 = fake
+            try:
+                written = file_io.write_at(handle, 0, payload)
+            finally:
+                file_io.kernel32 = original
+                file_io.close(handle)
+            assert written == len(payload), (
+                f"chunk={chunk}：短写后未写满（{written} < {len(payload)}）"
+            )
+            with open(path, "rb") as fh:
+                assert fh.read() == payload, f"chunk={chunk}：落盘内容与源不一致"
+            assert fake.calls > 1, f"chunk={chunk}：应发生多次 WriteFile（确实短写）"
+    print("\n[D-011] 短写补齐：chunk=1/7/512/4999 四种短写步长均写满且落盘一致")
+
+
+def test_write_at_raises_when_write_stalls() -> None:
+    """D-011 ②：WriteFile 返回 0 字节（写不进去）→ 抛错，绝不把已写字节当成功。"""
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "out.bin")
+        handle = file_io.open_write(path)
+        original = file_io.kernel32
+        try:
+            # 空数据：早返回 0，不进循环、不调 WriteFile
+            file_io.kernel32 = _ShortWriteKernel32(original, stall_after=0)
+            assert file_io.write_at(handle, 0, b"") == 0
+
+            # 一个字节都写不进去 → 必须报错
+            try:
+                file_io.write_at(handle, 0, b"x" * 4096)
+            except api.Win32Error as exc:
+                assert exc.winerror == api.ERROR_DISK_FULL, exc
+                assert isinstance(exc, OSError)   # 沿用既有异常词汇（OSError 子类）
+            else:
+                raise AssertionError("WriteFile 返回 0 字节必须抛错")
+
+            # 中途写不动（写了 10 字节后停滞）→ 同样报错，不能返回 10 当成功
+            file_io.kernel32 = _ShortWriteKernel32(original, stall_after=10)
+            try:
+                file_io.write_at(handle, 0, b"y" * 4096)
+            except api.Win32Error as exc:
+                assert exc.winerror == api.ERROR_DISK_FULL, exc
+            else:
+                raise AssertionError("中途写不动必须抛错，不能静默返回已写字节数")
+        finally:
+            file_io.kernel32 = original
+            file_io.close(handle)
+
+
+def test_staged_copy_rejects_short_block_write() -> None:
+    """D-011 位置二：目的块实写字节数 != 块长度 → 显式报错，不静默累加 written。"""
+    with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as cache:
+        src = _write_src(work)
+        dst = os.path.join(work, "dst.bin")
+        scratch_path = os.path.join(cache, "s.stage")
+        original_open_rw = file_io.open_readwrite
+        original_write = file_io.write_at
+        scratch_handles: set = set()
+
+        def spy_open_rw(path: str) -> int:
+            handle = original_open_rw(path)
+            scratch_handles.add(handle)
+            return handle
+
+        def short_dst_write(handle: int, offset: int, data: bytes) -> int:
+            """目的盘每次都少写 1 字节（模拟 write_at 契约被破坏 / 底层短写）。
+
+            暂存盘句柄照常真写——否则块根本没落暂存盘，先炸的是读侧而非写侧。
+            """
+            if handle in scratch_handles:
+                return original_write(handle, offset, data)
+            return len(data) - 1 if len(data) > 1 else len(data)
+
+        file_io.open_readwrite = spy_open_rw
+        file_io.write_at = short_dst_write
+        try:
+            try:
+                file_io.staged_copy(
+                    src, scratch_path, dst, buffer_blocks=2,
+                    bytes_per_cluster=_BPC, block_clusters=_BLOCK_CLUSTERS,
+                )
+            except api.Win32Error as exc:
+                assert "短写" in str(exc), exc
+                assert exc.winerror == api.ERROR_DISK_FULL, exc
+            else:
+                raise AssertionError("块级短写必须报错，不能被 written 静默累加吞掉")
+        finally:
+            file_io.open_readwrite = original_open_rw
+            file_io.write_at = original_write
+        assert not os.path.exists(scratch_path), "异常路径下 stage 文件仍须被清理"
+
+
 def test_scratch_name_unique_across_directories() -> None:
     """D-004：暂存文件名按目标**完整路径**哈希 —— 跨目录唯一、同目标可复现。"""
     a = file_io._scratch_name(os.path.join("D:" + os.sep, "dir-a", "same.bin"))
@@ -509,6 +644,98 @@ def test_copy_stream_disk_scratch_unique_per_directory() -> None:
         assert seen[0] != seen[1], "两次搬运必须走不同的暂存文件"
         assert os.path.basename(seen[0]) != os.path.basename(seen[1])
         assert os.listdir(cache) == [], "暂存文件必须都被清理干净"
+
+
+def _run_disk_copy(cap: "int | None" = None, join: bool = False) -> tuple:
+    """跑一次 disk 模式拷贝，返回 ``(dst 字节, 暂存写统计, written, nblocks)``。
+
+    ``join=True`` 时把 ``_write_run`` 换回**整段 join** 的旧实现作基线；
+    否则按 ``cap`` 设 ``MAX_MERGE_BYTES``（``None`` = 用模块默认 8 MiB）。
+    """
+    original_open = file_io.open_readwrite
+    original_write = file_io.write_at
+    original_run = file_io._write_run
+    original_cap = file_io.MAX_MERGE_BYTES
+    scratch_handles: set = set()
+    stats = {"calls": 0, "bytes": 0}
+
+    def spy_open(path: str) -> int:
+        handle = original_open(path)
+        scratch_handles.add(handle)
+        return handle
+
+    def spy_write(handle: int, offset: int, data: bytes) -> int:
+        if handle in scratch_handles:
+            stats["calls"] += 1
+            stats["bytes"] += len(data)
+        return original_write(handle, offset, data)
+
+    def join_run(scratch, blocks, pending, run, max_merge=None) -> None:
+        """旧版整段 join 基线（写入仍经 spy 计数，口径一致）。"""
+        file_io.write_at(scratch, blocks[run[0]].offset, b"".join(pending[i] for i in run))
+
+    file_io.open_readwrite = spy_open
+    file_io.write_at = spy_write
+    if join:
+        file_io._write_run = join_run
+    elif cap is not None:
+        file_io.MAX_MERGE_BYTES = cap
+
+    with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as cache:
+        src = _write_src(work)
+        dst = os.path.join(work, "dst.bin")
+        try:
+            written, nblocks = file_io.copy_stream(
+                src, dst, mode="disk", cache_dir=cache, buffer_blocks=2,
+                bytes_per_cluster=_BPC, block_clusters=_BLOCK_CLUSTERS,
+            )
+        finally:
+            file_io.open_readwrite = original_open
+            file_io.write_at = original_write
+            file_io._write_run = original_run
+            file_io.MAX_MERGE_BYTES = original_cap
+        with open(dst, "rb") as fh:
+            data = fh.read()
+    return data, stats, written, nblocks
+
+
+def test_staged_copy_write_guard_keeps_join_equivalence_and_merge_counts() -> None:
+    """D-011 ③：写侧校验上线后，分段写仍与整段 join 版逐字节一致、合并次数不变。"""
+    baseline, base_stats, written0, nblocks0 = _run_disk_copy(join=True)
+    assert baseline == _DATA and written0 == len(_DATA) and nblocks0 == _NBLOCKS
+    assert base_stats["bytes"] == len(_DATA)
+    assert base_stats["calls"] == 3, f"join 基线暂存写次数应为 3，实为 {base_stats['calls']}"
+
+    for cap in (1 << 20, 3000, 1):
+        data, stats, written, nblocks = _run_disk_copy(cap)
+        assert data == baseline, f"cap={cap}：与整段 join 版落盘字节不一致"
+        assert stats["bytes"] == len(_DATA), f"cap={cap}：暂存写入总字节变了"
+        assert written == len(_DATA) and nblocks == _NBLOCKS
+
+    # 默认上限（8 MiB）下：分段不触发 → 合并次数与 join 版**完全一致**
+    default_data, default_stats, _, _ = _run_disk_copy()
+    assert default_data == baseline
+    assert default_stats["calls"] == base_stats["calls"], (
+        f"默认上限下合并次数应与 join 版一致（{base_stats['calls']}），"
+        f"实为 {default_stats['calls']}"
+    )
+    assert default_stats["calls"] < _NBLOCKS, "默认路径仍保留连续块合并收益"
+
+    # 端到端：让底层 WriteFile **持续短写**（每次 7 字节）跑完整 disk 流程 ——
+    # 落盘字节仍须与 join 基线一致，且 write_at 调用次数（合并次数）不变
+    # （重试发生在 write_at **内部**，不得改变上层的合并策略）。
+    original_kernel32 = file_io.kernel32
+    file_io.kernel32 = _ShortWriteKernel32(original_kernel32, chunk=7)
+    try:
+        data, stats, written, nblocks = _run_disk_copy()
+    finally:
+        file_io.kernel32 = original_kernel32
+    assert data == baseline, "底层持续短写时，落盘字节必须与 join 版一致"
+    assert stats["calls"] == base_stats["calls"] == 3, (
+        f"短写重试不得改变合并次数（应 {base_stats['calls']}），实为 {stats['calls']}"
+    )
+    assert stats["bytes"] == len(_DATA)
+    assert written == len(_DATA) and nblocks == _NBLOCKS
 
 
 def test_staged_copy_segmented_write_matches_joined_bytes() -> None:

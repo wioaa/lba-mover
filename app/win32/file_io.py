@@ -149,14 +149,51 @@ def read_at(handle: int, offset: int, size: int) -> bytes:
 
 
 def write_at(handle: int, offset: int, data: bytes) -> int:
-    """把 ``data`` 写到 ``offset``（定位 + WriteFile），返回写入字节数。"""
+    """把 ``data`` **完整**写到 ``offset``（定位 + 循环 WriteFile），返回写入字节数。
+
+    D-011（D-003 的写侧孪生）：``WriteFile`` 同样允许返回**少于请求**的字节数
+    （短写：磁盘满 / 配额 / 驱动行为 / IO 排队）。原实现既不重试、也不校验
+    ``done.value``，短写会让落盘数据**静默少写**，上层完全无感知——读侧（D-003）
+    已经改成显式抛错，写侧留着同样的洞，流式迁移的数据一致性就没闭环。
+
+    这里改为循环写满 ``len(data)``：续写时用缓冲区**视图切片**推进（``from_buffer``，
+    不重复分配整块缓冲）；首次调用直接写原始字节串（**不额外复制**），只有真的
+    发生短写时才建一份可写副本供切片。若在没写满时 ``WriteFile`` 返回 0 字节
+    （真写不进去了），**显式抛错**，绝不把已写字节数当成功返回。
+
+    Raises:
+        api.Win32Error: 定位 / 写入失败；或写入停滞（0 字节）导致无法写满
+            （错误码 :data:`app.win32.api.ERROR_DISK_FULL`）。
+    """
+    n = len(data)
+    if n <= 0:
+        return 0
     if not kernel32.SetFilePointerEx(handle, int(offset), None, FILE_BEGIN):
         raise api.Win32Error(kernel32.GetLastError(), f"SetFilePointerEx@{offset}")
+
     done = wintypes.DWORD(0)
-    n = len(data)
-    if n and not kernel32.WriteFile(handle, data, n, ctypes.byref(done), None):
-        raise api.Win32Error(kernel32.GetLastError(), f"WriteFile@{offset}")
-    return done.value
+    written = 0
+    buf = None               # 仅在真发生短写时才建的可写副本（供视图切片）
+    while written < n:
+        if written == 0:
+            # 快路径：直接写原始字节串，零额外内存
+            chunk: object = data
+            size = n
+        else:
+            if buf is None:
+                buf = ctypes.create_string_buffer(data)
+            chunk = (ctypes.c_char * (n - written)).from_buffer(buf, written)
+            size = n - written
+        if not kernel32.WriteFile(handle, chunk, size, ctypes.byref(done), None):
+            raise api.Win32Error(kernel32.GetLastError(), f"WriteFile@{offset}")
+        if done.value <= 0:
+            # 写入停滞：一个字节都写不进去了 —— 报错，而不是把已写字节当成功
+            raise api.Win32Error(
+                api.ERROR_DISK_FULL,
+                f"WriteFile@{offset} 写入停滞（请求 {n} 字节，已写 {written} 字节）",
+            )
+        written += int(done.value)
+    return written
 
 
 def copy_block(src: int, dst: int, offset: int, length: int) -> int:
@@ -256,6 +293,10 @@ def staged_copy(
     ``buffer_blocks`` 个 block（或流末尾、或 store 需要）后，把**连续的块区间
     拼成单次顺序写**落盘 —— 功能输出不变（dst 内容逐字节一致），显著降低
     WriteFile syscall 次数与暂存盘碎片。
+
+    **写入完整性（D-011）**：``write_at`` 内部已循环写满并校验；这里再逐块
+    比对「实写字节数 vs 块长度」，不一致即抛 :class:`api.Win32Error`——
+    不让短写被 ``written`` 的静默累加吞掉。
     """
     total = os.path.getsize(src_path)
     blocks = plan_blocks(total, bytes_per_cluster, block_clusters)
@@ -296,7 +337,16 @@ def staged_copy(
                 if index in pending:
                     # 保险：目标块还没落盘（时序异常时兜底），先强制落盘
                     _flush_pending()
-                written += write_at(dst, block.offset, read_at(scratch, block.offset, block.length))
+                chunk = read_at(scratch, block.offset, block.length)
+                # D-011 位置二：write_at 的返回值**必须与块长度对齐**才累加——
+                # 不比对就把返回值静默累加，等于把「少写了多少」这个信息吞掉。
+                n = write_at(dst, block.offset, chunk)
+                if n != block.length:
+                    raise api.Win32Error(
+                        api.ERROR_DISK_FULL,
+                        f"目的块 {index} 短写（请求 {block.length} 字节，实写 {n} 字节）",
+                    )
+                written += n
         _flush_pending()
         result = (written, len(blocks))
     finally:
