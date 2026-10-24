@@ -637,6 +637,122 @@ def test_emit_pending_real_state_not_hardcoded() -> None:
     assert pending[-1] == (True, 1), f"应实算为有 1 项待定，实际 {pending}"
 
 
+# --------------------------------------------------------------------------- #
+# D-006 回归钉：流水句柄释放（切换卷 / 回滚完成）
+# --------------------------------------------------------------------------- #
+def test_release_journal_closes_handle_and_clears_reference() -> None:
+    """``_release_journal`` 必须**先关句柄**再丢引用，且幂等、不抛异常。
+
+    背景（D-006）：``MoveJournal`` 内部持有打开的 JSONL 文件句柄，早期实现把
+    ``self._journal`` 直接置 ``None``，句柄要泄漏到 GC 回收为止。
+    """
+    import tempfile
+
+    from pathlib import Path
+
+    from app.core.journal import JournalEntry, MoveJournal
+
+    window, _mw = _make_window()
+    with tempfile.TemporaryDirectory() as folder:
+        journal = MoveJournal(Path(folder) / "journal-R-test.jsonl")
+        journal.append(
+            JournalEntry(
+                phase="place", path="R:\\a.bin", vcn=0,
+                src_lcn=10, dst_lcn=5000, clusters=4,
+            )
+        )
+        handle = journal._handle
+        assert handle is not None and not handle.closed, "前置条件：句柄此刻是打开的"
+
+        window._journal = journal
+        window._journal_path = str(journal.path)
+
+        window._release_journal()
+
+        assert journal._closed is True, "流水必须已被 close()"
+        assert journal._handle is None, "文件句柄必须已释放（不许泄漏到 GC）"
+        assert window._journal is None
+        assert window._journal_path == ""
+
+        # 幂等：重复调用 / 已关闭的情况下都不许二次抛错
+        window._release_journal()
+        window._release_journal()
+
+        # close 会强制 fsync —— 关闭前写的内容必须已落盘可读（回滚清单完整性）
+        loaded = MoveJournal.load(Path(journal.path))
+        assert len(loaded) == 1 and loaded[0].path == "R:\\a.bin"
+
+
+def test_release_journal_is_reachable_from_both_drop_paths() -> None:
+    """两条释放路径都必须调用 ``_release_journal``，不许绕过它直接置空引用。"""
+    import inspect
+
+    import app.ui.main_window as mw
+
+    for method in (mw.MainWindow._on_volume_changed, mw.MainWindow._on_rollback_completed):
+        source = inspect.getsource(method)
+        assert "self._release_journal()" in source, (
+            f"{method.__qualname__} 未释放流水句柄（D-006）"
+        )
+        assert "self._journal = None" not in source, (
+            f"{method.__qualname__} 仍在直接把 _journal 置空（绕过 close，句柄泄漏）"
+        )
+
+
+def test_volume_changed_closes_the_open_journal() -> None:
+    """功能钉：真的切一次卷，先前打开的流水句柄必须被关掉（不是只丢引用）。"""
+    import tempfile
+
+    from pathlib import Path
+
+    from app.core.journal import JournalEntry, MoveJournal
+    from app.win32 import storage
+
+    window, _mw = _make_window()
+    volumes = [
+        VolumeInfo(
+            letter="R", root="R:\\", label="T", filesystem="NTFS",
+            total_bytes=TOTAL * BPC, bytes_per_cluster=BPC, total_clusters=TOTAL,
+            mft_zone_start=1000, mft_zone_end=2000, mft_start_lcn=1000, is_ntfs=True,
+        ),
+        VolumeInfo(
+            letter="S", root="S:\\", label="U", filesystem="NTFS",
+            total_bytes=TOTAL * BPC, bytes_per_cluster=BPC, total_clusters=TOTAL,
+            mft_zone_start=1000, mft_zone_end=2000, mft_start_lcn=1000, is_ntfs=True,
+        ),
+    ]
+    window._volumes = volumes
+    window._volume_combo.clear()
+    for volume in volumes:
+        window._volume_combo.addItem(volume.display_name)
+
+    original_probe = storage.probe_volume_storage
+    storage.probe_volume_storage = lambda letter: (
+        storage.MediaProbe(), storage.VolumeDiskMap()
+    )
+    try:
+        with tempfile.TemporaryDirectory() as folder:
+            journal = MoveJournal(Path(folder) / "journal-R-before.jsonl")
+            journal.append(
+                JournalEntry(
+                    phase="place", path="R:\\a.bin", vcn=0,
+                    src_lcn=10, dst_lcn=5000, clusters=4,
+                )
+            )
+            window._journal = journal
+            window._journal_path = str(journal.path)
+
+            window._volume_combo.setCurrentIndex(1)   # 触发 _on_volume_changed
+
+            assert journal._closed is True, "切卷后旧流水句柄必须已关闭（D-006）"
+            assert journal._handle is None
+            assert window._journal is None
+            assert window._journal_path == ""
+            assert window._volume is volumes[1]
+    finally:
+        storage.probe_volume_storage = original_probe
+
+
 if __name__ == "__main__":
     from tests._harness import exit_with
 

@@ -876,8 +876,8 @@ class MainWindow(QMainWindow):
         self._recovery.clear()
         self._recovery.set_cluster_size(info.bytes_per_cluster)
         self._recovery.set_journal("", 0)
-        self._journal = None
-        self._journal_path = ""
+        # ★ D-006：先关句柄再丢引用（原先直接置 None，句柄泄漏到 GC 才释放）
+        self._release_journal()
 
         # 介质与磁盘映射（两者都不抛异常）
         self._probe, self._disk_map_info = storage.probe_volume_storage(info.letter)
@@ -2183,6 +2183,27 @@ class MainWindow(QMainWindow):
     # ================================================================== #
     # 手动回滚
     # ================================================================== #
+    def _release_journal(self) -> None:
+        """关闭并释放本次会话的操作流水句柄（**幂等**、绝不抛异常）。
+
+        ★ D-006：:class:`MoveJournal` 内部持有一个打开的 JSONL 文件句柄。把
+        ``self._journal`` 置 ``None`` **之前**必须显式 :meth:`MoveJournal.close`，
+        否则句柄要一直泄漏到 GC 回收该对象为止 —— 切换卷（``_on_volume_changed``）
+        与回滚完成（``_on_rollback_completed``）这两条路径上都会漏。
+
+        ``close()`` 自身幂等且已吞掉 fsync 异常；这里再包一层 ``try``，保证这条
+        释放路径本身不会把异常抛进 Qt 事件循环（它跑在 UI 回调里）。
+        """
+        journal = self._journal
+        self._journal = None
+        self._journal_path = ""
+        if journal is None:
+            return
+        try:
+            journal.close()
+        except Exception:  # noqa: BLE001 - 释放路径绝不抛
+            pass
+
     def _start_rollback(self) -> None:
         info = self._volume
         if info is None:
@@ -2261,8 +2282,8 @@ class MainWindow(QMainWindow):
         self._recovery.disable_rollback(
             "已回滚过一次。再次回滚会把数据搬回目标位置，不是撤销操作，故已禁用。"
         )
-        self._journal = None
-        self._journal_path = ""
+        # ★ D-006：回滚完成后流水已消费完毕，关闭句柄再丢引用
+        self._release_journal()
         self._plan_stale = True
         self._reload_bitmap()
         self._sync_buttons()
