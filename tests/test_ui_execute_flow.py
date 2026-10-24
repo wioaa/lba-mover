@@ -496,6 +496,100 @@ def test_plan_ready_with_intent_confirms_exactly_once() -> None:
     assert getattr(source, "resume_after") is False, "worker 上的意图消费即清"
 
 
+# --------------------------------------------------------------------------- #
+# ⑭ 1.0.0F 修复①：计划过期时「生成迁移计划」按钮**不**再被可行性判定卡灰。
+#     此前要求 ``_feasibility.ok`` 才算可点；可行性为 None（区间被清空 / 还没
+#     评估）时按钮直接灰掉 —— 用户既不能执行也不能重新生成 → 表现「点了没反应」。
+# --------------------------------------------------------------------------- #
+def test_stale_plan_generate_button_enabled_without_feasibility() -> None:
+    window, mw = _make_window()
+    _select_one_file(window)
+    window._target_panel.set_volume(TOTAL, BPC)   # 默认区间 = 整卷 → window_ok = True
+    window._mode = mw.MODE_EXECUTE
+    window._plan_stale = True                     # 过期 → 走「生成迁移计划」
+    window._feasibility = None                    # 此前为 None 时按钮灰掉（bug）
+    window._sync_buttons()
+    assert window._action_button.text() == "生成迁移计划"
+    assert window._action_button.isEnabled() is True, (
+        "可行性为 None 时「生成迁移计划」必须可点（交给 _generate_plan 给原因）"
+    )
+    calls: list = []
+    window._generate_plan = lambda: calls.append("gen")
+    window._on_primary_action()
+    assert calls == ["gen"], "点击过期态的主按钮应重新发起规划"
+
+
+# --------------------------------------------------------------------------- #
+# ⑮ 1.0.0F 修复①续：可行性为 False 同样不卡灰按钮；点击后 _generate_plan
+#     会给出**明确不可行原因**（而非静默无反应）。
+# --------------------------------------------------------------------------- #
+def test_stale_plan_infeasible_generate_button_explains() -> None:
+    window, _mw = _make_window()
+    _select_one_file(window)
+    window._target_panel.set_volume(TOTAL, BPC)
+    window._mode = _mw.MODE_EXECUTE
+    window._plan_stale = True
+    window._feasibility = _FakeFeasibility(False, ["区间内空闲不足", "挡路者不可驱逐"])
+    window._sync_buttons()
+    assert window._action_button.text() == "生成迁移计划"
+    assert window._action_button.isEnabled() is True, "可行性 False 也不应卡灰按钮"
+    window._on_primary_action()                   # 走真实 _generate_plan
+    text = window._notice.text()
+    assert "不可行" in text, f"应给出明确不可行原因，实际 {text!r}"
+
+
+# --------------------------------------------------------------------------- #
+# ⑯ 1.0.0F 修复②：执行引擎切换改为**直通**——立即提交并发 engineChanged，
+#     不再留在「应用配置」暂存里，否则用户切完发现主按钮没反应（实机反馈：
+#     流式引擎切完仍是 LBA 的灰按钮「生成迁移计划」）。
+# --------------------------------------------------------------------------- #
+def test_engine_switch_passthrough_no_pending_stream_button() -> None:
+    window, mw = _make_window()
+    window._mode = mw.MODE_PREVIEW
+    window._target_panel.set_volume(TOTAL, BPC)
+    _select_one_file(window)
+    assert window._io_panel.engine() == "lba", "默认引擎应为 LBA"
+    assert window._has_pending is False
+    # 切到「分块流式」——直通，无需点应用
+    window._io_panel._engine_switch.set_current(1, emit=True)
+    assert window._io_panel.engine() == "stream", "引擎切换必须立即提交"
+    assert window._has_pending is False, "引擎直通不应留下待定（不必点应用）"
+    window._sync_buttons()
+    assert window._action_button.text() == "开始分块流式迁移", (
+        "切到流事后主按钮应立即变成流式按钮"
+    )
+    assert window._action_button.isEnabled() is True
+
+
+# --------------------------------------------------------------------------- #
+# ⑰ 1.0.0F 修复②续：io_panel._emit_pending 发**实算**的待定（不再硬编码 True）。
+#     此前硬编码 True 会让引擎直通后的补刷把「配置未应用」徽章假亮。
+# --------------------------------------------------------------------------- #
+def test_emit_pending_real_state_not_hardcoded() -> None:
+    _ = _app()
+    from app.ui.io_panel import IoPanel, ENGINE_STREAM
+
+    panel = IoPanel()
+    pending: list = []
+    panel.pendingChanged.connect(lambda p, c: pending.append((p, c)))
+    engine_signals: list = []
+    panel.engineChanged.connect(lambda e: engine_signals.append(e))
+
+    # 引擎直通：commit 后控件值 == 已提交值 → 实算待定应为 (False, 0)
+    panel._engine_switch.set_current(1, emit=True)
+    assert panel.engine() == ENGINE_STREAM
+    assert panel.is_pending() is False
+    assert pending and pending[-1] == (False, 0), (
+        f"引擎直通后应实算为无待定，实际 {pending}"
+    )
+    assert engine_signals == [ENGINE_STREAM], "应发出 engineChanged"
+
+    # 真正的待定变更：流式缓存模式 内存 → 硬盘（index 0 → 1）
+    panel._stream_cache_switch.set_current(1, emit=True)
+    assert panel.is_pending() is True, "改了未提交值应进入待定"
+    assert pending[-1] == (True, 1), f"应实算为有 1 项待定，实际 {pending}"
+
+
 if __name__ == "__main__":
     from tests._harness import exit_with
 

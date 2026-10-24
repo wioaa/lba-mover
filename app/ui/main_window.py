@@ -1704,12 +1704,16 @@ class MainWindow(QMainWindow):
                 enabled = self._is_admin and self._privilege_ok and not self._busy
             else:
                 desired = ("生成迁移计划", "primary")
+                # ★ 1.0.0F：可行性**不再**参与按钮启用判定。此前要求
+                # ``feasibility.ok`` 才算可点，而可行性为 None（还没评估 / 区间为空
+                # 被清空）时按钮直接灰掉 —— 用户既不能执行也不能重新生成，表现就是
+                # 「点了没反应」。现在交给 :meth:`_generate_plan`：不可行会在那里给出
+                # 明确原因（比灰按钮更有信息量），且不会静默。
                 enabled = (
                     selected > 0
                     and self._snapshot is not None
                     and window_ok
                     and not self._busy
-                    and feasible
                 )
         self._apply_action_button(desired, enabled)
 

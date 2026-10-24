@@ -485,11 +485,23 @@ class IoPanel(QWidget):
     def _on_engine_changed(self, index: int) -> None:
         """执行引擎切换：0 = LBA（簇级精确）/ 1 = 分块流式（用户态）。
 
-        1.0.0D：只更新**视觉预览**（盒子显隐 + 提示文案）并进入待定态；
-        ``engineChanged`` 等 :meth:`commit_pending` 才发。
+        1.0.0F 改为**直通**（立即提交并发 ``engineChanged``）：引擎只决定「用哪种
+        搬运方式」，两个引擎各自都有自己的人工确认闸门（LBA 走危险确认 + 管理员/
+        特权校验，流式走危险确认），不存在「用旧参数直接写盘」的风险；而留在
+        「应用配置」暂存里会让用户切完发现按钮没反应（实机反馈）。
+
+        **区间 / 保留区 / IO 参数仍走确认流程**（它们会进真实写盘流程）。
         """
-        self._apply_engine_visual(int(index))
-        self.pendingChanged.emit(True, self.pending_count())
+        index = int(index)
+        self._apply_engine_visual(index)
+        if index == self._committed[0]:
+            self._emit_pending()
+            return
+        self._guard = True
+        self._committed = (index,) + self._committed[1:]
+        self._guard = False
+        self.engineChanged.emit(self.engine())
+        self._emit_pending()
 
     def _apply_engine_visual(self, index: int) -> None:
         index = int(index)
@@ -506,9 +518,14 @@ class IoPanel(QWidget):
         self._emit_pending()
 
     def _emit_pending(self) -> None:
+        """发出**实算**的 pending 状态（与 TargetPanel 同口径）。
+
+        ★ 不要在调用点假设「一定是 dirty」：恢复 / 回显 / 引擎直通后的补刷都可能
+        在 clean 状态下走到这里，硬编码 True 会让「配置未应用」徽章假亮。
+        """
         if self._guard:
             return
-        self.pendingChanged.emit(True, self.pending_count())
+        self.pendingChanged.emit(self.is_pending(), self.pending_count())
 
     def _refresh_stream_buffer_label(self, *_args) -> None:
         bpc = self._bytes_per_cluster or 4096
