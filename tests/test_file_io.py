@@ -70,6 +70,60 @@ def test_memory_cache_mode_lossless() -> None:
             assert nblocks == _NBLOCKS
 
 
+def test_memory_copy_rejects_short_block_write() -> None:
+    """D-011 memory 侧：实写字节数 != 块长度 → 抛错，且异常路径不泄漏句柄。"""
+    with tempfile.TemporaryDirectory() as d:
+        src = _write_src(d)
+        dst = os.path.join(d, "dst.bin")
+        original_write = file_io.write_at
+
+        def short_write(handle: int, offset: int, data: bytes) -> int:
+            """每次都少写 1 字节（模拟 write_at 契约被破坏 / 底层短写）。"""
+            return len(data) - 1 if len(data) > 1 else len(data)
+
+        file_io.write_at = short_write
+        try:
+            try:
+                file_io.copy_stream(
+                    src, dst, mode="memory", buffer_blocks=2,
+                    bytes_per_cluster=_BPC, block_clusters=_BLOCK_CLUSTERS,
+                )
+            except api.Win32Error as exc:
+                assert exc.winerror == api.ERROR_DISK_FULL, exc
+                assert "短写" in str(exc) and "目的块" in str(exc), exc
+            else:
+                raise AssertionError("memory 模式块级短写必须报错，不能被 written 静默累加")
+        finally:
+            file_io.write_at = original_write
+
+        # 异常路径资源不泄漏：句柄若在 finally 里没关掉，Windows 上这两个文件
+        # 会因缺少 FILE_SHARE_DELETE 而删不掉（PermissionError）。
+        os.remove(dst)
+        os.remove(src)
+        assert not os.path.exists(dst) and not os.path.exists(src)
+
+
+def test_memory_copy_lossless_under_short_writes() -> None:
+    """D-011 memory 侧：底层 WriteFile 持续短写时，write_at 重试后 dst 仍无损。"""
+    with tempfile.TemporaryDirectory() as d:
+        src = _write_src(d)
+        dst = os.path.join(d, "dst.bin")
+        original = file_io.kernel32
+        fake = _ShortWriteKernel32(original, chunk=7)
+        file_io.kernel32 = fake
+        try:
+            written, nblocks = file_io.copy_stream(
+                src, dst, mode="memory", buffer_blocks=2,
+                bytes_per_cluster=_BPC, block_clusters=_BLOCK_CLUSTERS,
+            )
+        finally:
+            file_io.kernel32 = original
+        with open(dst, "rb") as fh:
+            assert fh.read() == _DATA, "底层持续短写下 memory 模式落盘必须无损"
+        assert written == len(_DATA) and nblocks == _NBLOCKS
+        assert fake.calls > _NBLOCKS, "应发生多次 WriteFile（确实在循环重试续写）"
+
+
 def test_disk_cache_mode_lossless() -> None:
     with tempfile.TemporaryDirectory() as work, tempfile.TemporaryDirectory() as cache:
         src = _write_src(work)

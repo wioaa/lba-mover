@@ -379,6 +379,11 @@ def memory_copy(
     个 block（可调）。最快，但占用内存 = ``buffer_blocks × block``。
     ``preallocate_dst=True`` 时先按总大小预分配一段（尽量连续）的簇，再流式覆盖
     （「预先填充 → 流式覆盖」，前端→后端整体直搬）。返回 ``(写入目的字节数, 块数)``。
+
+    **写入完整性（D-011 memory 侧）**：与 :func:`staged_copy` 同口径——``write_at``
+    的返回值先与块长度比对，不一致即抛 :class:`api.Win32Error`（带块索引 /
+    偏移线索），不让短写被 ``written`` 的静默累加吞掉。memory 是 worker 的
+    **默认模式**，用户默认走的就是这条路径。
     """
     total = os.path.getsize(src_path)
     blocks = plan_blocks(total, bytes_per_cluster, block_clusters)
@@ -401,7 +406,16 @@ def memory_copy(
             if kind == "load":
                 cache[index] = read_at(src, block.offset, block.length)
             else:  # store
-                written += write_at(dst, block.offset, cache.pop(index))
+                # D-011 memory 侧：实写字节数必须与块长度一致才累加（同 staged_copy 口径）
+                chunk = cache.pop(index)
+                n = write_at(dst, block.offset, chunk)
+                if n != block.length:
+                    raise api.Win32Error(
+                        api.ERROR_DISK_FULL,
+                        f"目的块 {index}@{block.offset} 短写"
+                        f"（请求 {block.length} 字节，实写 {n} 字节）",
+                    )
+                written += n
         return written, len(blocks)
     finally:
         close(src)
