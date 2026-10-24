@@ -2079,6 +2079,11 @@ class MainWindow(QMainWindow):
             return
 
         on_error = dialog.on_error()
+        # ★ D-012 审计补漏：上一条流水在本次修复后**不再于完成时关闭**（要留给
+        # 回滚写 rollback 行），因此开启新一轮迁移时必须先释放旧句柄 ——
+        # 否则「执行 → 完成 → 再执行一次」会丢掉一个未关闭的 JSONL 句柄，
+        # 等于把 D-006 刚修好的泄漏从另一条路径引回来。
+        self._release_journal()
         journal = MoveJournal(default_journal_path(info.letter))
         self._journal = journal
         self._journal_path = str(journal.path)
@@ -2134,7 +2139,15 @@ class MainWindow(QMainWindow):
         planned = len(self._plan.tasks) if self._plan is not None else 0
         self._recovery.set_outcome(outcome, planned)
         if self._journal is not None:
-            self._journal.close()
+            # ★ D-012：**只刷盘、不关闭**。流水还要留给随后的手动回滚写
+            # ``rollback`` 行 —— ``MoveJournal.append`` 在 ``_closed`` 之后会
+            # 抛 RuntimeError，届时的失败形态是「第 1 段 FSCTL 已真实执行、
+            # 剩余段不再执行、整文件报回滚异常」，即兜底绳子断了。
+            # 关闭统一交给会话终点：``_release_journal``（切卷 / 回滚完成 /
+            # 开启新一轮迁移）或 ``closeEvent``。
+            # ♦ 耐久性与原先等价：``force_fsync`` 无条件 ``os.fsync``，保证这里
+            # 读到的回滚清单已经是钉在盘上的（不是只剩页缓存）。
+            self._journal.force_fsync()
             rollback_clusters = self._journal.rollback_clusters()
             self._recovery.set_journal(self._journal_path, rollback_clusters)
         self._recovery.mark_executed()
@@ -2190,6 +2203,11 @@ class MainWindow(QMainWindow):
         ``self._journal`` 置 ``None`` **之前**必须显式 :meth:`MoveJournal.close`，
         否则句柄要一直泄漏到 GC 回收该对象为止 —— 切换卷（``_on_volume_changed``）
         与回滚完成（``_on_rollback_completed``）这两条路径上都会漏。
+
+        ★ D-012：本函数是**关闭流水的唯一出口**。会话中途（``_on_move_completed``）
+        只允许 :meth:`MoveJournal.force_fsync` 刷盘、**不许 close** —— 流水要留给
+        随后的手动回滚写 ``rollback`` 行。关闭时机限定为：切换卷、回滚完成、
+        开启新一轮迁移、以及关窗（``closeEvent``）。
 
         ``close()`` 自身幂等且已吞掉 fsync 异常；这里再包一层 ``try``，保证这条
         释放路径本身不会把异常抛进 Qt 事件循环（它跑在 UI 回调里）。

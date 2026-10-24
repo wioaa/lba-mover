@@ -753,6 +753,205 @@ def test_volume_changed_closes_the_open_journal() -> None:
         storage.probe_volume_storage = original_probe
 
 
+# --------------------------------------------------------------------------- #
+# D-012 回归钉：journal 生命周期（迁移完成后必须仍可写 —— 回滚靠它）
+#
+# 旧 bug：_on_move_completed 把 journal close() 了却保留引用，之后点回滚走
+# RollbackWorker(journal=self._journal) ⇒ 第 1 段 FSCTL 已真实执行，紧接着
+# journal.record() 撞上 journal.py 的 `if self._closed: raise RuntimeError` ⇒
+# 剩余段不执行、整文件报「回滚异常」—— 兜底绳子是断的。
+# --------------------------------------------------------------------------- #
+class _AllowAllGuard:
+    """RollbackWorker / mover 用的最小守卫替身（恒放行）。"""
+
+    def allow(self, lcn: int, clusters: int):
+        return True, ""
+
+    def reserve(self, lcn: int, clusters: int) -> None:
+        return None
+
+
+def _window_with_journal(journal):
+    """构造「刚跑完一次迁移」的窗口状态（屏蔽位图重载等真实 IO）。"""
+    window, mw = _make_window()
+    mw.MainWindow._reload_bitmap = lambda self: None   # 免得真的起 BitmapWorker 线程
+    window._journal = journal
+    window._journal_path = str(journal.path)
+    return window
+
+
+def test_journal_stays_writable_after_move_completed() -> None:
+    """D-012 主钉：``_on_move_completed`` 之后流水必须**仍可写**（回滚要写 rollback 行）。"""
+    import tempfile
+
+    from pathlib import Path
+
+    from app.core.journal import MoveJournal
+    from app.core.models import MoveOutcome
+
+    with tempfile.TemporaryDirectory() as folder:
+        journal = MoveJournal(Path(folder) / "journal-R.jsonl")
+        journal.record(
+            phase="place", path="R:\\a.bin", vcn=0,
+            src_lcn=10, dst_lcn=5000, clusters=4, ok=True,
+        )
+        window = _window_with_journal(journal)
+
+        # ① 迁移完成回调（旧实现在这里就把句柄关了）
+        window._on_move_completed(MoveOutcome(moved_clusters=4, moved_files=1))
+
+        # ② 回滚还要往同一条流水里写 —— 旧实现在这一步抛 RuntimeError
+        journal.record(
+            phase="rollback", path="R:\\a.bin", vcn=0,
+            src_lcn=5000, dst_lcn=10, clusters=4, ok=True,
+        )
+
+        assert journal.record_count == 2, "place + rollback 两行都必须成功写入"
+        phases = [entry.phase for entry in MoveJournal.load(Path(journal.path))]
+        assert phases == ["place", "rollback"], phases
+        assert journal._closed is False, "迁移完成 ≠ 会话结束：句柄必须保持可用"
+        assert window._journal is journal, "引用必须留给回滚用"
+
+        # 会话收尾（顺带证明：修复后句柄确实还开着 —— Windows 上正是
+        # "句柄未关 ⇒ 临时目录删不掉"这一行为，反过来印证 inspect 判据）
+        journal.close()
+        assert journal._closed is True
+
+
+def test_move_completed_keeps_records_durable() -> None:
+    """D-012 耐久性守卫：不 close 也必须把已写记录刷到盘上（``load()`` 能全量读回）。"""
+    import tempfile
+
+    from pathlib import Path
+
+    from app.core.journal import MoveJournal
+    from app.core.models import MoveOutcome
+
+    with tempfile.TemporaryDirectory() as folder:
+        journal = MoveJournal(Path(folder) / "journal-R.jsonl")
+        for src_lcn, clusters in ((10, 4), (20, 6)):
+            journal.record(
+                phase="place", path="R:\\a.bin", vcn=0,
+                src_lcn=src_lcn, dst_lcn=5000 + src_lcn, clusters=clusters, ok=True,
+            )
+        window = _window_with_journal(journal)
+        # 探针：盯住 force_fsync 有没有真的被调用（防止后人"省事式修复"——
+        # 直接把 close() 删掉而不补刷盘，那样 host 掉电时回滚清单会不完整）
+        fsync_calls = {"n": 0}
+        original_fsync = journal.force_fsync
+
+        def _spy():
+            fsync_calls["n"] += 1
+            return original_fsync()
+
+        journal.force_fsync = _spy
+
+        window._on_move_completed(MoveOutcome(moved_clusters=10, moved_files=1))
+
+        assert fsync_calls["n"] >= 1, "完成回调必须显式强制刷盘（durability 不许丢）"
+        entries = MoveJournal.load(Path(journal.path))
+        assert len(entries) == 2, f"两条流水都必须已落盘可读，实际 {len(entries)}"
+        assert all(entry.ok for entry in entries)
+        assert sorted(entry.clusters for entry in entries) == [4, 6]
+        # 「执行与恢复」面板的回滚量也来自落盘内容 —— 数字必须正确
+        assert journal.rollback_clusters() == 10
+
+        journal.close()      # 会话收尾
+
+
+def test_rollback_writer_can_continue_on_same_journal() -> None:
+    """D-012：RollbackWorker 走的**真实写入链路**（mover → journal.record）仍能写。
+
+    用 mover 的 win32 替身（不碰哪个 handle），但流水是**真的** MoveJournal。
+    """
+    import tempfile
+
+    from pathlib import Path
+
+    from app.core.journal import MoveJournal
+    from app.core.models import MoveOutcome, MoveSegment
+    from app.win32 import mover
+
+    with tempfile.TemporaryDirectory() as folder:
+        journal = MoveJournal(Path(folder) / "journal-R.jsonl")
+        journal.record(
+            phase="place", path="R:\\a.bin", vcn=0,
+            src_lcn=10, dst_lcn=5000, clusters=4, ok=True,
+        )
+        window = _window_with_journal(journal)
+        window._on_move_completed(MoveOutcome(moved_clusters=4, moved_files=1))
+
+        original_move, original_open = mover.move_clusters, mover.open_file_for_move
+        mover.move_clusters = lambda *args, **kwargs: None
+        mover.open_file_for_move = lambda path: 7
+        try:
+            outcome = mover.rollback_segments(
+                0xBEEF,
+                "R:\\a.bin",
+                [MoveSegment(vcn=0, src_lcn=5000, dst_lcn=10, clusters=4)],
+                guard=_AllowAllGuard(),
+                policy=None,
+                journal=window._journal,
+            )
+        finally:
+            mover.move_clusters = original_move
+            mover.open_file_for_move = original_open
+
+        assert outcome.failures == [], f"回滚应零失败（旧实现会在这里挂 RuntimeError）：{outcome.failures}"
+        assert outcome.moved_clusters == 4
+        assert outcome.moved_files == 1
+        written = [entry.phase for entry in MoveJournal.load(Path(journal.path))]
+        assert written == ["place", "rollback"], written
+
+        journal.close()      # 会话收尾（真实会话由 closeEvent / _release_journal 负责）
+
+
+def test_close_event_still_closes_the_journal() -> None:
+    """D-012 交叉守卫：不在完成时关了，**关窗**路径必须补上（不许把 D-006 泄漏引回来）。"""
+    import tempfile
+
+    from pathlib import Path
+
+    from PySide6.QtGui import QCloseEvent
+
+    from app.core.journal import MoveJournal
+    from app.core.models import MoveOutcome
+
+    with tempfile.TemporaryDirectory() as folder:
+        journal = MoveJournal(Path(folder) / "journal-R.jsonl")
+        journal.record(
+            phase="place", path="R:\\a.bin", vcn=0,
+            src_lcn=10, dst_lcn=5000, clusters=4, ok=True,
+        )
+        window = _window_with_journal(journal)
+        window._on_move_completed(MoveOutcome(moved_clusters=4, moved_files=1))
+        assert journal._closed is False, "完成回调只是 fsync，不应关闭句柄"
+
+        window.closeEvent(QCloseEvent())
+
+        assert journal._closed is True, "关窗必须补最后一刀（否则 D-006 句柄泄漏复辟）"
+        assert journal._handle is None
+
+
+def test_new_migration_releases_previous_journal() -> None:
+    """D-012 审计补漏：开启新一轮迁移前必须先释放上一条流水。
+
+    D-012 之后流水**不在完成时关闭**了（要留给回滚写 rollback 行），于是
+    「执行 → 完成 → 再执行一次」会丢掉一个未关闭的句柄 = D-006 泄漏复辟。
+    """
+    import inspect
+
+    import app.ui.main_window as mw
+
+    source = inspect.getsource(mw.MainWindow._start_move)
+    assert "self._release_journal()" in source, (
+        "_start_move 未释放上一条流水句柄（D-012 之后会泄漏）"
+    )
+    assert source.index("self._release_journal()") < source.index("self._journal = journal"), (
+        "必须先释放旧流水，再挂上新流水"
+    )
+
+
 if __name__ == "__main__":
     from tests._harness import exit_with
 
