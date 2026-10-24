@@ -2284,6 +2284,8 @@ class MainWindow(QMainWindow):
             self._scan_worker,
             self._index_worker,
             self._plan_worker,
+            self._stream_worker,
+            self._feasibility_worker,
         ):
             if worker is not None and worker.isRunning():
                 worker.request_cancel()

@@ -85,6 +85,20 @@ def test_worker_slots_hold_qthread_or_none() -> None:
         )
 
 
+def test_cancel_current_covers_every_worker() -> None:
+    """D-002 回归钉：``_cancel_current``（Esc 取消）的取消清单必须与 closeEvent
+    一样覆盖**所有** ``self._x_worker`` 属性，否则按 Esc 无法中止某个在跑的线程
+    （1.0.0F 实锤：曾漏 ``_stream_worker`` → 流式迁移按 Esc 无反应）。"""
+    import app.ui.main_window as mw
+
+    attrs = _worker_attributes()
+    cancel_source = inspect.getsource(mw.MainWindow._cancel_current)
+    for name in sorted(attrs):
+        assert name in cancel_source, (
+            f"_cancel_current 取消清单缺 {name}（Esc 将无法中止该线程）"
+        )
+
+
 if __name__ == "__main__":
     from tests._harness import exit_with
 
