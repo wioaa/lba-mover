@@ -138,6 +138,115 @@ def test_ledger_allocate_rejects_bad_input() -> None:
     assert ledger.take(0, 0) is False
 
 
+def _inside(run: tuple, start: int, clusters: int) -> bool:
+    """``[start, start+clusters)`` 是否完整落在 ``run`` 内。"""
+    return run[0] <= start and start + clusters <= run[1]
+
+
+# --------------------------------------------------------------------------- #
+# D-007 回归钉：allocate(near=...) 的两种越界/边界情形
+# --------------------------------------------------------------------------- #
+def test_allocate_near_beyond_total_clamps_into_highest_run() -> None:
+    """情形①：``near`` 超出卷总簇数（比所有空闲段都大）。
+
+    结论（现已 probe 验证）：实现**不需要**显式 clamp —— 三条分支里只有
+    「``end <= near`` 的最高段、段尾对齐」会命中，返回值天然落在该空闲段内。
+    本用例把这一行为钉住：不许返回 ``near`` 本身、不许越界、不许返回 None。
+    """
+    ledger = SpaceLedger([(100, 200), (500, 600)])
+    start = ledger.allocate(50, near=100_000)
+    assert start == 550, f"越界 near 应退化为最高段的段尾对齐，实际 {start}"
+    assert _inside((500, 600), start, 50), "返回值必须完整落在空闲段内"
+    assert ledger.runs() == [(100, 200), (500, 550)]
+
+    # 再分配一次：继续向低处退（仍在其空闲段内），不许越过段边界
+    second = ledger.allocate(50, near=100_000)
+    assert second == 500, second
+    assert _inside((500, 550), second, 50)
+    assert ledger.runs() == [(100, 200)]
+
+    # 剩余空间不足 → 老实返回 None（不许硬塞）
+    assert ledger.allocate(150, near=100_000) is None
+    assert ledger.allocate(100, near=100_000) == 100
+    assert ledger.free_clusters() == 0
+
+
+def test_allocate_near_beyond_total_single_run() -> None:
+    """情形①（单段版）：只有一个空闲段时也不越界；放不下就老实返回 None。"""
+    ledger = SpaceLedger([(10, 30)])
+    start = ledger.allocate(10, near=10 ** 9)
+    assert start == 20, start                       # 20 簇段的段尾对齐 = 20
+    assert _inside((10, 30), start, 10)
+    assert ledger.runs() == [(10, 20)]
+    assert ledger.free_clusters() == 10
+    # 需求大于剩余 ⇒ None（绝不返回越界起点）
+    assert ledger.allocate(15, near=10 ** 9) is None
+    assert ledger.runs() == [(10, 20)]              # 失败的分配不许改动账本
+
+
+def test_allocate_near_inside_consumed_region_never_overlaps() -> None:
+    """情形②：``near`` 落在**已分配（已消费）段内**。
+
+    结论（现已 probe 验证）：ledger 只维护空闲段，一旦某区被分出去它就从
+    ``_runs`` 里消失 ⇒ 没有任何空闲段能包含这个 ``near`` ⇒ 结果必然落在该
+    段之外。本用例把「不与已分配区相交」这条不变量钉死。
+    """
+    ledger = SpaceLedger([(0, 300)])
+    allocated: list = []
+    first = ledger.allocate(100)                    # [0, 100) 已分出去
+    assert first == 0
+    allocated.append((first, 100))
+
+    second = ledger.allocate(50, near=50)           # near 落在 [0,100) 内部
+    assert second is not None, "near 落在已分配段内仍应给出合法落点"
+    assert not _intersects((second, second + 50), (0, 100)), (
+        f"新块 [{second}, {second + 50}) 与已分配区 [0, 100) 相交"
+    )
+    assert _inside((100, 300), second, 50)
+    allocated.append((second, 50))
+
+    # near 落在**新 occupancy** 内部（ zweite allocations 之后）
+    third = ledger.allocate(50, near=allocated[1][0] + 10)
+    assert third is not None
+    for start, clusters in allocated:
+        assert not _intersects((third, third + 50), (start, start + clusters)), (
+            f"第三次分配与已分配区 [{start}, {start + clusters}) 相交"
+        )
+    assert _inside((100, 300), third, 50)
+
+
+def test_allocate_near_inside_free_run_stays_in_that_run() -> None:
+    """情形②的补集：``near`` 落在空闲段内部 ⇒ 按段首落位，仍在该段内。"""
+    ledger = SpaceLedger([(0, 400)])
+    a = ledger.allocate(100)                        # [0, 100)
+    assert a == 0
+    b = ledger.allocate(100, near=250)              # 250 在空闲段 (100,400) 内 → 段首 100
+    assert b == 100, b
+    assert _inside((100, 400), b, 100)
+    assert ledger.runs() == [(200, 400)]
+
+    c = ledger.allocate(50, near=150)               # 150 在已分配段 [100,200) 内 → 让到 200
+    assert c == 200, c
+    assert not _intersects((c, c + 50), (100, 200))
+    assert _inside((200, 400), c, 50)
+
+
+def test_allocate_near_boundaries_are_total() -> None:
+    """穷举 near 落在段边界上的情形：三条分支必须无缝衔接（不漏、不重）。"""
+    for near in (-1, 0, 100, 101, 199, 200, 201, 299, 300, 301, 10 ** 6):
+        ledger = SpaceLedger([(100, 200), (300, 400)])
+        start = ledger.allocate(50, near=near)
+        assert start is not None, f"near={near} 不应返回 None"
+        inside = _inside((100, 200), start, 50) or _inside((300, 400), start, 50)
+        assert inside, f"near={near} 的落点 {start} 不落在任何空闲段内"
+        allocated = (start, start + 50)
+        # 第二次分配同样合法，且不得与第一次相交
+        nxt = ledger.allocate(50, near=near)
+        assert nxt is None or not _intersects(allocated, (nxt, nxt + 50)), (
+            f"near={near} 的两次分配相交"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # fdd_pack：确定性 + unplaced 原因
 # --------------------------------------------------------------------------- #

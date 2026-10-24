@@ -432,6 +432,91 @@ def test_both_workers_use_the_shared_accounting_rule() -> None:
         )
 
 
+# --------------------------------------------------------------------------- #
+# D-007 回归钉：break_cycles 的中转块落点（near = window.end_lcn）
+# --------------------------------------------------------------------------- #
+def _cyclic_pair() -> list:
+    """一对互为目标/源的任务 ⇒ ``build_dependencies`` 必然成环。"""
+    return [
+        task(0, src=2000, dst=2010, clusters=10, path="R:\\a.bin"),
+        task(1, src=2010, dst=2000, clusters=10, path="R:\\b.bin"),
+    ]
+
+
+def test_relay_block_stays_outside_window_and_inside_free_run() -> None:
+    """中转空间在窗口**之后**：``allocate(near=window.end_lcn)`` 取其最低段的段首。
+
+    断言三件事：① 落在某个空闲段内；② 不与目标窗口相交；③ 账本确实被消费。
+    """
+    from app.core.models import TargetWindow
+    from app.core.packer import SpaceLedger
+
+    window = TargetWindow(1000, 1100)
+    tasks = _cyclic_pair()
+    edges = sc.build_dependencies(tasks)
+    ledger = SpaceLedger([(3000, 3100)])         # 真实管道里 = evict_space（已扣窗口）
+
+    result = sc.break_cycles(tasks, edges, ledger, window)
+    assert not result.errors, result.errors
+    relay_outs = [t for t in result.tasks if t.phase == sc.PHASE_RELAY_OUT]
+    assert relay_outs, "必须产生中转任务"
+
+    task = relay_outs[0]
+    start, clusters = task.first_dst, task.clusters
+    assert start == 3000, start
+    assert 3000 <= start and start + clusters <= 3100, "中转块必须完整落在空闲段内"
+    assert not window.overlaps(start, start + clusters), "中转块不许压进目标窗口"
+    assert ledger.free_clusters() == 90, "中转占用的空间必须从账本里扣掉"
+
+
+def test_relay_block_near_beyond_all_runs_tail_aligns_before_window() -> None:
+    """中转空间全在窗口**之前**（``near`` 超出全部空闲段）⇒ 最高段段尾对齐。
+
+    这是 D-007 描述的"``near`` 越界"在真实调用点的形态：窗口之外的空闲段
+    全部低于 ``window.end_lcn``，返回值仍须落在空闲段内且**不回落进窗口**。
+    """
+    from app.core.models import TargetWindow
+    from app.core.packer import SpaceLedger
+
+    window = TargetWindow(1000, 1100)
+    tasks = _cyclic_pair()
+    edges = sc.build_dependencies(tasks)
+    ledger = SpaceLedger([(500, 600), (700, 800)])   # 都在窗口之前（<1000）
+
+    result = sc.break_cycles(tasks, edges, ledger, window)
+    assert not result.errors, result.errors
+    relay_outs = [t for t in result.tasks if t.phase == sc.PHASE_RELAY_OUT]
+    assert relay_outs
+
+    task = relay_outs[0]
+    start, clusters = task.first_dst, task.clusters
+    assert start == 790, f"越界 near 应在最高段尾对齐，实际 {start}"
+    assert 700 <= start and start + clusters <= 800, "必须仍在空闲段内"
+    assert not window.overlaps(start, start + clusters), "不许回落进目标窗口"
+    assert ledger.runs() == [(500, 600), (700, 790)]
+
+
+def test_relay_allocation_never_double_book() -> None:
+    """连续多轮中转：每次拿到的区间必须与之前所有分配互不相交（不许重复租借）。"""
+    from app.core.models import TargetWindow
+    from app.core.packer import SpaceLedger
+
+    window = TargetWindow(1000, 1100)
+    ledger = SpaceLedger([(2000, 2200)])
+    taken: list = []
+    for _round in range(3):
+        start = ledger.allocate(10, near=window.end_lcn)
+        assert start is not None
+        span = (start, start + 10)
+        for earlier in taken:
+            assert not sc.ranges_overlap(*span, *earlier), (
+                f"中转块 {span} 与已分配 {earlier} 相交"
+            )
+        assert 2000 <= start and start + 10 <= 2200
+        assert not window.overlaps(start, start + 10)
+        taken.append(span)
+
+
 if __name__ == "__main__":
     from tests._harness import exit_with
 
