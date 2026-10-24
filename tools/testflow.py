@@ -21,7 +21,7 @@ testflow 把这些判断固化成规则，只输出**三态结论**：
 不绑定框架、不绑定语言。全部由 `.testflow.toml` 声明：
 
 - `steps`：任意命令序列（C 项目可以是 build + ctest，Python 项目就是一步 pytest）
-- `parser`：pytest / unittest / ctest / generic（generic 只看退出码）
+- `parser`：pytest / unittest / ctest / generic / tap / gotest / cargo / jest / junit
 - `watch`：参与"源码是否被改动"快照的 glob
 - `artifacts`：跑完要清理的测试产物（只删文件与空目录，越界路径直接拒绝）
 - `timeout`：单步超时
@@ -40,26 +40,60 @@ testflow 把这些判断固化成规则，只输出**三态结论**：
 报告默认写到 `.testflow/last-run.json`（并在 `history.jsonl` 追加一行摘要）。
 报告里的路径一律相对仓库根，`{python}` 会还原成占位符 —— 不要把本机用户名
 或绝对路径带进可分享的文件里。
+
+## 覆盖范围（v2 增补）
+
+单一"跑一遍单元测试"覆盖不到常见测试方案里的其他层。v2 在这个文件里补齐了
+六层，全部可选，不配就是 v1 的行为：
+
+1. **框架层**：解析器从 4 个扩到 9 个 —— pytest / unittest / ctest / generic /
+   tap / gotest / cargo / jest / junit。`junit` 读报告文件（JUnit XML），
+   覆盖 Java、.NET、Node、C++ 等"结果落在文件里"的框架。
+2. **阶段层**：步骤可以标 `required = false` 变成**审计项**（lint、类型检查、
+   复杂度扫描），失败只记录不判定；`--strict` 才把它们算进结论。
+3. **环境层**：`[preflight]` 环境自检（Python 版本、可执行文件、模块、路径、
+   环境变量），不过关就不跑测试 —— 否则一屏 red 全是同一个环境问题。
+4. **覆盖率层**：`[coverage]` 读标准覆盖率报告（coverage.py JSON、istanbul
+   JSON、Cobertura XML），按总门槛与逐文件门槛判定。
+5. **套件完整层**：`[inventory]` 用 `--collect-only` 枚举实际收集到的用例，
+   与磁盘上的测试文件对账，报出"文件在但一个用例都没被收集"的漏测。
+6. **历史层**：与上一次运行对比（新增失败 / 已修复 / 耗时漂移），
+   `--repeat N` 重复跑识别 flaky，`--junit` 输出 CI 能读的 JUnit XML。
+
+新增的 `reason`：`preflight-failed` / `coverage-below-min` / `orphan-tests` /
+`audit-failed` / `regression`。
 """
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TOOL_NAME = "testflow"
 REPORT_DIR = ".testflow"
 DEFAULT_REPORT = f"{REPORT_DIR}/last-run.json"
 HISTORY_KEEP = 200
+DEFAULT_JUNIT = f"{REPORT_DIR}/junit.xml"
+
+# 步骤默认是否"把关"：required = true 失败即判 FAIL；false 是审计项（lint /
+# 类型检查 / 复杂度扫描），失败只记录。--strict 或 profile 里 strict = true 才升级。
+STEP_REQUIRED_DEFAULT = True
+
+# 预检不过时理由；与三态判定里的 reason 保持一致口径
+REASON_PREFLIGHT = "preflight-failed"
 
 # 退出码就是结论，调用方不必再解析文本
 EXIT_PASS = 0
@@ -100,6 +134,29 @@ def register_parser(
 
 def parser_names() -> tuple[str, ...]:
     return tuple(PARSER_FUNCS)
+
+
+# 文件型解析器：有的框架不往 stdout 打结果，而是写一份标准报告文件
+# （JUnit XML、TRX、ctest XML）。这类解析器签名不同 —— 读文件，不是读文本：
+#
+#   [[profiles.default.steps]]
+#   name = "junit"
+#   command = ["{python}", "-m", "pytest", "--junitxml=build/junit.xml"]
+#   parser = "junit"
+#   report = "build/junit.xml"
+#
+# 报告文件缺失时按环境问题处理：有报告格式约定却没产出报告，通常是命令写错。
+PARSER_FILE_FUNCS: dict[str, Any] = {}
+
+
+def register_file_parser(name: str, func: Any) -> Any:
+    """登记一个读报告文件的解析器：``func(path) -> (Counts, [(用例名, 消息)])``。"""
+    PARSER_FILE_FUNCS[str(name)] = func
+    return func
+
+
+def file_parser_names() -> tuple[str, ...]:
+    return tuple(PARSER_FILE_FUNCS)
 
 # 每类失败对应的下一步动作。写在这里而不是让调用方自己猜
 NEXT_HINT = {
@@ -174,6 +231,7 @@ class StepResult:
     output: str = ""                   # 原始输出（只在内存里，报告只留尾部）
     counts: Counts = field(default_factory=Counts)
     failures: list[Failure] = field(default_factory=list)
+    required: bool = True              # 审计项（lint / 类型检查）为 False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -183,8 +241,62 @@ class StepResult:
             "exit_code": self.exit_code,
             "duration_s": round(self.duration_s, 2),
             "timed_out": self.timed_out,
+            "required": self.required,
             "counts": self.counts.to_dict(),
             "failures": [f.to_dict() for f in self.failures],
+        }
+
+
+@dataclass
+class CheckResult:
+    """一条预检结果。环境不对就先拦下，别让后面的失败看起来像代码问题。"""
+
+    name: str
+    ok: bool
+    kind: str = "env"
+    detail: str = ""
+    next: str = ""
+    required: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "ok": self.ok,
+            "kind": self.kind,
+            "detail": self.detail,
+            "next": self.next or NEXT_HINT.get(self.kind, ""),
+            "required": self.required,
+        }
+
+
+@dataclass
+class CoverageResult:
+    """从标准覆盖率报告里读到的数字。
+
+    生成报告是项目自己那一步的事（coverage run / jest --coverage / coverlet），
+    这里只负责按门槛判定 —— 否则工具就得内置一堆语言生态。
+    """
+
+    percent: float = 0.0
+    covered: int = 0
+    total: int = 0
+    report: str = ""
+    min_percent: float = 0.0
+    below: list[str] = field(default_factory=list)   # 低于逐文件门槛的文件
+
+    @property
+    def ok(self) -> bool:
+        return not self.below and self.percent >= self.min_percent
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "percent": round(self.percent, 2),
+            "covered_lines": self.covered,
+            "total_lines": self.total,
+            "min_percent": self.min_percent,
+            "ok": self.ok,
+            "below": list(self.below),
+            "report": self.report,
         }
 
 
@@ -249,11 +361,43 @@ def get_profile(cfg: dict, name: str) -> dict:
         if not isinstance(step, dict) or not step.get("command"):
             raise ConfigError(f"profile「{name}」第 {idx + 1} 个步骤缺少 command")
         parser = step.get("parser", "generic")
-        if parser not in PARSER_FUNCS:
+        known = parser in PARSER_FUNCS or parser in PARSER_FILE_FUNCS
+        if not known:
+            all_names = ", ".join(parser_names() + file_parser_names())
             raise ConfigError(
                 f"profile「{name}」第 {idx + 1} 个步骤 parser 不认识: {parser}"
-                f"（可用 {', '.join(parser_names())}；新增语言见 tools/TESTFLOW.md）"
+                f"（可用 {all_names}；新增语言见 tools/TESTFLOW.md）"
             )
+        if parser in PARSER_FILE_FUNCS and not (step.get("report") or step.get("junit")):
+            raise ConfigError(
+                f"profile「{name}」第 {idx + 1} 个步骤用了文件型解析器 {parser}，"
+                "但没有给 report（报告文件路径）"
+            )
+
+    preflight = profile.get("preflight")
+    if preflight is not None:
+        checks = preflight.get("checks") if isinstance(preflight, dict) else preflight
+        if not isinstance(checks, list) or not checks:
+            raise ConfigError(
+                f"profile「{name}」的 [preflight] 需要 checks 列表"
+                "（可以写成 preflight = [...] 或 [preflight.checks] ...）"
+            )
+        for idx, check in enumerate(checks):
+            if not isinstance(check, dict) or not check.get("type"):
+                raise ConfigError(f"profile「{name}」preflight 第 {idx + 1} 项缺少 type")
+
+    coverage = profile.get("coverage")
+    if coverage is not None:
+        if not isinstance(coverage, dict):
+            raise ConfigError(f"profile「{name}」的 [coverage] 必须是表")
+        try:
+            float(coverage.get("min", 0))
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"profile「{name}」coverage.min 不是数字") from exc
+
+    inventory = profile.get("inventory")
+    if inventory is not None and not isinstance(inventory, dict):
+        raise ConfigError(f"profile「{name}」的 [inventory] 必须是表")
     return profile
 
 
@@ -419,14 +563,173 @@ def parse_generic(text: str, exit_code: int) -> tuple[Counts, list[tuple[str, st
     return Counts(), []
 
 
+# ---- TAP（node --test、prove、bats、shell 的通用输出格式）----
+_TAP_ITEM = re.compile(
+    r"^(ok|not ok)\b\s*(\d+)?\s*(?:-\s*)?(.*?)(?:\s+#\s*(SKIP|TODO)\b.*)?$", re.I
+)
+
+
+def parse_tap(text: str, exit_code: int) -> tuple[Counts, list[tuple[str, str]]]:
+    """TAP 12/13/14：``ok 1 - name`` / ``not ok 2 - name # TODO``。
+
+    ``# TODO`` 按规范不算失败（已知问题），归到 skipped —— 否则老项目永远是红的。
+    """
+    counts = Counts()
+    items: list[tuple[str, str]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _TAP_ITEM.match(line)
+        if not match:
+            continue
+        mark, _num = match.group(1), match.group(2)
+        name = (match.group(3) or "").strip() or "<unnamed>"
+        directive = (match.group(4) or "").upper()
+        if directive:
+            counts.skipped += 1
+        elif mark.lower() == "ok":
+            counts.passed += 1
+        else:
+            counts.failed += 1
+            items.append((name, "not ok"))
+    return counts, items
+
+
+# ---- Go：go test -v 的 --- PASS/FAIL/SKIP 行，或 -json 之外的包级结论 ----
+_GO_ITEM = re.compile(r"^\s*--- (PASS|FAIL|SKIP): (\S+)", re.M)
+_GO_PKG = re.compile(r"^(ok|FAIL)\s+(\S+)\s+[\d.]+s", re.M)
+
+
+def parse_gotest(text: str, exit_code: int) -> tuple[Counts, list[tuple[str, str]]]:
+    counts = Counts()
+    items: list[tuple[str, str]] = []
+    for match in _GO_ITEM.finditer(text):
+        status, name = match.group(1), match.group(2)
+        if status == "PASS":
+            counts.passed += 1
+        elif status == "SKIP":
+            counts.skipped += 1
+        else:
+            counts.failed += 1
+            items.append((name, "go test: FAIL"))
+    if counts.total == 0:
+        # 没加 -v 时只剩包级结论：至少把失败的包报出来，别让调用方去翻输出
+        for match in _GO_PKG.finditer(text):
+            if match.group(1) == "FAIL":
+                items.append((match.group(2), "go test: 包内有用例失败（加 -v 看具体用例）"))
+        counts.failed = len(items)
+    return counts, items
+
+
+# ---- Rust：cargo test 的 test result 行 + failures: 区块 ----
+_CARGO_RESULT = re.compile(
+    r"test result: (\w+)\.\s+(\d+) passed;\s+(\d+) failed;\s+(\d+) ignored"
+)
+
+
+def parse_cargo(text: str, exit_code: int) -> tuple[Counts, list[tuple[str, str]]]:
+    counts = Counts()
+    last = None
+    for match in _CARGO_RESULT.finditer(text):
+        last = match  # 多个测试目标会各打一行；取最后一行（汇总行在最后）
+    if last:
+        counts.passed = int(last.group(2))
+        counts.failed = int(last.group(3))
+        counts.skipped = int(last.group(4))
+
+    items: list[tuple[str, str]] = []
+    in_block = False
+    for raw in text.splitlines():
+        if raw.strip() == "failures:":
+            in_block = True
+            continue
+        if in_block:
+            if not raw.strip():
+                in_block = False
+                continue
+            items.append((raw.strip(), "cargo test: FAILED"))
+    return counts, items
+
+
+# ---- Jest / Vitest：``Tests: 1 failed, 2 passed, 3 total`` ----
+_JEST_SUMMARY = re.compile(r"^Tests:\s+(.*)$", re.M)
+_JEST_ITEM = re.compile(r"^\s*(?:✕|×|●)\s+(.+?)(?:\s+\(\d+(?:\.\d+)?\s*m?s\))?\s*$")
+
+
+def parse_jest(text: str, exit_code: int) -> tuple[Counts, list[tuple[str, str]]]:
+    counts = Counts()
+    items: list[tuple[str, str]] = []
+    for raw in text.splitlines():
+        match = _JEST_ITEM.match(raw)
+        if match:
+            items.append((match.group(1).strip(), "jest: FAILED"))
+    summary = _JEST_SUMMARY.search(text)
+    if summary:
+        for part in summary.group(1).split(","):
+            match = re.match(r"(\d+)\s+(failed|passed|skipped|todo|total)", part.strip())
+            if not match:
+                continue
+            value, key = int(match.group(1)), match.group(2)
+            if key == "failed":
+                counts.failed = value
+            elif key == "passed":
+                counts.passed = value
+            elif key in ("skipped", "todo"):
+                counts.skipped += value
+    return counts, items
+
+
+# ---- JUnit XML（文件型）：pytest --junitxml / NUnit / jest-junit / ctest ----
+
+
+def parse_junit_file(path: Path) -> tuple[Counts, list[tuple[str, str]]]:
+    """读标准的 JUnit XML。这是跨语言覆盖率最广的一种"结果落文件"格式。"""
+    counts = Counts()
+    items: list[tuple[str, str]] = []
+    root = ET.parse(str(path)).getroot()
+    for case in root.iter("testcase"):
+        classname = case.get("classname") or ""
+        name = case.get("name") or "<unnamed>"
+        test_id = f"{classname}::{name}" if classname else name
+        failure = case.find("failure")
+        error = case.find("error")
+        skipped = case.find("skipped")
+        if failure is not None:
+            counts.failed += 1
+            message = (failure.get("message") or failure.text or "failure").strip()
+            items.append((test_id, message[:500]))
+        elif error is not None:
+            counts.errors += 1
+            message = (error.get("message") or error.text or "error").strip()
+            items.append((test_id, message[:500]))
+        elif skipped is not None:
+            counts.skipped += 1
+        else:
+            counts.passed += 1
+    return counts, items
+
+
 # 内置解析器注册。generic 必须始终存在 —— run_step 在遇到未注册名字时拿它兜底
-for _name, _func in (
-    ("pytest", parse_pytest),
-    ("unittest", parse_unittest),
-    ("ctest", parse_ctest),
-    ("generic", parse_generic),
+for _name, _func, _kind_rules in (
+    ("pytest", parse_pytest, None),
+    ("unittest", parse_unittest, None),
+    ("ctest", parse_ctest, None),
+    ("generic", parse_generic, None),
+    ("tap", parse_tap, None),
+    ("gotest", parse_gotest, [
+        ("code", re.compile(r"panic: ")),
+        ("code", re.compile(r"^\s*\S+\.go:\d+:\d+:", re.M)),
+    ]),
+    ("cargo", parse_cargo, [
+        ("code", re.compile(r"panicked at")),
+        ("code", re.compile(r"^error\[E\d+\]", re.M)),
+    ]),
+    ("jest", parse_jest, None),
 ):
-    register_parser(_name, _func)
+    register_parser(_name, _func, kind_rules=_kind_rules)
+
+register_file_parser("junit", parse_junit_file)
 
 # pytest 的非 0 退出码里有些不是"用例失败"，直接翻译成一句话，省得再查文档
 _PYTEST_EXIT_NOTE = {
@@ -512,8 +815,11 @@ def _decode(data: Optional[bytes]) -> str:
 def run_step(
     step: dict, root: Path, timeout: float, extra: Sequence[str]
 ) -> StepResult:
-    name = str(step.get("name") or step.get("command")[0])
+    name = str(step.get("name") or step["command"][0])
     parser = step.get("parser", "generic")
+    required = bool(step.get("required", STEP_REQUIRED_DEFAULT))
+    # 单步超时可以覆盖 profile 级：一个慢的集成测试不该把整条流水线的超时顶宽
+    limit = float(step.get("timeout") or timeout or 0)
     env = dict(os.environ)
     env.update({str(k): str(v) for k, v in (step.get("env") or {}).items()})
 
@@ -526,6 +832,7 @@ def run_step(
         command=sanitize_command(command, root),
         parser=parser,
         exit_code=0,
+        required=required,
     )
     started = time.monotonic()
     try:
@@ -535,7 +842,7 @@ def run_step(
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            timeout=timeout or None,
+            timeout=limit or None,
         )
         output = _decode(proc.stdout)
         result.exit_code = proc.returncode
@@ -543,7 +850,7 @@ def run_step(
         result.timed_out = True
         result.exit_code = -9
         output = _decode(exc.stdout) + _decode(exc.stderr)
-        output += f"\n[testflow] 步骤「{name}」超过 {timeout:.0f}s 未结束，已中断"
+        output += f"\n[testflow] 步骤「{name}」超过 {limit:.0f}s 未结束，已中断"
     except FileNotFoundError:
         result.exit_code = 127
         output = f"[testflow] 找不到命令: {command[0]}"
@@ -553,7 +860,33 @@ def run_step(
     result.duration_s = time.monotonic() - started
     result.output = output
 
-    counts, items = (PARSER_FUNCS.get(parser) or parse_generic)(output, result.exit_code)
+    # 结果解析：文本型读 stdout，文件型读报告文件（JUnit XML 等）
+    counts, items = Counts(), []
+    file_func = PARSER_FILE_FUNCS.get(parser)
+    report_rel = step.get("report") or step.get("junit")
+    if file_func and report_rel:
+        report_path = Path(str(report_rel))
+        if not report_path.is_absolute():
+            report_path = root / report_path
+        if report_path.is_file():
+            try:
+                counts, items = file_func(report_path)
+            except (ET.ParseError, OSError, ValueError) as exc:
+                result.exit_code = result.exit_code or 1
+                result.failures.append(
+                    Failure(step=name, test="<report>", kind="unknown",
+                            message=f"测试报告解析失败: {exc}"[:500])
+                )
+        else:
+            # 约定了报告格式却没产出报告：多半是命令参数写错（如漏了 --junitxml）
+            result.exit_code = result.exit_code or 1
+            result.failures.append(
+                Failure(step=name, test="<report>", kind="env",
+                        message=f"未生成测试报告文件: {report_rel}")
+            )
+    else:
+        counts, items = (PARSER_FUNCS.get(parser) or parse_generic)(output, result.exit_code)
+
     result.counts = counts
     for test_id, message in items:
         blob = f"{test_id}\n{message}"
@@ -565,7 +898,7 @@ def run_step(
     if result.exit_code != 0 and not result.failures:
         if result.timed_out:
             kind = "timeout"
-            message = f"步骤「{name}」超过 {timeout:.0f}s 未结束"
+            message = f"步骤「{name}」超过 {limit:.0f}s 未结束"
         elif result.exit_code in (126, 127):
             kind = "env"
             message = f"命令无法执行（找不到可执行文件或没有权限）: {command[0]}"
@@ -578,7 +911,8 @@ def run_step(
                 else f"退出码 {result.exit_code}，解析器 {parser} 未能定位具体用例"
             )
         result.failures.append(
-            Failure(step=name, test="<command>", kind=kind, message=message)
+            # 用步骤名当标识：报告里一眼看出是哪一步挂了，基线对比也不会串味
+            Failure(step=name, test=name, kind=kind, message=message)
         )
     return result
 
@@ -602,6 +936,320 @@ def clean_artifacts(root: Path, rels: Iterable[str]) -> list[str]:
         except OSError:
             continue
     return removed
+
+
+# ---------------------------------------------------------------- 预检 / 覆盖率 / 清单 / 基线
+#
+# 这四层是"常见测试方案"里 testflow v1 没覆盖的部分：环境没自检、覆盖率没门槛、
+# 套件有没有被完整收集没人管、跟上一轮比是变好还是变坏也没人算。
+
+
+def _rel(root: Path, path: Path) -> str:
+    """能相对就相对 —— 报告可能被贴进 issue，别带本机绝对路径。"""
+    try:
+        return str(path.resolve().relative_to(root.resolve())).replace("\\", "/")
+    except (ValueError, OSError):
+        return path.name
+
+
+def _version_tuple(text: str) -> tuple[int, ...]:
+    parts = re.findall(r"\d+", str(text) or "")[:3]
+    return tuple(int(p) for p in parts) if parts else (0,)
+
+
+def run_preflight(preflight: Optional[dict], root: Path, env: dict) -> list[CheckResult]:
+    """跑 ``[preflight]`` 里的环境自检。类型：python / exe / module / path / env。
+
+    预检不过就不该跑测试 —— 环境不对时一屏 red 全是同一个原因，白等。
+    """
+    if not preflight:
+        return []
+    # 兼容两种写法：[preflight] 直接给数组，或 [preflight.checks] 数组
+    checks = preflight.get("checks") if isinstance(preflight, dict) else preflight
+    results: list[CheckResult] = []
+    for check in checks or []:
+        if not isinstance(check, dict):
+            continue
+        kind = str(check.get("type") or "").lower()
+        name = str(check.get("name") or check.get("value") or kind)
+        if kind == "python":
+            minimum = str(check.get("min") or check.get("min_version") or "3.8")
+            current = "%d.%d.%d" % sys.version_info[:3]
+            ok = _version_tuple(current) >= _version_tuple(minimum)
+            results.append(CheckResult(
+                name, ok, "env", f"Python {current}（要求 >= {minimum}）",
+                "" if ok else f"换解释器，或把 min 改成不大于 {current} 的版本",
+            ))
+        elif kind == "exe":
+            target = str(check.get("value") or check.get("target") or check.get("name") or "")
+            found = shutil.which(target, path=env.get("PATH"))
+            detail = f"PATH 里{'找到' if found else '找不到'} {Path(found).name if found else target}"
+            results.append(CheckResult(
+                name, bool(found), "env", detail,
+                "" if found else f"安装 {target} 或把它加进 PATH 后重跑",
+            ))
+        elif kind == "module":
+            target = str(check.get("value") or check.get("target") or check.get("name") or "")
+            found = importlib.util.find_spec(target) is not None if target else False
+            results.append(CheckResult(
+                name, found, "env", f"模块 {'已安装' if found else '缺失'}: {target}",
+                "" if found else f"补依赖：pip install 对应包（{target}）",
+            ))
+        elif kind == "path":
+            target = str(check.get("value") or "")
+            exists = bool(target) and (root / target).exists()
+            results.append(CheckResult(
+                name, exists, "env", f"路径{'存在' if exists else '不存在'}: {target}",
+                "" if exists else f"准备 {target}，或把它从 [preflight] 里去掉",
+            ))
+        elif kind == "env":
+            target = str(check.get("value") or check.get("target") or check.get("name") or "")
+            present = bool(env.get(target))
+            results.append(CheckResult(
+                name, present, "env",
+                f"环境变量 {'已设置' if present else '未设置'}: {target}",
+                "" if present else f"设置环境变量 {target} 后重跑",
+            ))
+        else:
+            results.append(CheckResult(name, False, "env", f"未知的检查类型: {kind}",
+                                       "type 只支持 python / exe / module / path / env"))
+    # 把 required 从配置搬到结果上（顺序与有效 check 一一对应）
+    flags = [bool(c.get("required", True)) for c in (checks or []) if isinstance(c, dict)]
+    for result, flag in zip(results, flags):
+        result.required = flag
+    return results
+
+
+def parse_coverage_report(path: Path) -> Optional[CoverageResult]:
+    """识别三种最通用的覆盖率报告格式，别把工具绑死在某一个语言生态里。
+
+    - coverage.py ``coverage json``：``totals.percent_covered``
+    - istanbul ``json-summary``：``total.lines.pct``
+    - Cobertura XML（C# / Java / pytest-cov 都能出）：``line-rate``
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        totals = data.get("totals") or {}
+        if "percent_covered" in totals:
+            return CoverageResult(
+                percent=float(totals.get("percent_covered") or 0),
+                covered=int(totals.get("covered_lines") or 0),
+                total=int(totals.get("num_statements") or 0),
+            )
+        lines = (data.get("total") or {}).get("lines") or {}
+        if "pct" in lines:
+            return CoverageResult(
+                percent=float(lines.get("pct") or 0),
+                covered=int(lines.get("covered") or 0),
+                total=int(lines.get("total") or 0),
+            )
+        return None
+    if suffix == ".xml":
+        try:
+            root = ET.parse(str(path)).getroot()
+        except (ET.ParseError, OSError):
+            return None
+        rate = root.get("line-rate")
+        if rate is not None:
+            try:
+                return CoverageResult(percent=float(rate) * 100.0)
+            except ValueError:
+                return None
+        valid, covered = root.get("lines-valid"), root.get("lines-covered")
+        if valid and covered:
+            try:
+                return CoverageResult(
+                    percent=100.0 * float(covered) / float(valid),
+                    covered=int(covered),
+                    total=int(valid),
+                )
+            except (ValueError, ZeroDivisionError):
+                return None
+    return None
+
+
+def check_coverage(cfg: dict, root: Path) -> Optional[CoverageResult]:
+    """按 ``[coverage]`` 的门槛判定。报告不存在就返回 None（不制造假失败）。"""
+    rel = str(cfg.get("report") or cfg.get("file") or cfg.get("path") or "coverage.xml")
+    path = Path(rel)
+    if not path.is_absolute():
+        path = root / path
+    if not path.is_file():
+        return None
+    result = parse_coverage_report(path)
+    if result is None:
+        return None
+    result.report = _rel(root, path)
+    result.min_percent = float(cfg.get("min", 0) or 0)
+
+    floors = cfg.get("files") or {}
+    if floors and path.suffix.lower() == ".json":
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        for filename, stats in (data.get("files") or {}).items():
+            achieved = ((stats or {}).get("summary") or {}).get("percent_covered")
+            if achieved is None:
+                continue
+            for prefix, floor in floors.items():
+                if str(filename).replace("\\", "/").startswith(str(prefix).replace("\\", "/")):
+                    if float(achieved) < float(floor):
+                        result.below.append(
+                            f"{filename}: {float(achieved):.1f}% < {float(floor):g}%"
+                        )
+    return result
+
+
+_COLLECT_MODULE = re.compile(r"^<Module\s+(.+?)>$")
+_COLLECT_CASE = re.compile(r"^<(?:Function|TestCaseFunction|Coroutine|Method|UnitTestCase)\b")
+
+
+def run_inventory(cfg: dict, root: Path, env: dict, timeout: float) -> Optional[dict]:
+    """枚举实际被收集到的用例，与磁盘上的测试文件对账。
+
+    "文件在、但一个用例都没被收集"是最典型的静默漏测：文件名不匹配
+    ``test_*.py``、类名不以 ``Test`` 开头、被 conftest 跳过。
+    """
+    if not cfg:
+        return None
+    # -o addopts= 把项目自己的 addopts 清掉：不然项目里的 ``-v`` 会让 --collect-only
+    # 输出成树状（<Module>/<TestCaseFunction>），条目一多就没法按 :: 解析
+    command = cfg.get("command") or [
+        sys.executable, "-m", "pytest", "--collect-only", "-q", "-o", "addopts=",
+    ]
+    command = expand_command(command, root, env)
+    result: dict[str, Any] = {
+        "command": sanitize_command(command, root),
+        "collected": 0,
+        "files": 0,
+        "orphans": [],
+        "ok": True,
+        "detail": "",
+    }
+    started = time.monotonic()
+    limit = float(cfg.get("timeout") or timeout or 0)
+    try:
+        proc = subprocess.run(
+            command, cwd=str(root), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=limit or None,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        result.update(ok=False, detail=f"收集命令执行失败: {exc}")
+        return result
+    result["exit_code"] = proc.returncode
+    result["duration_s"] = round(time.monotonic() - started, 2)
+    output = _decode(proc.stdout)
+
+    globs = cfg.get("globs") or ["tests/test_*.py", "tests/**/test_*.py"]
+    disk: set[str] = set()
+    for pattern in globs:
+        for path in root.glob(str(pattern)):
+            if path.is_file():
+                disk.add(_rel(root, path))
+    by_name: dict[str, str] = {}
+    for rel_path in disk:
+        by_name.setdefault(rel_path.rsplit("/", 1)[-1], rel_path)
+
+    collected_files: set[str] = set()
+    collected = 0
+    current_module = ""
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line or line.startswith(("=", "-", "!", "#")):
+            continue
+        module = _COLLECT_MODULE.match(line)
+        if module:
+            current_module = module.group(1).strip()
+            continue
+        if not line.startswith("<") and "::" in line:
+            filename = line.split("::", 1)[0].strip().replace("\\", "/")
+            if filename:
+                collected_files.add(filename)
+                collected += 1
+            continue
+        if _COLLECT_CASE.match(line) and current_module:
+            # 树状输出只有文件名，用基名回查磁盘上的相对路径
+            collected_files.add(by_name.get(Path(current_module).name, current_module))
+            collected += 1
+    result["collected"] = collected
+    result["files"] = len(disk)
+    result["orphans"] = sorted(p for p in disk if p not in collected_files)
+    if collected == 0:
+        result.update(ok=False, detail="收集命令没有报出任何用例（命令写错，或套件为空）")
+    return result
+
+
+def load_baseline(root: Path, report_path: str) -> Optional[dict]:
+    """上一轮的报告就是最自然的基线，不用另存一份。"""
+    path = Path(report_path)
+    if not path.is_absolute():
+        path = root / path
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def compare_baseline(previous: dict, failures: Sequence[dict], duration: float) -> dict:
+    """和上一轮比：新增失败 / 已修复 / 耗时漂移。这就是"回归测试"的判定依据。"""
+    prev_ids = {str(item.get("test")) for item in (previous.get("failures") or [])}
+    cur_ids = {str(item.get("test")) for item in failures}
+    prev_duration = float(previous.get("duration_s") or 0)
+    delta = ((duration - prev_duration) / prev_duration * 100.0) if prev_duration else 0.0
+    return {
+        "previous_verdict": previous.get("verdict"),
+        "previous_at": previous.get("started_at"),
+        "new_failures": sorted(cur_ids - prev_ids),
+        "fixed": sorted(prev_ids - cur_ids),
+        "duration_delta_pct": round(delta, 1),
+    }
+
+
+def write_junit(root: Path, rel: str, report: dict) -> Path:
+    """把结论写成 JUnit XML —— CI（Actions / Jenkins / GitLab）都能直接渲染。"""
+    path = Path(rel)
+    if not path.is_absolute():
+        path = root / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    counts = report.get("counts") or {}
+    project = str(report.get("project") or "testflow")
+    profile = str(report.get("profile") or "default")
+    suites = ET.Element("testsuites", {"name": project})
+    suite = ET.SubElement(suites, "testsuite", {
+        "name": f"{project}/{profile}",
+        "tests": str(report.get("planned_steps") or len(report.get("steps") or [])),
+        "failures": str(int(counts.get("failed", 0)) + int(counts.get("errors", 0))),
+        "skipped": str(int(counts.get("skipped", 0))),
+        "time": str(report.get("duration_s") or 0),
+    })
+    for step in report.get("steps") or []:
+        case = ET.SubElement(suite, "testcase", {
+            "classname": f"{project}/{profile}",
+            "name": str(step.get("name")),
+            "time": str(step.get("duration_s") or 0),
+        })
+        if step.get("exit_code"):
+            details = step.get("failures") or []
+            failure = ET.SubElement(case, "failure", {
+                "message": str((details[0] if details else {}).get("message", "step failed"))[:300],
+            })
+            failure.text = "\n".join(
+                f"[{item.get('kind')}] {item.get('test')}: {item.get('message')}"
+                for item in details
+            )
+    ET.ElementTree(suites).write(str(path), encoding="utf-8", xml_declaration=True)
+    return path
+
+
+def failed_ids(results: Sequence[StepResult]) -> set[str]:
+    return {failure.test for result in results for failure in result.failures}
 
 
 # ---------------------------------------------------------------- 结论
@@ -725,6 +1373,53 @@ def print_human(report: dict, results: Sequence[StepResult], show_output: bool) 
             for line in tail(result.output, 1500).splitlines():
                 print(f"      {line}")
 
+    preflight = report.get("preflight") or []
+    if preflight:
+        bad = [check for check in preflight if not check["ok"]]
+        print(f"预检：{len(preflight) - len(bad)}/{len(preflight)} 通过")
+        for check in bad:
+            flag = "" if check.get("required", True) else "（可选，不影响结论）"
+            print(f"  · [{check['kind']}] {check['name']}{flag} — {check['detail']}")
+            print(f"    -> {check['next']}")
+    audits = report.get("audits") or []
+    if audits:
+        print(f"审计项（默认不计入结论，--strict 才算）：{len(audits)} 项未通过")
+        for audit in audits:
+            print(f"  · {audit['name']}  exit={audit['exit_code']}")
+    coverage = report.get("coverage")
+    if coverage:
+        state = "达标" if coverage["ok"] else "不达标"
+        print(
+            f"覆盖率：{coverage['percent']:.1f}%"
+            f"（门槛 {coverage['min_percent']:g}%，{state}）"
+        )
+        for item in (coverage.get("below") or [])[:5]:
+            print(f"  · {item}")
+    inventory = report.get("inventory")
+    if inventory:
+        print(
+            f"套件清单：磁盘 {inventory.get('files', 0)} 个测试文件"
+            f" / 收集到 {inventory.get('collected', 0)} 个用例"
+        )
+        orphans = inventory.get("orphans") or []
+        if orphans:
+            print(f"  ! 有测试文件但没收集到用例：{', '.join(orphans[:8])}")
+        if not inventory.get("ok", True) and inventory.get("detail"):
+            print(f"  ! {inventory['detail']}")
+    baseline = report.get("baseline")
+    if baseline:
+        print(
+            f"与上一轮（{baseline.get('previous_verdict')}）比："
+            f"新增失败 {len(baseline.get('new_failures') or [])}"
+            f" / 已修复 {len(baseline.get('fixed') or [])}"
+            f" / 耗时 {(baseline.get('duration_delta_pct') or 0):+.1f}%"
+        )
+        for item in (baseline.get("new_failures") or [])[:5]:
+            print(f"  · 新失败 {item}")
+    flaky = report.get("flaky") or []
+    if flaky:
+        print(f"flaky（重复跑中时好时坏）：{', '.join(flaky[:8])}")
+
     if report["source_changed"]:
         print("!" * 64)
         print("运行期间这些文件被改动，结论不可信：")
@@ -764,7 +1459,20 @@ def command_for_rerun(argv: Sequence[str], profile: str, root: Path) -> str:
     parts = ["python", entry]
     if profile != "default":
         parts += ["--profile", profile]
-    extras = [a for a in argv if a not in ("--json", "--quiet", "--no-clean", "--show-output")]
+    # --profile 已经由上面按最终生效的 profile 拼好了，原样保留会重复一遍
+    extras: list[str] = []
+    skip_next = False
+    for arg in argv:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--profile":
+            skip_next = True
+            continue
+        if arg in ("--json", "--quiet", "--no-clean", "--show-output",
+                   "--strict", "--no-baseline", "--fail-on-regression"):
+            continue
+        extras.append(arg)
     return " ".join(_quote(p) for p in parts + extras).strip()
 
 
@@ -782,6 +1490,20 @@ def parse_args(argv: Sequence[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--quiet", action="store_true", help="只输出一行结论")
     parser.add_argument("--no-clean", action="store_true", help="不清理测试产物")
     parser.add_argument("--show-output", action="store_true", help="失败时打印输出尾部")
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="审计项（required=false）失败、漏测、覆盖率不达标也判 FAIL",
+    )
+    parser.add_argument(
+        "--repeat", type=int, default=None,
+        help="整条流水线重复跑 N 次，用来识别 flaky（时好时坏的用例）",
+    )
+    parser.add_argument("--junit", default=None, help="额外写一份 JUnit XML（给 CI 用）")
+    parser.add_argument("--no-baseline", action="store_true", help="不与上一轮报告对比")
+    parser.add_argument(
+        "--fail-on-regression", action="store_true",
+        help="与上一轮比出现新增失败即判 FAIL（其余情况只记录）",
+    )
     args, extra = parser.parse_known_args(list(argv))
     return args, extra
 
@@ -804,31 +1526,113 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     watch: list[str] = list(profile.get("watch") or [])
     artifacts: list[str] = list(profile.get("artifacts") or [])
     timeout = args.timeout if args.timeout is not None else float(profile.get("timeout", 900))
+    strict = bool(args.strict or profile.get("strict"))
+    repeat = max(1, int(args.repeat or profile.get("repeat") or 1))
+    env = dict(os.environ)
 
     # 额外参数透传给最后一个步骤（通常是测试本身，而不是 build）
     if extra and steps:
         steps[-1] = {**steps[-1], "passthrough": True}
 
     started_at = datetime.now().astimezone().isoformat(timespec="seconds")
-    before = snapshot(root, watch)
     started = time.monotonic()
 
-    results: list[StepResult] = []
-    for step in steps:
-        result = run_step(step, root, timeout, extra)
-        results.append(result)
-        # 前置步骤失败就不再往后跑：build 挂了还去 ctest 只会多一屏噪音
-        if result.exit_code != 0 and step.get("fail_fast", True):
-            break
-    duration = time.monotonic() - started
+    # 1) 环境预检：不过关就不跑测试，否则一屏 red 全是同一个原因，白等
+    preflight = run_preflight(profile.get("preflight"), root, env)
+    preflight_failed = [check for check in preflight if not check.ok and check.required]
 
-    changed = diff_snapshots(before, snapshot(root, watch))
-    verdict, reason = decide_verdict(results, changed, len(steps))
+    # 2) 跑步骤。--repeat 时整条流水线重复 N 次，用来识别 flaky
+    runs: list[list[StepResult]] = []
+    changed_all: list[str] = []
+    if not preflight_failed:
+        for _round in range(repeat):
+            before = snapshot(root, watch)
+            round_results: list[StepResult] = []
+            for step in steps:
+                result = run_step(step, root, timeout, extra)
+                round_results.append(result)
+                # 前置步骤失败就不再往后跑：build 挂了还去 ctest 只会多一屏噪音。
+                # 审计项默认不拦后续步骤 —— lint 红不该挡单元测试。
+                should_stop = step.get("fail_fast", result.required)
+                if result.exit_code != 0 and should_stop:
+                    break
+            runs.append(round_results)
+            changed_all += diff_snapshots(before, snapshot(root, watch))
+
+    # 多轮里取"最差的一轮"当主结果：重复跑的意义就是把偶发失败暴露出来
+    primary: list[StepResult] = (
+        max(runs, key=lambda items: sum(1 for r in items if r.exit_code != 0)) if runs else []
+    )
+    changed = sorted(set(changed_all))
+    planned_required = sum(
+        1 for step in steps if bool(step.get("required", STEP_REQUIRED_DEFAULT))
+    )
+
+    def gate(items: Sequence[StepResult]) -> list[StepResult]:
+        return [r for r in items if r.required]
+
+    if preflight_failed:
+        verdict, reason = "FAIL", REASON_PREFLIGHT
+    else:
+        verdict, reason = decide_verdict(gate(primary), changed, planned_required)
 
     total = Counts()
-    for result in results:
+    for result in primary:
         total.add(result.counts)
-    failures = [f.to_dict() for result in results for f in result.failures]
+    failures = [f.to_dict() for result in primary for f in result.failures]
+
+    # 审计项（required = false）：默认只记录，--strict 时才计入结论
+    audits = [r for r in primary if not r.required and r.exit_code != 0]
+    if audits and verdict == "PASS" and strict:
+        verdict, reason = "FAIL", "audit-failed"
+
+    # 3) 覆盖率门槛（读项目自己产出的标准报告，不替项目跑覆盖率工具）
+    coverage = None
+    coverage_cfg = profile.get("coverage")
+    if coverage_cfg and not preflight_failed:
+        coverage = check_coverage(coverage_cfg, root)
+        if coverage is not None and not coverage.ok and verdict == "PASS":
+            if bool(coverage_cfg.get("required", True)):
+                verdict, reason = "FAIL", "coverage-below-min"
+
+    # 4) 套件完整：文件在、用例一个没被收集 = 静默漏测
+    inventory = None
+    inventory_cfg = profile.get("inventory")
+    if inventory_cfg and not preflight_failed:
+        inventory = run_inventory(inventory_cfg, root, env, timeout)
+        orphan_gate = bool(inventory_cfg.get("required") or strict)
+        if inventory and inventory["orphans"] and orphan_gate and verdict == "PASS":
+            verdict, reason = "FAIL", "orphan-tests"
+
+    duration = time.monotonic() - started
+
+    # 5) 与上一轮对比：新增失败 / 已修复 / 耗时漂移（上一轮报告就是基线）
+    baseline = None
+    if not args.no_baseline:
+        previous = load_baseline(root, report_path)
+        if previous:
+            baseline = compare_baseline(previous, failures, duration)
+            if args.fail_on_regression and baseline["new_failures"] and verdict == "PASS":
+                verdict, reason = "FAIL", "regression"
+
+    # 6) --repeat：在部分轮次失败、部分轮次通过的用例是 flaky
+    flaky: list[str] = []
+    runs_meta: list[dict] = []
+    if repeat > 1:
+        seen_in: dict[str, set[int]] = defaultdict(set)
+        for index, round_results in enumerate(runs):
+            for test_id in failed_ids(round_results):
+                seen_in[test_id].add(index)
+            run_counts = Counts()
+            for result in round_results:
+                run_counts.add(result.counts)
+            run_verdict, _ = decide_verdict(gate(round_results), [], planned_required)
+            runs_meta.append({
+                "index": index + 1,
+                "verdict": run_verdict,
+                "counts": run_counts.to_dict(),
+            })
+        flaky = sorted(t for t, seen in seen_in.items() if 0 < len(seen) < repeat)
 
     exit_code = {"PASS": EXIT_PASS, "FAIL": EXIT_FAIL}.get(verdict, EXIT_INVALID)
     report = {
@@ -842,21 +1646,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "started_at": started_at,
         "duration_s": round(duration, 2),
         "planned_steps": len(steps),
-        "steps": [r.to_dict() for r in results],
+        "planned_required": planned_required,
+        "steps": [r.to_dict() for r in primary],
         "counts": total.to_dict(),
         "failures": failures,
         "source_changed": changed,
         "artifacts_cleaned": [],
         "watch_patterns": watch,
         "summary": build_summary(
-            verdict, reason, total, results, duration,
+            verdict, reason, total, primary, duration,
             command_for_rerun(argv, args.profile, root),
         ),
         "report_path": report_path,
+        # ---- v2 扩展（老调用方忽略即可）
+        "preflight": [check.to_dict() for check in preflight],
+        "audits": [r.to_dict() for r in audits],
+        "coverage": coverage.to_dict() if coverage else None,
+        "inventory": inventory,
+        "baseline": baseline,
+        "runs": runs_meta,
+        "flaky": flaky,
+        "strict": strict,
     }
 
     if not args.no_clean and artifacts:
         report["artifacts_cleaned"] = clean_artifacts(root, artifacts)
+
+    # JUnit 要在写 JSON 之前生成：它读的就是这份 dict
+    if args.junit:
+        try:
+            junit_path = write_junit(root, args.junit, report)
+            report["junit_path"] = _rel(root, junit_path)
+        except OSError as exc:
+            print(f"[testflow] 写 JUnit 失败：{exc}", file=sys.stderr)
 
     path = write_report(root, report, report_path)
     report["report_path"] = str(path.relative_to(root)).replace("\\", "/") if path.is_relative_to(root) else str(path)
@@ -866,7 +1688,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     elif args.quiet:
         print(report["summary"])
     else:
-        print_human(report, results, args.show_output)
+        print_human(report, primary, args.show_output)
     return exit_code
 
 
