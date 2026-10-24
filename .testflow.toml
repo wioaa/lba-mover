@@ -34,3 +34,23 @@ steps = [
 # 排查时只跑文件名含某子串的测试文件：
 #   python tools/testflow.py -k relay
 # （-k 由 run_all_tests.py 消费，经 testflow 的 passthrough 透传）
+
+# ---------------------------------------------------------------------------
+# 并行冒烟流（smoke）：与传统 default 流共用同一套 testflow 引擎，可开第二个
+# 终端同时跑。覆盖 default 流（tests/test_*.py 纯逻辑）到不了的缺口：真实入口
+# 自测、冻结 EXE 自测、写路径隔离不变量、真实 Win32 卷枚举、真实主窗口构造。
+#   python tools/testflow.py --profile smoke
+# smoke 自带报告：.testflow/smoke-last-run.json（避免与传统流并发写同一文件）。
+[profiles.smoke]
+watch = [
+  "app/**/*.py",
+  "tools/*.py",
+  "main.py",
+  "tools/smoketest.py",
+  "dist/**",
+]
+artifacts = []
+timeout = 600
+steps = [
+  { name = "smoke", command = ["{python}", "tools/smoketest.py"], parser = "generic" },
+]
