@@ -1,0 +1,333 @@
+"""任务调度：并发、限速、重试汇聚、断点落盘。
+
+调度器只做四件事，每件事都必须有明确的上限或终态：
+
+====================  ==================================================
+并发                  ``max_workers = 1 if plan.requires_serial else concurrency``
+限速                  令牌桶（字节/秒），0 表示不限
+重试                  委托给 :class:`ChunkPipeline`（chunk 粒度）
+停止                  收到取消后不再提交新 op，已提交的靠 ``RunControl`` 退出
+====================  ==================================================
+
+关于并发的一个坑：**并发数不是越大越好**。机械盘上并发 >1 会让磁头来回
+寻道，实测吞吐反而下降；SSD 上才有收益。因此默认 2，且在报告里明确标注
+``requires_serial`` 的计划强制降为 1——那不是性能选择，是正确性要求。
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
+from typing import Callable
+
+from ..contract.models import JobParams, MoveOp, Plan
+from .checkpoint import Checkpoint, CheckpointStore, JsonlJournal, merge_op_progress
+from .chunk import BlockSlice
+from .control import RunControl
+from .pipeline import ChunkPipeline, OpResult
+from .progress import ProgressTracker
+
+__all__ = ["RateLimiter", "ExecutionResult", "JobRunner"]
+
+
+class RateLimiter:
+    """令牌桶限速。``bytes_per_sec <= 0`` 时完全旁路（零开销）。"""
+
+    __slots__ = ("rate", "burst", "_tokens", "_last", "_lock")
+
+    def __init__(self, bytes_per_sec: float, burst_seconds: float = 0.25) -> None:
+        self.rate = max(0.0, bytes_per_sec)
+        self.burst = max(1.0, self.rate * burst_seconds) if self.rate > 0 else 0.0
+        self._tokens = self.burst
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def update_rate(self, bytes_per_sec: float) -> None:
+        """运行期改限速（UI 的滑块）。"""
+        with self._lock:
+            self.rate = max(0.0, bytes_per_sec)
+            self.burst = max(1.0, self.rate * 0.25) if self.rate > 0 else 0.0
+            self._tokens = min(self._tokens, self.burst) if self.burst else 0.0
+            self._last = time.monotonic()
+
+    def acquire(self, n_bytes: int, control: RunControl | None = None) -> None:
+        if self.rate <= 0 or n_bytes <= 0:
+            return
+        # 桶容量必须至少能装下「一次请求」，否则 token 永远攒不够，acquire
+        # 会永久空转。这不是边界情况：限速 1 MiB/s 而 chunk 是 2 MiB 时，
+        # 每个 chunk 都会撞上它。
+        cap = max(self.burst, float(n_bytes))
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                self._tokens = min(cap, self._tokens + (now - self._last) * self.rate)
+                self._last = now
+                if self._tokens >= n_bytes:
+                    self._tokens -= n_bytes
+                    return
+                need = (n_bytes - self._tokens) / self.rate
+            # 分片等待：既能及时响应取消，又不会把 CPU 打满
+            wait = min(need, 0.05)
+            if control is not None:
+                control.sleep(wait)
+            else:  # pragma: no cover
+                time.sleep(wait)
+
+
+@dataclass(slots=True)
+class ExecutionResult:
+    moved_ops: int = 0
+    failed_ops: int = 0
+    skipped_ops: int = 0
+    blocks_done: int = 0
+    bytes_moved: int = 0
+    elapsed_s: float = 0.0
+    cancelled: bool = False
+    errors: list[str] = field(default_factory=list)
+    op_results: list[OpResult] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.failed_ops == 0 and not self.cancelled
+
+
+class JobRunner:
+    """执行一份 :class:`Plan`。"""
+
+    def __init__(
+        self,
+        src,
+        dst,
+        params: JobParams,
+        control: RunControl,
+        *,
+        store: CheckpointStore | None = None,
+        journal: JsonlJournal | None = None,
+        on_progress: Callable | None = None,
+        on_log: Callable[[str], None] | None = None,
+        on_op_done: Callable[[OpResult], None] | None = None,
+        halt_on_error: bool = False,
+    ) -> None:
+        self.src = src
+        self.dst = dst
+        self.params = params
+        self.control = control
+        self.store = store
+        self.journal = journal
+        self.on_progress = on_progress
+        self.on_log = on_log
+        self.on_op_done = on_op_done
+        self.halt_on_error = halt_on_error
+
+        self.tracker = ProgressTracker(0, params.block_size, 0)
+        self.limiter = RateLimiter(params.rate_limit_mbps * 1024 * 1024)
+        self._lock = threading.Lock()
+        self._chunks_since_cp = 0
+        self._cp: Checkpoint | None = None
+        self._plan: Plan | None = None
+
+    # -- 主流程 -----------------------------------------------------------
+
+    def run(self, plan: Plan, resume: Checkpoint | None = None) -> ExecutionResult:
+        self._plan = plan
+        self.tracker = ProgressTracker(plan.total_blocks, self.params.block_size, plan.op_count)
+        result = ExecutionResult()
+        t0 = time.monotonic()
+
+        completed: set[int] = set(resume.completed_ops) if resume else set()
+        self._cp = Checkpoint(
+            job_id=plan.job_id,
+            plan_hash=plan.plan_hash,
+            completed_ops=tuple(sorted(completed)),
+            op_blocks=resume.op_blocks if resume else (),
+        )
+
+        pending: list[MoveOp] = []
+        for op in plan.ops:
+            if op.op_id in completed:
+                # 续做时已完成的部分也要计入进度，否则进度条会从 0 开始"白跳"
+                self.tracker.advance(op.blocks)
+                self.tracker.complete_op()
+                result.skipped_ops += 1
+                result.blocks_done += op.blocks
+            else:
+                pending.append(op)
+
+        workers = 1 if plan.requires_serial else max(1, self.params.concurrency)
+        if plan.requires_serial and self.params.concurrency > 1:
+            self._log("计划需要复用腾出的空间，并发强制降为 1 以保证读前写后")
+        self._log(
+            f"开始执行：{len(pending)} 个待搬文件，{plan.total_blocks} 块，"
+            f"并发 {workers}，chunk {self.params.chunk_blocks} 块"
+        )
+
+        if pending:
+            self._run_pool(pending, workers, result)
+
+        if self.control.cancelled:
+            result.cancelled = True
+        self.dst.flush()
+        result.elapsed_s = time.monotonic() - t0
+        result.bytes_moved = result.blocks_done * self.params.block_size
+        self._save_checkpoint(force=True)
+        self._emit_progress()
+        return result
+
+    # -- 并发池 -----------------------------------------------------------
+
+    def _run_pool(self, ops: list[MoveOp], workers: int, result: ExecutionResult) -> None:
+        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lba-op")
+        futures: dict[Future, MoveOp] = {}
+        try:
+            for op in ops:
+                if self.control.cancelled:
+                    break
+                futures[executor.submit(self._run_one, op)] = op
+            for fut in _as_completed(futures):
+                op = futures[fut]
+                try:
+                    res = fut.result()
+                except BaseException as exc:  # noqa: BLE001 - worker 内部已兜底，这里防漏
+                    res = OpResult(
+                        op_id=op.op_id,
+                        blocks_done=0,
+                        bytes_done=0,
+                        ok=False,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                self._account(op, res, result)
+                if self.control.cancelled:
+                    result.cancelled = True
+                    break
+                if not res.ok and self.halt_on_error:
+                    self._log(f"遇到错误且开启了 fail-fast，停止后续任务：{res.error}")
+                    self.control.request_cancel()
+                    break
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def _run_one(self, op: MoveOp) -> OpResult:
+        if self.control.cancelled:
+            return OpResult(op.op_id, 0, 0, ok=False, cancelled=True, error="已取消")
+        with self._lock:
+            self.tracker.current_path = op.path
+        start_blocks = self._cp.blocks_of(op.op_id) if self._cp else 0
+        if start_blocks >= op.blocks:
+            start_blocks = 0  # 记录异常时不冒险跳块，整体重做
+
+        pipe = ChunkPipeline(
+            self.src,
+            self.dst,
+            self.params,
+            self.control,
+            limiter=self.limiter,
+            on_chunk=self._on_chunk,
+            on_retry=self._on_retry,
+        )
+        return pipe.run_op(op, start_blocks)
+
+    # -- 回调 -------------------------------------------------------------
+
+    def _on_chunk(self, sl: BlockSlice) -> None:
+        with self._lock:
+            self.tracker.advance(sl.blocks)
+            self._chunks_since_cp += 1
+            need_cp = (
+                self.params.checkpoint_every_chunks > 0
+                and self._chunks_since_cp >= self.params.checkpoint_every_chunks
+            )
+            if need_cp:
+                self._chunks_since_cp = 0
+        if need_cp:
+            self._save_checkpoint()
+        if self.on_progress is not None:
+            self.on_progress(self.tracker.snapshot())
+
+    def _on_retry(self, attempt: int, exc: BaseException, delay: float) -> None:
+        with self._lock:
+            self.tracker.note_retry()
+        self._log(f"chunk 重试 #{attempt}（等待 {delay * 1000:.0f} ms）：{exc}")
+
+    def _account(self, op: MoveOp, res: OpResult, result: ExecutionResult) -> None:
+        with self._lock:
+            result.op_results.append(res)
+            if res.ok:
+                result.moved_ops += 1
+                result.blocks_done += res.blocks_done
+                self.tracker.complete_op()
+                if self._cp is not None:
+                    done = set(self._cp.completed_ops) | {op.op_id}
+                    self._cp = replace(
+                        self._cp,
+                        completed_ops=tuple(sorted(done)),
+                        op_blocks=merge_op_progress(
+                            self._cp.op_blocks, op.op_id, op.blocks
+                        ),
+                        bytes_done=self._cp.bytes_done + res.bytes_done,
+                    )
+            elif res.cancelled:
+                if self._cp is not None and res.blocks_done > 0:
+                    self._cp = replace(
+                        self._cp,
+                        op_blocks=merge_op_progress(
+                            self._cp.op_blocks,
+                            op.op_id,
+                            (self._cp.blocks_of(op.op_id)) + res.blocks_done,
+                        ),
+                        bytes_done=self._cp.bytes_done + res.bytes_done,
+                    )
+                self.tracker.skip_op()
+            else:
+                result.failed_ops += 1
+                result.errors.append(f"{op.path}: {res.error}")
+                self.tracker.note_failure()
+                self.tracker.skip_op()
+        self._save_checkpoint(force=True)
+        if self.journal is not None:
+            self.journal.append(
+                {
+                    "op_id": op.op_id,
+                    "path": op.path,
+                    "ok": res.ok,
+                    "cancelled": res.cancelled,
+                    "blocks": res.blocks_done,
+                    "retries": res.retries,
+                    "error": res.error,
+                }
+            )
+        if self.on_op_done is not None:
+            self.on_op_done(res)
+        if not res.ok and not res.cancelled:
+            self._log(f"op{op.op_id} 失败：{op.path} — {res.error}")
+
+    # -- 断点 -------------------------------------------------------------
+
+    def _save_checkpoint(self, force: bool = False) -> None:
+        if self.store is None or self._cp is None:
+            return
+        if not force and self.params.checkpoint_every_chunks <= 0:
+            return
+        with self._lock:
+            cp = replace(self._cp, updated_at=time.time())
+            self._cp = cp
+        try:
+            self.store.save(cp)
+        except OSError as exc:
+            self._log(f"断点保存失败（不影响继续执行）：{exc}")
+
+    def _emit_progress(self) -> None:
+        if self.on_progress is not None:
+            self.on_progress(self.tracker.snapshot())
+
+    def _log(self, message: str) -> None:
+        if self.on_log is not None:
+            self.on_log(message)
+
+
+def _as_completed(futures: dict[Future, MoveOp]):
+    """按完成顺序产出（不依赖 concurrent.futures.as_completed 的兼容性）。"""
+    from concurrent.futures import as_completed
+
+    yield from as_completed(list(futures))

@@ -4,53 +4,45 @@
 # tools/testflow.py 本身不含任何本项目专属逻辑。
 
 [project]
-name = "lba-mover"
+name = "lbamover"
 report = ".testflow/last-run.json"
 
 [profiles.default]
 # 参与"运行期间源码是否被改动"快照的 glob。跑测试时改这里列的文件，
-# 结论会直接判 INVALID（静态 import 会读到半新半旧的源码）。
+# 结论会直接判 INVALID。
 watch = [
-  "app/**/*.py",
+  "src/**/*.py",
   "tests/**/*.py",
-  "tools/*.py",
-  "main.py",
+  "scripts/*.py",
 ]
 
-# 测试会写出来的运行时文件，跑完自动清掉。lba-mover 的测试是纯逻辑 + 内存
-# fixture，目前不落盘；未来若新增临时产物，加到这里。
-artifacts = []
+# 测试会写出来的运行时文件，跑完自动清掉
+artifacts = [
+  ".tmp/",
+]
 
-timeout = 1200
+timeout = 900
 
-# lba-mover 的测试是「每个 tests/test_*.py 自带 _harness、独立退出码 0/1」，
-# 没有 pytest 那样的单一收集入口。tools/run_all_tests.py 把它们汇成一步，并
-# 转成 pytest 风格的摘要 / FAILED 行 —— 所以这里用内置 pytest 解析器，
-# tools/testflow.py 原样拷贝、不改一行。
+# 环境自检：src 布局靠 PYTHONPATH 注入，缺了就是一屏 ModuleNotFoundError
+preflight = [
+  { type = "python", min = "3.11", name = "Python 3.11+" },
+  { type = "module", value = "pytest", name = "pytest" },
+  { type = "module", value = "PySide6", name = "PySide6", required = false },
+]
+
+# 磁盘上有 test_*.py 但一个用例都没被收集 = 静默漏测
+inventory = { timeout = 120 }
+
 steps = [
-  { name = "unit", command = ["{python}", "tools/run_all_tests.py"], parser = "pytest" },
+  { name = "pytest", command = ["{python}", "-m", "pytest", "-q", "--durations=5"], parser = "pytest", env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" } },
+  { name = "smoke", command = ["{python}", "scripts/smoke.py"], parser = "generic", required = false, env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1", QT_QPA_PLATFORM = "offscreen" } },
 ]
 
-# 排查时只跑文件名含某子串的测试文件：
-#   python tools/testflow.py -k relay
-# （-k 由 run_all_tests.py 消费，经 testflow 的 passthrough 透传）
-
-# ---------------------------------------------------------------------------
-# 并行冒烟流（smoke）：与传统 default 流共用同一套 testflow 引擎，可开第二个
-# 终端同时跑。覆盖 default 流（tests/test_*.py 纯逻辑）到不了的缺口：真实入口
-# 自测、冻结 EXE 自测、写路径隔离不变量、真实 Win32 卷枚举、真实主窗口构造。
-#   python tools/testflow.py --profile smoke
-# smoke 自带报告：.testflow/smoke-last-run.json（避免与传统流并发写同一文件）。
-[profiles.smoke]
-watch = [
-  "app/**/*.py",
-  "tools/*.py",
-  "main.py",
-  "tools/smoketest.py",
-  "dist/**",
-]
-artifacts = []
-timeout = 600
+# 只看失败重跑，排查时用：python tools/testflow.py --profile lastfailed
+[profiles.lastfailed]
+watch = ["src/**/*.py", "tests/**/*.py"]
+artifacts = [".tmp/"]
+timeout = 900
 steps = [
-  { name = "smoke", command = ["{python}", "tools/smoketest.py"], parser = "generic" },
+  { name = "pytest-lf", command = ["{python}", "-m", "pytest", "-q", "--lf"], parser = "pytest", env = { PYTHONPATH = "src", PYTHONDONTWRITEBYTECODE = "1" } },
 ]

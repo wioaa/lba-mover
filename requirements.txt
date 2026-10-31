@@ -1,1 +1,7 @@
+# 运行时依赖
+# 引擎核心（contract / engine / devices / platform）零第三方依赖，仅用标准库；
+# PySide6 只被 ui 包需要，缺失时 CLI 与引擎仍可完整运行。
 PySide6>=6.6
+
+# 测试
+pytest>=8.0

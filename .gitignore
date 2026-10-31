@@ -1,33 +1,31 @@
-# ---- Python ----
 __pycache__/
 *.py[cod]
-*$py.class
 *.egg-info/
-.eggs/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.testflow/
-
-# ---- 虚拟环境 ----
-.venv/
-venv/
-env/
-
-# ---- PyInstaller 构建产物（可在任意 Windows + PySide6 机器上重建）----
 build/
 dist/
+.eggs/
 
-# ---- 操作系统 / 编辑器 ----
+# 本地临时产物（截图、断点、测试用状态目录）
+.tmp/
+
+# testflow 运行产物
+.testflow/
+.pytest_cache/
+
+# 运行时产物：断点、日志、暂存
+*.log
+logs/
+scratch/
+*.stage
+*.checkpoint.json
+
+# 本地镜像/测试用磁盘文件
+*.img
+*.bin.disk
+
+# 编辑器
 .vscode/
 .idea/
-*.swp
-Thumbs.db
-desktop.ini
-.DS_Store
 
-# ---- 日志 ----
-*.log
-
-# ---- QA 过程脚本 / 缓存 / 原始输出（内部 scratch，不入库）----
-qa_work/
+# 断点与流水（默认写在仓库内，见 engine/checkpoint.py）
+.lbamover/

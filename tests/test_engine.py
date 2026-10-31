@@ -1,0 +1,316 @@
+"""引擎编排：状态机、事件、规划-执行-校验闭环、断点续做、目录绑定。
+
+这里用真实的内存设备跑完整链路，不 mock。原因：引擎的价值全在"这几块
+拼起来还能对"，把其中任何一块换成假件，测的就只是接线图。
+"""
+
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from lbamover.contract.commands import CancelJob, StartJob, UpdateTarget
+from lbamover.contract.enums import ErrorClass, EventKind, JobState, LogLevel, Strategy, VolumeKind
+from lbamover.contract.models import Extent, FileFrag, Geometry, JobParams, Plan, VolumeInfo
+from lbamover.contract.ports import ListSink
+from lbamover.devices.memory import MemoryDevice
+from lbamover.engine.catalog import CatalogError, StaticCatalog, UnsupportedCatalog
+from lbamover.engine.checkpoint import Checkpoint, CheckpointStore
+from lbamover.engine.engine import EngineCore, EngineService
+from lbamover.engine.errors import PlanRejected
+from lbamover.engine.synth import apply_plan, build_layout, populate, verify
+
+
+def make_volume(
+    geometry: Geometry, *, writable: bool = True, mount="T:\\", device_path="memory://test"
+) -> VolumeInfo:
+    return VolumeInfo(
+        device_path=device_path,
+        mount_point=mount,
+        label="test",
+        filesystem="SYNTH",
+        kind=VolumeKind.RAMDISK,
+        geometry=geometry,
+        free_bytes=geometry.total_bytes // 2,
+        is_mounted=False,
+        writable=writable,
+    )
+
+
+@pytest.fixture()
+def scenario(tmp_path):
+    layout = build_layout(1024, file_count=16, seed=42)
+    dev = MemoryDevice(layout.total_blocks, layout.geometry.block_size, name="t")
+    populate(dev, layout)
+    vol = make_volume(layout.geometry)
+    sink = ListSink()
+    core = EngineCore(
+        sink=sink,
+        catalog=StaticCatalog(layout.files, layout.free, volume_key=vol.device_path),
+        state_dir=tmp_path / "state",
+    )
+    core.params = JobParams(chunk_blocks=16, concurrency=2, queue_depth=2)
+    core.set_target(vol, core.params)
+    return core, sink, dev, layout, vol
+
+
+class TestScan:
+    def test_produces_report_and_event(self, scenario):
+        core, sink, _dev, layout, vol = scenario
+        report = core.scan(vol)
+        assert report.file_count == len(layout.files)
+        assert report.buckets
+        kinds = [e.kind for e in sink.events]
+        assert EventKind.FRAG_MAP in kinds
+        assert any(e.kind is EventKind.STATE and e.state is JobState.SCANNING for e in sink.events)
+        assert core.state is JobState.IDLE
+
+    def test_free_extents_derived_when_catalog_omits_them(self, scenario):
+        core, _sink, _dev, layout, _vol = scenario
+        core.catalog = StaticCatalog(layout.files, (), volume_key="memory://test")
+        report = core.scan()
+        assert report.free_blocks > 0
+
+    def test_catalog_volume_mismatch_is_rejected(self, scenario):
+        core, _sink, _dev, layout, vol = scenario
+        other = make_volume(layout.geometry, mount="Q:\\", device_path="memory://other")
+        with pytest.raises(CatalogError):
+            core.scan(other)
+        assert core.state is JobState.IDLE
+
+    def test_unsupported_catalog_explains_itself(self, scenario):
+        core, _sink, _dev, _layout, vol = scenario
+        core.catalog = UnsupportedCatalog()
+        with pytest.raises(CatalogError) as exc:
+            core.scan(vol)
+        assert "未实现" in str(exc.value)
+
+    def test_scan_without_target(self, scenario):
+        core, _sink, _dev, _layout, _vol = scenario
+        core.volume = None
+        with pytest.raises(ValueError):
+            core.scan()
+
+
+class TestPlanAndExecute:
+    def test_end_to_end_data_integrity(self, scenario):
+        core, _sink, dev, layout, vol = scenario
+        core.scan(vol)
+        plan = core.make_plan(Strategy.COALESCE)
+        assert plan.ops and plan.feasible
+        res = core.execute(plan, dev)
+        assert res.moved_ops == plan.op_count
+        assert res.failed_ops == 0
+        after = apply_plan(layout, plan)
+        assert verify(dev, after) == [], "搬迁后数据不一致"
+        assert core.state is JobState.DONE
+
+    def test_analyze_only_has_no_ops(self, scenario):
+        core, _sink, _dev, _layout, vol = scenario
+        core.scan(vol)
+        plan = core.make_plan(Strategy.ANALYZE_ONLY)
+        assert plan.ops == ()
+        res = core.execute(plan)
+        assert res.moved_ops == 0
+
+    def test_execute_without_plan_raises(self, scenario):
+        core, _sink, _dev, _layout, _vol = scenario
+        with pytest.raises(ValueError):
+            core.execute(None)
+
+    def test_invalid_plan_rejected_before_any_write(self, scenario):
+        core, _sink, dev, _layout, vol = scenario
+        core.scan(vol)
+        bad = Plan(
+            job_id="bad",
+            strategy=Strategy.COALESCE,
+            ops=(),
+            feasible=False,
+            reasons=("人为构造的不可行计划",),
+        )
+        with pytest.raises(PlanRejected):
+            core.execute(bad, dev)
+
+    def test_self_overlapping_plan_rejected(self, scenario):
+        from lbamover.contract.models import MoveOp
+
+        core, _sink, dev, _layout, vol = scenario
+        core.scan(vol)
+        bad = Plan(
+            job_id="bad",
+            strategy=Strategy.COALESCE,
+            ops=(MoveOp(0, "x", "x", (Extent(0, 10),), dst_start=5),),
+        )
+        with pytest.raises(PlanRejected) as exc:
+            core.execute(bad, dev)
+        assert any("自我覆盖" in p for p in exc.value.problems)
+
+    def test_checkpoint_cleared_after_full_success(self, scenario, tmp_path):
+        core, _sink, dev, _layout, vol = scenario
+        core.scan(vol)
+        plan = core.make_plan(Strategy.COALESCE)
+        core.execute(plan, dev)
+        store = CheckpointStore(tmp_path / "state" / f"{plan.job_id}.checkpoint.json")
+        assert not store.exists
+
+    def test_resume_state_reported(self, scenario, tmp_path):
+        core, sink, dev, _layout, vol = scenario
+        core.scan(vol)
+        plan = core.make_plan(Strategy.COALESCE)
+        store = CheckpointStore(tmp_path / "state" / f"{plan.job_id}.checkpoint.json")
+        store.save(
+            Checkpoint(
+                job_id=plan.job_id,
+                plan_hash=plan.plan_hash,
+                completed_ops=tuple(op.op_id for op in plan.ops[:1]),
+            )
+        )
+        res = core.execute(plan, dev)
+        assert res.skipped_ops >= 1
+        assert any("断点" in e.message for e in sink.events if e.kind is EventKind.LOG)
+
+    def test_plan_hash_mismatch_refuses_resume(self, scenario, tmp_path):
+        core, sink, dev, _layout, vol = scenario
+        core.scan(vol)
+        plan = core.make_plan(Strategy.COALESCE)
+        store = CheckpointStore(tmp_path / "state" / f"{plan.job_id}.checkpoint.json")
+        store.save(Checkpoint(job_id=plan.job_id, plan_hash="stale-hash", completed_ops=(0,)))
+        core.execute(plan, dev)
+        assert any("不匹配" in e.message for e in sink.events if e.kind is EventKind.LOG)
+
+    def test_state_sequence_is_legal(self, scenario):
+        core, sink, dev, _layout, vol = scenario
+        core.scan(vol)
+        plan = core.make_plan(Strategy.COALESCE)
+        core.execute(plan, dev)
+        states = [e.state for e in sink.events if e.kind is EventKind.STATE]
+        assert states[0] is JobState.IDLE
+        assert JobState.RUNNING in states
+        assert states[-1] is JobState.DONE
+
+    def test_progress_events_carry_rate(self, scenario):
+        core, sink, dev, _layout, vol = scenario
+        core.scan(vol)
+        plan = core.make_plan(Strategy.COALESCE)
+        core.execute(plan, dev)
+        progress = [e for e in sink.events if e.kind is EventKind.PROGRESS]
+        assert progress, "没有任何进度事件"
+        assert progress[-1].progress.total_blocks == plan.total_blocks
+
+    def test_job_done_event_summarises(self, scenario):
+        core, sink, dev, _layout, vol = scenario
+        core.scan(vol)
+        plan = core.make_plan(Strategy.COALESCE)
+        core.execute(plan, dev)
+        done = [e for e in sink.events if e.kind is EventKind.JOB_DONE][-1]
+        assert done.moved_ops == plan.op_count
+        assert done.bytes_moved > 0
+        assert done.state is JobState.DONE
+
+    def test_journal_file_written(self, scenario, tmp_path):
+        from lbamover.engine.checkpoint import JsonlJournal
+
+        core, _sink, dev, _layout, vol = scenario
+        core.scan(vol)
+        plan = core.make_plan(Strategy.COALESCE)
+        core.execute(plan, dev)
+        recs = JsonlJournal(tmp_path / "state" / f"{plan.job_id}.jsonl").records()
+        assert len(recs) == plan.op_count
+        assert all("op_id" in r for r in recs)
+
+
+class TestStrategies:
+    @pytest.mark.parametrize("strategy", [Strategy.COALESCE, Strategy.COMPACT, Strategy.RELOCATE_TAIL])
+    def test_each_write_strategy_keeps_data_intact(self, strategy, tmp_path):
+        layout = build_layout(1200, file_count=18, seed=7)
+        dev = MemoryDevice(layout.total_blocks, layout.geometry.block_size)
+        populate(dev, layout)
+        vol = make_volume(layout.geometry)
+        core = EngineCore(
+            sink=ListSink(),
+            catalog=StaticCatalog(layout.files, layout.free, volume_key=vol.device_path),
+            state_dir=tmp_path / "s",
+        )
+        core.params = JobParams(chunk_blocks=16)
+        core.set_target(vol, core.params)
+        core.scan(vol)
+        plan = core.make_plan(strategy)
+        if not plan.ops:
+            pytest.skip("该布局下该策略无可执行操作")
+        res = core.execute(plan, dev)
+        assert res.failed_ops == 0
+        assert verify(dev, apply_plan(layout, plan)) == []
+
+
+class TestEngineService:
+    def _service(self, tmp_path, layout, dev, vol):
+        sink = ListSink()
+        core = EngineCore(
+            sink=sink,
+            catalog=StaticCatalog(layout.files, layout.free, volume_key=vol.device_path),
+            state_dir=tmp_path / "s",
+        )
+        core.params = JobParams(chunk_blocks=16)
+        svc = EngineService(core, device_provider=lambda v: dev)
+        svc.start()
+        return svc, core, sink
+
+    def test_update_target_scans_and_plans(self, tmp_path):
+        layout = build_layout(512, file_count=12, seed=3)
+        dev = MemoryDevice(layout.total_blocks, layout.geometry.block_size)
+        populate(dev, layout)
+        vol = make_volume(layout.geometry)
+        svc, core, sink = self._service(tmp_path, layout, dev, vol)
+        try:
+            svc.submit(UpdateTarget(vol, core.params, strategy=Strategy.COALESCE))
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and core.plan is None:
+                time.sleep(0.01)
+            assert core.report is not None
+            assert core.plan is not None and core.plan.ops
+        finally:
+            svc.stop()
+
+    def test_pause_and_resume_are_immediate(self, tmp_path):
+        layout = build_layout(256, file_count=6, seed=1)
+        dev = MemoryDevice(layout.total_blocks, layout.geometry.block_size)
+        populate(dev, layout)
+        vol = make_volume(layout.geometry)
+        svc, core, _sink = self._service(tmp_path, layout, dev, vol)
+        try:
+            svc.submit(UpdateTarget(vol, core.params))
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and core.report is None:
+                time.sleep(0.01)
+            from lbamover.contract.commands import PauseJob, ResumeJob
+
+            svc.submit(PauseJob())
+            assert core.control.paused
+            assert core.state is JobState.PAUSED
+            svc.submit(ResumeJob())
+            assert not core.control.paused
+            assert core.state is JobState.RUNNING
+        finally:
+            svc.stop()
+
+    def test_cancel_sets_control(self, tmp_path):
+        layout = build_layout(256, file_count=6, seed=1)
+        dev = MemoryDevice(layout.total_blocks, layout.geometry.block_size)
+        populate(dev, layout)
+        vol = make_volume(layout.geometry)
+        svc, core, _sink = self._service(tmp_path, layout, dev, vol)
+        try:
+            svc.submit(CancelJob())
+            assert core.control.cancelled
+            assert core.state is JobState.STOPPING
+        finally:
+            svc.stop()
+
+    def test_stop_shuts_thread_down(self, tmp_path):
+        layout = build_layout(64, file_count=2, seed=1)
+        dev = MemoryDevice(layout.total_blocks, layout.geometry.block_size)
+        vol = make_volume(layout.geometry)
+        svc, _core, _sink = self._service(tmp_path, layout, dev, vol)
+        svc.stop(timeout=3)
+        assert svc._thread is None

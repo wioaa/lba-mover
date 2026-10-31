@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lbamover"
+version = "2.0.0"
+description = "LBA 块级流式整理引擎与桌面控制台"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+ui = ["PySide6>=6.6"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+lbamover = "lbamover.__main__:main"
+lbamover-cli = "lbamover.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# 版本号约定：三段写在 [project].version（PEP 440 合法），
+# 小版本字母放这里，由 lbamover/__init__.py 拼接成 2.0.0A 形式对外展示。
+[tool.lbamover]
+revision = ""
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
