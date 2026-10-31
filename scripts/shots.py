@@ -66,6 +66,8 @@ def main() -> int:
     spec = JobSpec(volume=w._volume, strategy=w._strategy, params=w._params)
     w.service.submit(StartJob(spec))
     pump(app, lambda: w.core.state is JobState.RUNNING, timeout=10)
+    time.sleep(0.3)  # 等进度卡的自动滚动校正完成
+    app.processEvents()
     shot("03-running")
     pump(app, lambda: w.core.state in (JobState.DONE, JobState.FAILED), timeout=60)
     shot("04-done")

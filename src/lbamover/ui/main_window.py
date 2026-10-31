@@ -435,7 +435,10 @@ class MainWindow(QMainWindow):
             # 跑起来之后"进度"才是第一眼要看的东西，把它滚进视口。
             # 延后一拍：状态事件到达时布局还没按新内容算完，此时
             # ensureWidgetVisible 会判定"不用滚"，于是什么都没发生。
-            QTimer.singleShot(60, self._reveal_progress)
+            # 立刻滚一次（多数情况已够），再补一次校正：状态事件到达时
+            # 布局还没按新内容算完，只滚一次会停在"差几像素"的位置。
+            self._reveal_progress()
+            QTimer.singleShot(120, self._reveal_progress)
 
     def _reveal_progress(self) -> None:
         scroll = getattr(self, "_center_scroll", None)
