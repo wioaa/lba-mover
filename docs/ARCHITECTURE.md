@@ -79,6 +79,13 @@ src/lbamover/
 │   ├── volumes.py       卷枚举（只读探测，普通权限也能列出目标）
 │   ├── privilege.py     管理员检测 / 特权启用 / runas 重启
 │   └── errors.py        错误码 → 可重试 / 不可恢复
+├── packaging/           ← 封包（不参与运行时）
+│   ├── build.py         一键封包 + 产物验证
+│   ├── make_icon.py     用项目色板画多尺寸 .ico
+│   ├── make_version_file.py  exe 版本资源（版本号唯一来源）
+│   ├── gui_entry.py     窗口版入口（console=False）
+│   ├── cli_entry.py     命令行版入口（console=True）
+│   └── lbamover.ico     产物图标（生成物，已入库）
 └── ui/                  ← 桌面端
     ├── app.py           QApplication + 主题 + 主窗口装配
     ├── bridge.py        EventSink → Qt 信号（唯一的 QObject 接触点）

@@ -184,6 +184,94 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_smoke(args: argparse.Namespace) -> int:
+    """无头冒烟：建窗口 → 载合成卷 → 扫描 → 规划 → 执行 → 逐块校验。
+
+    存在的理由是**打包产物需要被验证**。源码树里 pytest 全绿，不代表
+    PyInstaller 打出来的 exe 能起得来（缺 Qt 插件、缺 fonts、缺 hook 都会
+    在运行时才炸）。这个子命令可以用退出码判定，适合放进构建脚本。
+    """
+    import os
+    import time
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    from .contract.commands import StartJob
+    from .contract.enums import JobState
+    from .contract.models import JobSpec
+    from .engine.synth import apply_plan, verify
+
+    try:
+        from .ui.app import build_app
+        from .ui.main_window import DEMO_DEVICE_PATH
+    except ImportError as exc:
+        print(f"[FAIL] 无法加载 GUI：{exc}", file=sys.stderr)
+        return 2
+
+    def pump(predicate, timeout: float, label: str) -> bool:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            app.processEvents()
+            if predicate():
+                return True
+            time.sleep(0.01)
+        print(f"[FAIL] 等待超时：{label}", file=sys.stderr)
+        return False
+
+    app, window = build_app(["--demo"])
+    window.show()
+    try:
+        if not pump(
+            lambda: window._volume is not None
+            and window._volume.device_path == DEMO_DEVICE_PATH,
+            20.0,
+            "演示卷装载",
+        ):
+            return 1
+        window._on_scan()
+        if not pump(lambda: window._plan is not None, 20.0, "扫描 + 规划"):
+            return 1
+        plan = window._plan
+        if not plan.ops:
+            print("[FAIL] 预演没有产生任何操作", file=sys.stderr)
+            return 1
+
+        spec = JobSpec(volume=window._volume, strategy=window._strategy, params=window._params)
+        window.service.submit(StartJob(spec))
+        if not pump(
+            lambda: window.core.state
+            in (JobState.DONE, JobState.FAILED, JobState.CANCELLED),
+            60.0,
+            "执行完成",
+        ):
+            return 1
+        if window.core.state is not JobState.DONE:
+            print(f"[FAIL] 结束状态 {window.core.state.value}", file=sys.stderr)
+            return 1
+        result = window.core.last_result
+        if result is None or result.moved_ops == 0:
+            print("[FAIL] 没有搬迁任何文件", file=sys.stderr)
+            return 1
+
+        after = apply_plan(window._demo_layout, plan)
+        problems = verify(window._demo_device, after)
+        if problems:
+            print(f"[FAIL] 数据校验不一致 {len(problems)} 处", file=sys.stderr)
+            for p in problems[:5]:
+                print(f"       {p}", file=sys.stderr)
+            return 1
+
+        print(
+            f"[PASS] GUI 冒烟：窗口可构建，搬迁 {result.moved_ops} 个文件 / "
+            f"{result.blocks_done} 块，逐块校验一致（{len(after.files)} 个文件）"
+        )
+        return 0
+    finally:
+        window.close()
+        if app is not None:
+            app.quit()
+
+
 def _cmd_gui(args: argparse.Namespace) -> int:
     try:
         from .ui.app import build_app
@@ -215,6 +303,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     v = sub.add_parser("volumes", help="列出本机可整理的卷")
     v.set_defaults(func=_cmd_volumes)
+
+    k = sub.add_parser("smoke", help="无头冒烟：建窗口、跑一次完整搬迁并校验")
+    k.set_defaults(func=_cmd_smoke)
 
     s = sub.add_parser("selftest", help="在内存合成卷上跑完整流水线并逐块校验")
     s.add_argument("--blocks", type=int, default=4096)

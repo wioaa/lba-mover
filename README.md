@@ -34,6 +34,47 @@ PYTHONPATH=src python scripts/smoke.py
 
 ---
 
+## 封包
+
+```bash
+python packaging/build.py            # 图标 → 版本资源 → PyInstaller → wheel → zip → 校验和
+python packaging/build.py --no-wheel # 只出 exe
+```
+
+产物：
+
+| 路径 | 说明 |
+| --- | --- |
+| `dist/LBAMover/LBAMover.exe` | 图形界面，双击即用，无控制台窗口（2.8 MB） |
+| `dist/LBAMover/LBAMover-cli.exe` | 命令行：`volumes` / `selftest` / `smoke` |
+| `dist/LBAMover/_internal/` | Python 运行时 + Qt 插件，两个 exe **共用一份** |
+| `dist/LBAMover-2.0.0-win64.zip` | 分发用压缩包，47.7 MiB |
+| `dist/lbamover-2.0.0-py3-none-any.whl` | `pip install` 用 |
+| `dist/SHA256SUMS.txt` | 上述产物的校验和 |
+
+目录解包后 115.7 MiB，其中 94 MiB 是 PySide6（`Qt6Core/Gui/Widgets` 加一个
+19.7 MB 的 `opengl32sw.dll` 软件 OpenGL 回退），6 MB 是 CPython。
+
+**为什么不是 onefile**：onefile 每次启动都要把 ~80 MB 解压到临时目录，冷启动
+3~5 秒，杀软还会额外扫描自解压行为。这个工具经常是"双击后立刻要看到界面"，
+那个代价不合适。onedir 冷启动 0.6 秒左右，代价只是"产物是一个文件夹"。
+
+**构建脚本会自动验证产物**，任一项失败即中止（这一步不能省——源码树里
+pytest 全绿不代表 exe 能跑）：
+
+1. `LBAMover-cli.exe --version` 与代码里的版本号一致；
+2. `LBAMover-cli.exe selftest` 合成卷端到端 + 逐块校验；
+3. `LBAMover-cli.exe smoke` 与 `LBAMover.exe --smoke` **各自**无头建窗口并
+   跑完一次完整搬迁（窗口程序没有 stdout，靠退出码汇报）。
+
+已额外手工确认：真实 Windows 平台下 `LBAMover.exe --demo` 能创建主窗口
+（标题 `LBAMover 2.0.0 — LBA 块级流式整理`）。
+
+> exe 未做代码签名，首次运行会有 SmartScreen 提示；内网分发可先用
+> `SHA256SUMS.txt` 核对。
+
+---
+
 ## 它做什么
 
 **引擎**（`src/lbamover/engine`，不依赖 Qt）：
