@@ -251,6 +251,25 @@ class TestParamsPanel:
         assert got.chunk_blocks == 32 and got.concurrency == 3
         assert got.rate_limit_mbps == 50.0 and not got.verify
 
+    def test_advanced_rows_hidden_by_default(self, qapp):
+        p = ParamsPanel(DARK)
+        assert p.depth.isHidden() and p.retries.isHidden() and p.reserve.isHidden()
+        assert not p.chunk.isHidden()
+
+    def test_advanced_toggle_shows_and_hides(self, qapp):
+        p = ParamsPanel(DARK)
+        p.advanced_toggle.click()
+        qapp.processEvents()
+        assert not p.depth.isHidden()
+        assert "▾" in p.advanced_toggle.text()
+        # 隐藏的参数仍在 JobParams 里生效，不会因为折叠而丢值
+        p.depth.setValue(6)
+        assert p.current().queue_depth == 6
+        p.advanced_toggle.click()
+        qapp.processEvents()
+        assert p.depth.isHidden()
+        assert "▸" in p.advanced_toggle.text()
+
     def test_lock_toggles_structural_params(self, qapp):
         p = ParamsPanel(DARK)
         p.set_locked(True)

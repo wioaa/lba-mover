@@ -97,7 +97,7 @@ PYTHONPATH=src python scripts/smoke.py
 
 ```
 src/lbamover/{contract,engine,devices,platform,ui}/   见 docs/ARCHITECTURE.md
-tests/                     214 个用例
+tests/                     216 个用例
 scripts/smoke.py           全链路冒烟
 scripts/shots.py           界面截图（视觉评审用）
 tools/testflow.py          测试入口（零第三方依赖）

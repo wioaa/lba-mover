@@ -145,6 +145,9 @@ class ParamsPanel(QWidget):
         form = self.layout().itemAt(0).layout()
         for widget in self._advanced_rows:
             form.setRowVisible(widget, shown)
+        # 隐藏的行不会自动让面板缩小，必须显式让上层重新算尺寸
+        form.activate()
+        self.updateGeometry()
 
     def set_locked(self, locked: bool) -> None:
         """任务运行期间锁住结构性参数（热更新只允许限速与校验）。"""
