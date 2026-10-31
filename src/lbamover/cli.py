@@ -184,6 +184,56 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
 
 
+def _cmd_ntfs(args: argparse.Namespace) -> int:
+    """解析一份 NTFS 卷镜像，打印文件表读到的内容。
+
+    这是**上真机之前的验收手段**：先用 dd / Win32DiskImager 把分区导成镜像，
+    在这里确认"文件 → 簇区间"读得对，再去动真卷。没有这一步，解析器写错了
+    也只能在真机上才发现，而真机上的代价是数据。
+    """
+    from .devices.image import ImageDevice
+    from .ntfs.catalog import MftCatalog, NtfsScanError
+    from .ntfs.synth import build_ntfs_image
+
+    path = args.image
+    if args.make_demo:
+        ImageDevice.create(path, block_count=1024, block_size=4096).close()
+        dev = ImageDevice(path, block_size=4096, writable=True)
+        info = build_ntfs_image(dev, total_clusters=1024, record_slots=64)
+        dev.close()
+        print(f"已生成合成 NTFS 镜像：{path}（{info.cluster_count} 簇 × {info.cluster_size} B）")
+
+    dev = ImageDevice(path, block_size=args.block_size, writable=False)
+    try:
+        cat = MftCatalog.open(dev)
+        stats = cat.scan()
+        boot = cat.boot
+        print(
+            f"卷：sector={boot.bytes_per_sector} cluster={boot.cluster_size} "
+            f"records={boot.record_size} mft_lcn={boot.mft_lcn} "
+            f"clusters={boot.cluster_count}"
+        )
+        print(stats.summary(boot.cluster_size))
+        for note in stats.notes[:8]:
+            print(f"  · {note}")
+
+        files = cat.list_files(None)
+        top = sorted(files, key=lambda f: f.run_count, reverse=True)[: args.top]
+        print(f"\n最碎的文件（前 {len(top)} 个）：")
+        for f in top:
+            print(
+                f"  {f.run_count:>3} 段  {f.total_blocks * boot.cluster_size / 1048576:>8.1f} MiB  {f.path}"
+            )
+        free = cat.free_extents(None)
+        print(f"\n自由区间 {len(free)} 段，共 {sum(e.length for e in free)} 块")
+        return 0
+    except NtfsScanError as exc:
+        print(f"[FAIL] {exc}", file=sys.stderr)
+        return 1
+    finally:
+        dev.close()
+
+
 def _cmd_smoke(args: argparse.Namespace) -> int:
     """无头冒烟：建窗口 → 载合成卷 → 扫描 → 规划 → 执行 → 逐块校验。
 
@@ -306,6 +356,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     k = sub.add_parser("smoke", help="无头冒烟：建窗口、跑一次完整搬迁并校验")
     k.set_defaults(func=_cmd_smoke)
+
+    n = sub.add_parser("ntfs", help="解析 NTFS 卷镜像，打印文件表（上真机前的验收）")
+    n.add_argument("--image", required=True, help="卷镜像文件路径")
+    n.add_argument("--block-size", type=int, default=4096, help="镜像的块大小（=簇大小）")
+    n.add_argument("--top", type=int, default=10, help="列出最碎的前 N 个文件")
+    n.add_argument("--make-demo", action="store_true", help="先生成一份合成 NTFS 镜像再解析")
+    n.set_defaults(func=_cmd_ntfs)
 
     s = sub.add_parser("selftest", help="在内存合成卷上跑完整流水线并逐块校验")
     s.add_argument("--blocks", type=int, default=4096)

@@ -26,7 +26,8 @@ from ..contract.models import JobParams, MoveOp, Plan
 from .checkpoint import Checkpoint, CheckpointStore, JsonlJournal, merge_op_progress
 from .chunk import BlockSlice
 from .control import RunControl
-from .pipeline import ChunkPipeline, OpResult
+from .executor import BlockCopyExecutor, Executor
+from .pipeline import OpResult
 from .progress import ProgressTracker
 
 __all__ = ["RateLimiter", "ExecutionResult", "JobRunner"]
@@ -109,6 +110,7 @@ class JobRunner:
         on_log: Callable[[str], None] | None = None,
         on_op_done: Callable[[OpResult], None] | None = None,
         halt_on_error: bool = False,
+        executor_factory: Callable[["JobRunner"], Executor] | None = None,
     ) -> None:
         self.src = src
         self.dst = dst
@@ -120,6 +122,11 @@ class JobRunner:
         self.on_log = on_log
         self.on_op_done = on_op_done
         self.halt_on_error = halt_on_error
+        #: 由调用方决定"用哪种方式落盘"（块拷贝 / FSCTL_MOVE_FILE）。
+        #: 用工厂而不是实例：执行器需要拿到 runner 的回调与限速器，
+        #: 而那两样只有在 runner 构造完之后才存在。
+        self.executor_factory = executor_factory
+        self._executor: Executor | None = None
 
         self.tracker = ProgressTracker(0, params.block_size, 0)
         self.limiter = RateLimiter(params.rate_limit_mbps * 1024 * 1024)
@@ -163,12 +170,24 @@ class JobRunner:
             f"并发 {workers}，chunk {self.params.chunk_blocks} 块"
         )
 
-        if pending:
-            self._run_pool(pending, workers, result)
+        self._executor = self._make_executor()
+        try:
+            if pending:
+                self._run_pool(pending, workers, result)
+        finally:
+            closer = getattr(self._executor, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:  # noqa: BLE001 - 释放失败不改变任务结论
+                    pass
+            self._executor = None
 
         if self.control.cancelled:
             result.cancelled = True
-        self.dst.flush()
+        # 走 FSCTL_MOVE_FILE 时没有裸块设备，落盘一致性由文件系统自己保证
+        if self.dst is not None:
+            self.dst.flush()
         result.elapsed_s = time.monotonic() - t0
         result.bytes_moved = result.blocks_done * self.params.block_size
         self._save_checkpoint(force=True)
@@ -217,7 +236,14 @@ class JobRunner:
         if start_blocks >= op.blocks:
             start_blocks = 0  # 记录异常时不冒险跳块，整体重做
 
-        pipe = ChunkPipeline(
+        assert self._executor is not None
+        return self._executor.run_op(op, start_blocks)
+
+    def _make_executor(self) -> Executor:
+        if self.executor_factory is not None:
+            return self.executor_factory(self)
+        # 默认：逐块拷贝（内存盘、镜像文件、离线镜像）
+        return BlockCopyExecutor(
             self.src,
             self.dst,
             self.params,
@@ -226,7 +252,16 @@ class JobRunner:
             on_chunk=self._on_chunk,
             on_retry=self._on_retry,
         )
-        return pipe.run_op(op, start_blocks)
+
+    # -- 给执行器工厂用的回调 ---------------------------------------------
+
+    @property
+    def chunk_callback(self) -> Callable:
+        return self._on_chunk
+
+    @property
+    def retry_callback(self) -> Callable:
+        return self._on_retry
 
     # -- 回调 -------------------------------------------------------------
 

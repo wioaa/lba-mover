@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import struct
 import threading
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -76,6 +77,8 @@ FSCTL_UNLOCK_VOLUME = 0x0009001C
 FSCTL_DISMOUNT_VOLUME = 0x00090020
 #: NTFS 自管搬迁：由文件系统搬簇并更新元数据（安全路径）
 FSCTL_MOVE_FILE = 0x00090074
+#: 查文件的 VCN→LCN 映射（METHOD_NEITHER，必须用虚拟内存缓冲）
+FSCTL_GET_RETRIEVAL_POINTERS = 0x00090073
 IOCTL_DISK_GET_DRIVE_GEOMETRY = 0x00070000
 IOCTL_DISK_GET_LENGTH_INFO = 0x0007405C
 
@@ -399,12 +402,126 @@ class Win32Native:
         Win32Native.ioctl(volume_handle, FSCTL_MOVE_FILE, data, 0)
 
     @staticmethod
+    def ioctl_neither(handle: int, code: int, address: int, in_size: int, out_size: int) -> int:
+        """METHOD_NEITHER 的 IOCTL：驱动直接拿裸指针读写同一块缓冲。
+
+        这类 IOCTL（如 retrieval pointers）不能走 ``byref(结构体)`` 那套，
+        缓冲必须是我们自己分配的、地址稳定的内存（``VirtualAlloc``）。
+        返回实际写入字节数。
+        """
+        returned = wintypes.DWORD(0)
+        ok = _kernel32().DeviceIoControl(
+            wintypes.HANDLE(handle),
+            code,
+            ctypes.c_void_p(address),
+            in_size,
+            ctypes.c_void_p(address),
+            out_size,
+            ctypes.byref(returned),
+            None,
+        )
+        if not ok:
+            err = ctypes.get_last_error()
+            # 缓冲不足时驱动会把已填好的部分写回来，调用方可以先用着
+            if err != ERROR_MORE_DATA and err != ERROR_INSUFFICIENT_BUFFER:
+                raise _win_error(f"IOCTL 0x{code:08X}")
+        return int(returned.value)
+
+    @staticmethod
+    def query_retrieval_pointers(handle: int) -> tuple[tuple[int, int, int], ...]:
+        """返回 ``((start_vcn, start_lcn, count), ...)``；``lcn == -1`` 表示稀疏。
+
+        这是判断"文件现在到底占哪些簇"的唯一可靠来源，也是搬簇之前**必须**
+        重新查一次的校验依据——扫描到执行之间文件可能已经变了。
+        """
+        size = 64 * 1024
+        for _attempt in range(6):
+            buf = AlignedBuffer(size)
+            try:
+                # 入参是 STARTING_VCN_INPUT_BUFFER，与输出共用同一块缓冲
+                ctypes.memmove(buf.address, struct.pack("<q", 0), 8)
+                got = Win32Native.ioctl_neither(
+                    handle, FSCTL_GET_RETRIEVAL_POINTERS, buf.address, 8, size
+                )
+                raw = buf.to_bytes(got) if got else buf.to_bytes(size)
+                parsed = _parse_retrieval(raw)
+                if parsed is not None:
+                    return parsed
+            finally:
+                buf.free()
+            size *= 4  # 碎片极多的文件需要更大缓冲，重试一次就够
+        raise DeviceError("查询文件簇映射失败：缓冲反复不足", error_class=ErrorClass.FATAL)
+
+    @staticmethod
+    def open_file(path: str, writable: bool = True) -> int:
+        """打开文件拿句柄（FSCTL_MOVE_FILE 要的是文件句柄，不是卷句柄）。"""
+        access = GENERIC_READ | (GENERIC_WRITE if writable else 0)
+        handle = _kernel32().CreateFileW(
+            long_path(path),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,  # 允许打开目录/特殊文件
+            None,
+        )
+        if handle == INVALID_HANDLE_VALUE or handle is None:
+            err = ctypes.get_last_error()
+            raise DeviceError(
+                f"打开文件失败 {path}：{ctypes.FormatError(err).strip()}",
+                error_class=classify_winerror(err),
+                winerror=err,
+            )
+        return int(handle)
+
+    @staticmethod
     def query_cluster_geometry(handle: int) -> tuple[int, int]:
         """返回 ``(bytes_per_sector, sectors_per_cluster)``。"""
         sector = Win32Native.sector_size(handle)
         raw = Win32Native.ioctl(handle, IOCTL_DISK_GET_DRIVE_GEOMETRY, None, ctypes.sizeof(_DISK_GEOMETRY))
         geo = _DISK_GEOMETRY.from_buffer_copy(raw[: ctypes.sizeof(_DISK_GEOMETRY)])
         return sector, max(1, int(geo.SectorsPerTrack))
+
+
+def long_path(path: str) -> str:
+    """超过 248 字符的路径要加长路径前缀，否则 CreateFileW 直接失败。
+
+    前缀是 Windows 的「双反斜杠 + ? + 反斜杠」约定。这里用 ``chr(92)`` 拼，
+    是因为这一串反斜杠在多层转义里极易被吃掉一位；少一个的后果是
+    CreateFileW 报"文件名语法不正确"，而且**只在超长路径上出现**。
+    """
+    prefix = "\\\\?\\"
+    if path.startswith(prefix):
+        return path
+    p = path if os.path.isabs(path) else os.path.abspath(path)
+    if len(p) >= 248:
+        return prefix + p
+    return p
+
+
+def _parse_retrieval(raw: bytes) -> tuple[tuple[int, int, int], ...] | None:
+    """解析 RETRIEVAL_POINTERS_BUFFER。
+
+    布局：``DWORD ExtentCount; LARGE_INTEGER StartingVcn; {LARGE_INTEGER NextVcn,
+    LARGE_INTEGER Lcn}[]``。每个 extent 的长度由下一个 NextVcn 推出来。
+    """
+    if len(raw) < 16:
+        return None
+    extent_count = struct.unpack_from("<I", raw, 0)[0]
+    starting_vcn = struct.unpack_from("<q", raw, 8)[0]
+    if extent_count == 0:
+        return ()
+    avail = (len(raw) - 16) // 16
+    use = min(extent_count, avail)
+    out: list[tuple[int, int, int]] = []
+    prev_vcn = starting_vcn
+    for i in range(use):
+        next_vcn, lcn = struct.unpack_from("<qq", raw, 16 + i * 16)
+        count = next_vcn - prev_vcn
+        if count > 0:
+            out.append((prev_vcn, lcn, count))
+        prev_vcn = next_vcn
+    return tuple(out)
 
 
 # --------------------------------------------------------------------------
@@ -581,6 +698,46 @@ class Win32VolumeDevice(BlockDeviceBase):
 
     def bytes_range(self, ext) -> tuple[int, int]:
         return ext.start * self.geometry.block_size, ext.length * self.geometry.block_size
+
+
+class Win32ClusterMover:
+    """``FSCTL_MOVE_FILE`` 的最小封装：开卷、开文件、查映射、搬簇。
+
+    注意两处与 :class:`Win32VolumeDevice` 相反的地方：
+
+    * 卷句柄**不锁**（锁了就打不开卷上的文件，MOVE_FILE 也就无从谈起）；
+    * 不用无缓冲 IO（搬簇是文件系统元数据操作，跟裸扇区读写不是一回事）。
+    """
+
+    def __init__(self, device_path: str, *, writable: bool = True) -> None:
+        if not IS_WINDOWS:
+            raise DeviceUnavailable("Win32ClusterMover 只能在 Windows 上使用")
+        self._device_path = device_path
+        self._handle = Win32Native.open_volume(device_path, writable=writable, unbuffered=False)
+        self._writable = writable
+
+    def open_file(self, path: str, writable: bool = True) -> int:
+        return Win32Native.open_file(path, writable=writable and self._writable)
+
+    def query(self, handle: int) -> tuple[tuple[int, int, int], ...]:
+        return Win32Native.query_retrieval_pointers(handle)
+
+    def move(self, handle: int, start_vcn: int, start_lcn: int, count: int) -> None:
+        Win32Native.move_file_data(self._handle, handle, start_vcn, start_lcn, count)
+
+    def close_file(self, handle: int) -> None:
+        Win32Native.close(handle)
+
+    def close(self) -> None:
+        if getattr(self, "_handle", 0):
+            Win32Native.close(self._handle)
+            self._handle = 0
+
+    def __enter__(self) -> "Win32ClusterMover":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 # --------------------------------------------------------------------------

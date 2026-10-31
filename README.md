@@ -23,6 +23,9 @@ PYTHONPATH=src python -m lbamover selftest --blocks 4096 --files 24
 # 列出本机可整理的卷
 PYTHONPATH=src python -m lbamover volumes
 
+# 解析一份 NTFS 卷镜像（上真机前的验收）；没有镜像就先生成一份合成的
+PYTHONPATH=src python -m lbamover ntfs --image .tmp/demo.img --make-demo
+
 # 跑测试（唯一入口）
 python tools/testflow.py
 
@@ -113,38 +116,50 @@ python packaging/verify_gui_launch.py   # 5 秒后自动关闭，退出码 0 = �
 
 | 能力 | 状态 |
 | --- | --- |
+| **NTFS 文件表解析（$MFT → 文件 → 簇区间）** | ✅ 已实现：引导扇区 → 记录 0 → runlist → 全表扫描 → 路径还原 → `$Bitmap` 自由空间 |
+| **簇级搬迁（`FSCTL_MOVE_FILE`）** | ✅ 已实现：文件系统自己搬簇并更新元数据，这是唯一安全的原地整理路径 |
+| **保护层** | ✅ 元文件 / 系统目录 / 页面文件 / 系统属性文件排除；搬完空闲余量下限；执行前二次审计 |
 | 块级流式搬运（内存盘 / 镜像文件） | ✅ 完整可用，逐块校验通过 |
 | 碎片分析与分桶可视化 | ✅ |
 | 三种整理策略 + 规划静态自检 | ✅ |
 | 并发 / 限速 / 暂停 / 停止 / 断点续做 | ✅ |
 | 卷枚举、系统卷识别 | ✅ 普通权限即可 |
-| Windows 原始卷**读** | ✅ 已实现（页对齐 + 短读补齐），未在真机管理员权限下验证 |
-| Windows 原始卷**写** | ⚠ 需管理员 + 必须先锁卷；对已挂载卷裸写会**破坏文件系统**，代码默认拒绝 |
-| `FSCTL_MOVE_FILE`（NTFS 安全搬簇） | ✅ 原语已实现，待接入文件枚举 |
-| 实时 NTFS 文件枚举（MFT / retrieval pointers） | ❌ **未实现**（下一版的第一优先级） |
-| 卷镜像离线整理 | ✅ `lbamover run --image ... --layout ...` |
+| Windows 原始卷读写（离线镜像用） | ✅ 已实现（页对齐 + 短读补齐 + 锁卷），未在管理员权限下真机验证 |
+| **真机 NTFS 整理全链路** | ⚠ **代码完整，但未在管理员权限的真实卷上验证过**（见下） |
+| exFAT / FAT32 | ❌ 不支持（没有 MFT，本版不做） |
 
-拿不到文件表时**不会**返回空报告。空报告会让界面显示"卷很健康"，而事实
-是根本没看过——这类假象比报错危险。此时界面上会明确写出能力不足。
+**上真机之前请先做这一步**：把目标分区导成镜像（`dd` / Win32DiskImager），
+用 `lbamover ntfs --image dump.img` 确认文件表读得对，再动真卷。
+
+```bash
+# 没有真盘也能验收解析器：先生成一份结构合法的合成 NTFS 镜像再解析
+PYTHONPATH=src python -m lbamover ntfs --image .tmp/demo.img --make-demo
+```
 
 ---
 
 ## 安全须知
 
-1. **本工具会写块**。对已挂载的卷做原始块写入必然破坏文件系统，代码里
-   强制要求先锁卷，并对该路径默认拒绝。
+1. **本工具会改块**。真机路径走 `FSCTL_MOVE_FILE`（文件系统自己搬簇），
+   不走裸写——裸写已挂载卷必然破坏文件系统，代码对那条路默认拒绝。
 2. 系统卷执行整理要求手输盘符确认，不提供"回车即通过"的路径。
-3. 演示模式（`--demo` / 「演示模式」按钮）在内存里造一个 32 MiB 合成卷，
+3. **保护层默认生效**：MFT 元文件、`Windows\System32` / `WinSxS` / `$Recycle.Bin`
+   等系统目录、`pagefile.sys` / `hiberfil.sys` 等系统文件、带系统属性的文件，
+   一律不进计划。规划阶段过滤一次，执行前再审计一次。
+4. 搬完后必须至少留 5% 空闲（或卷容量的 1/20，取较大者），否则拒绝执行。
+5. 演示模式（`--demo` / 「演示模式」按钮）在内存里造一个 32 MiB 合成卷，
    全程不碰真实磁盘，用于验收与演示。
-4. `verify`（回读校验）默认开启。关掉会快一倍，但坏块不会被发现。
+6. `verify`（回读校验）默认开启。真机路径下它校验的是"搬完后文件是否真的
+   变成一段连续簇"，而不是逐块比对（那需要把数据读一遍）。
 
 ---
 
 ## 目录速览
 
 ```
-src/lbamover/{contract,engine,devices,platform,ui}/   见 docs/ARCHITECTURE.md
-tests/                     216 个用例
+src/lbamover/{contract,engine,devices,ntfs,platform,ui}/   见 docs/ARCHITECTURE.md
+src/lbamover/ntfs/         NTFS 解析：boot / runlist / record / catalog / synth
+tests/                     290 个用例
 scripts/smoke.py           全链路冒烟
 scripts/shots.py           界面截图（视觉评审用）
 tools/testflow.py          测试入口（零第三方依赖）

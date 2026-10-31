@@ -48,8 +48,9 @@ from .catalog import CatalogError, StaticCatalog
 from .checkpoint import Checkpoint, CheckpointStore, JsonlJournal, default_state_dir
 from .control import RunControl
 from .errors import CancelledError, PlanRejected
-from .frag import DEFAULT_BUCKETS, analyze, free_extents_from_files
+from .frag import DEFAULT_BUCKETS, analyze, bucketize, free_extents_from_files
 from .planner import build_plan, validate_plan
+from .safety import DEFAULT_POLICY, ProtectionPolicy, audit_plan
 from .scheduler import ExecutionResult, JobRunner
 
 __all__ = ["EngineCore", "EngineService", "DeviceProviderError"]
@@ -89,9 +90,15 @@ class EngineCore:
         sink: EventSink | None = None,
         catalog=None,
         state_dir: str | os.PathLike[str] | None = None,
+        catalog_factory=None,
+        policy: ProtectionPolicy | None = None,
     ) -> None:
         self.sink: EventSink = sink or NullSink()
         self.catalog = catalog or StaticCatalog()
+        #: 每次扫描临时打开的目录服务（真机 NTFS 的 MFT 解析）。
+        #: 与 ``catalog`` 二选一：``catalog_factory`` 优先。
+        self.catalog_factory = catalog_factory
+        self.policy: ProtectionPolicy = policy or DEFAULT_POLICY
         self._state_dir = state_dir
         self._seq = 0
         self._seq_lock = threading.Lock()
@@ -160,13 +167,35 @@ class EngineCore:
 
         self._set_state(JobState.SCANNING, f"扫描 {vol.mount_point}")
         t0 = time.monotonic()
+        cat = self.catalog
+        owned = None
         try:
-            files = tuple(self.catalog.list_files(vol))
-            free = tuple(self.catalog.free_extents(vol))
+            if self.catalog_factory is not None:
+                cat = self.catalog_factory(vol)
+                owned = cat
+            files = tuple(cat.list_files(vol))
+            free = tuple(cat.free_extents(vol))
+            stats = getattr(cat, "stats", None)
+            if stats is not None:
+                self._log(
+                    LogLevel.INFO,
+                    f"文件表解析：{stats.summary(vol.geometry.block_size)}",
+                    detail=f"耗时 {stats.elapsed_s * 1000:.0f} ms",
+                )
+                for note in stats.notes[:6]:
+                    self._log(LogLevel.DEBUG, note)
         except CatalogError as exc:
             self._log(LogLevel.ERROR, str(exc))
             self._set_state(JobState.IDLE, "扫描失败")
             raise
+        finally:
+            if owned is not None:
+                closer = getattr(owned, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except OSError:
+                        pass
         if not free:
             # 目录服务没给自由空间时用补集推算，两条路径互相校验
             free = free_extents_from_files(vol.geometry, files)
@@ -191,6 +220,71 @@ class EngineCore:
         self._set_state(JobState.IDLE, "扫描完成")
         return report
 
+    # -- 保护策略 ---------------------------------------------------------
+
+    def _screened_report(self) -> FragReport:
+        """按保护策略过滤后的报告。
+
+        **原报告保持不动**：执行前审计要靠它认出"这个文件本来是受保护的"，
+        如果这里把原报告也换掉，审计就再也说不清为什么该拦。
+        """
+        assert self.report is not None
+        allowed, blocked = self.policy.screen(self.report.files)
+        if not blocked:
+            return self.report
+        counts: dict[str, int] = {}
+        for _f, reason in blocked:
+            counts[reason] = counts.get(reason, 0) + 1
+        detail = "；".join(f"{k}×{v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
+        self._log(LogLevel.INFO, f"保护策略拦下 {len(blocked)} 个文件，不参与本次整理", detail)
+        buckets = bucketize(
+            self.report.geometry,
+            allowed,
+            self.report.free_extents,
+            len(self.report.buckets) or DEFAULT_BUCKETS,
+        )
+        return replace(self.report, files=allowed, buckets=buckets)
+
+    # -- 执行器选择 -------------------------------------------------------
+
+    def uses_cluster_mover(self, plan: Plan | None = None) -> bool:
+        """是否走 NTFS 自己的搬迁原语（此时不需要、也不能要锁定的裸块设备）。"""
+        plan = plan or self.plan
+        vol = self.volume
+        if vol is None or os.name != "nt":
+            return False
+        if not vol.filesystem.upper().startswith("NTFS"):
+            return False
+        if plan is not None and not plan.strategy.writes_blocks:
+            return False
+        return True
+
+    def make_executor_factory(self, plan: Plan | None = None):
+        """返回 ``factory(runner) -> Executor``；``None`` 表示用逐块拷贝。"""
+        if not self.uses_cluster_mover(plan):
+            return None
+        from ..devices.win32 import Win32ClusterMover
+
+        from .executor import NtfsMoveExecutor
+
+        volume = self.volume
+        cluster_size = volume.geometry.block_size  # NTFS 卷的块大小 == 簇大小
+
+        def factory(runner) -> "NtfsMoveExecutor":
+            mover = Win32ClusterMover(volume.device_path)
+            return NtfsMoveExecutor(
+                mover,
+                runner.params,
+                self.control,
+                cluster_size=cluster_size,
+                limiter=runner.limiter,
+                on_chunk=runner.chunk_callback,
+                on_retry=runner.retry_callback,
+                verify=runner.params.verify,
+            )
+
+        return factory
+
     # -- 规划 -------------------------------------------------------------
 
     def make_plan(
@@ -205,7 +299,9 @@ class EngineCore:
         p = params or self.params
         self.job_id = f"job-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         self._set_state(JobState.PLANNING, f"规划 {strategy.value}")
-        plan = build_plan(self.job_id, strategy, self.report, file_ids=file_ids, params=p)
+
+        plan_report = self._screened_report()
+        plan = build_plan(self.job_id, strategy, plan_report, file_ids=file_ids, params=p)
         problems = validate_plan(plan, self.volume.geometry.block_count)
         if problems:
             plan = replace(plan, feasible=False, reasons=tuple(problems))
@@ -252,6 +348,22 @@ class EngineCore:
                 self._log(LogLevel.ERROR, reason)
             raise PlanRejected(list(plan.reasons) or ["计划标记为不可行"])
 
+        # 执行前复核：计划里不能有受保护对象，搬完必须留够空闲。
+        # 规划阶段已经过滤过一次，这里再查一次——少这一道就是漏洞，因为
+        # "规划时过滤了"依赖每一个调用方都记得，而调用方会越来越多。
+        audit = audit_plan(plan, self.report, self.policy, volume=self.volume)
+        if not audit.allowed:
+            for reason in audit.reasons:
+                self._log(LogLevel.ERROR, f"审计未通过：{reason}")
+            for path, why in audit.blockers:
+                self._log(LogLevel.ERROR, f"{path} —— {why}")
+            raise PlanRejected(list(audit.reasons))
+        self._log(
+            LogLevel.INFO,
+            f"执行前审计通过：搬完后剩余 {audit.free_after_blocks} 块空闲"
+            f"（安全下限 {audit.required_free_blocks} 块）",
+        )
+
         if not plan.ops:
             self._log(LogLevel.WARNING, "计划里没有可执行的操作")
             result = ExecutionResult()
@@ -261,7 +373,10 @@ class EngineCore:
 
         self.job_id = plan.job_id
         self.control = RunControl()
-        dev = device if device is not None else (open_device_fn or _default_open)(self.volume)
+        factory = self.make_executor_factory(plan)
+        dev = device
+        if factory is None and dev is None:
+            dev = (open_device_fn or _default_open)(self.volume)
 
         state_dir = self._state_dir if self._state_dir is not None else default_state_dir()
         store = CheckpointStore(os.path.join(state_dir, f"{plan.job_id}.checkpoint.json"))
@@ -295,6 +410,7 @@ class EngineCore:
             on_progress=self._on_progress,
             on_log=lambda m: self._log(LogLevel.INFO, m),
             halt_on_error=halt_on_error,
+            executor_factory=factory,
         )
 
         try:
@@ -482,9 +598,15 @@ class EngineService:
                     self.core._log(LogLevel.WARNING, reason)
                 self.core._log(LogLevel.WARNING, "没有可执行的整理操作")
                 return
-            self._device = self._open(self.core.volume)
-            self.core.execute(plan, self._device)
-            self._release_device()
+            if self.core.uses_cluster_mover(plan):
+                # 真机 NTFS：执行器自己开卷 + 开文件。
+                # 这里刻意**不**打开裸块设备——Win32VolumeDevice 写入前要求
+                # 锁卷，而锁了卷就打不开卷上的文件，MOVE_FILE 也就无从谈起。
+                self.core.execute(plan, None)
+            else:
+                self._device = self._open(self.core.volume)
+                self.core.execute(plan, self._device)
+                self._release_device()
             return
 
     def _open(self, volume):

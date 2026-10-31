@@ -81,6 +81,16 @@ EXCLUDES = [
 
 # 函数内延迟导入的模块，静态分析可能跟丢；显式列出来更保险
 HIDDEN = [
+    # 全部是函数内延迟导入，静态分析不保证跟得住；真机路径缺一个模块
+    # 的表现是"打包后点扫描就报 ImportError"，而源码树里一切正常。
+    "lbamover.ntfs",
+    "lbamover.ntfs.boot",
+    "lbamover.ntfs.runlist",
+    "lbamover.ntfs.record",
+    "lbamover.ntfs.catalog",
+    "lbamover.ntfs.synth",
+    "lbamover.engine.safety",
+    "lbamover.engine.executor",
     "lbamover.devices.win32",
     "lbamover.platform.privilege",
     "lbamover.platform.volumes",

@@ -16,12 +16,19 @@ retrieval pointers，然后把 runlist 转成 ``Extent``。接口已经在这里
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Iterable
 
 from ..contract.models import Extent, FileFrag, VolumeInfo
 
-__all__ = ["StaticCatalog", "JsonCatalog", "UnsupportedCatalog", "CatalogError"]
+__all__ = [
+    "StaticCatalog",
+    "JsonCatalog",
+    "UnsupportedCatalog",
+    "CatalogError",
+    "open_ntfs_catalog",
+]
 
 
 class CatalogError(RuntimeError):
@@ -97,6 +104,35 @@ class JsonCatalog:
 
     def free_extents(self, volume: VolumeInfo) -> Iterable[Extent]:
         return self._free
+
+
+def open_ntfs_catalog(volume: VolumeInfo, *, min_clusters: int = 1):
+    """为真实 NTFS 卷打开文件目录服务。**这是真机扫描的入口。**
+
+    只读打开卷：扫描阶段一个字节都不写。句柄由调用方在用完后关闭
+    （:meth:`lbamover.ntfs.MftCatalog.close`）。
+    """
+    if os.name != "nt":
+        raise CatalogError("实时文件表解析只在 Windows 上可用")
+    if not volume.filesystem.upper().startswith("NTFS"):
+        raise CatalogError(
+            f"{volume.mount_point} 是 {volume.filesystem or '未知'}，"
+            "本版的文件表解析只支持 NTFS"
+        )
+    # 延迟导入：engine 包的其它部分在非 Windows 上也要能 import
+    from ..devices import DeviceSpec, open_device
+    from ..ntfs import MftCatalog
+
+    device = open_device(
+        DeviceSpec(
+            kind="win32",
+            path=volume.device_path,
+            block_size=volume.geometry.block_size,
+            writable=False,
+            unbuffered=True,
+        )
+    )
+    return MftCatalog(device, min_clusters=min_clusters)
 
 
 class UnsupportedCatalog:

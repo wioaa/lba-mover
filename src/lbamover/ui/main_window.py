@@ -37,7 +37,7 @@ from ..contract.enums import JobState, LogLevel, Strategy, VolumeKind
 from ..contract.models import FragReport, JobParams, JobSpec, Plan, Progress, VolumeInfo
 from ..devices.base import DeviceError
 from ..devices.memory import MemoryDevice
-from ..engine.catalog import StaticCatalog, UnsupportedCatalog
+from ..engine.catalog import StaticCatalog, UnsupportedCatalog, open_ntfs_catalog as _open_ntfs_catalog
 from ..engine.engine import EngineCore, EngineService
 from ..engine.synth import apply_plan, build_layout, populate, verify
 from ..platform.volumes import enumerate_volumes
@@ -83,7 +83,13 @@ class MainWindow(QMainWindow):
 
         # -- 引擎 --
         self.bridge = EngineBridge(self)
-        self.core = EngineCore(sink=self.bridge, catalog=UnsupportedCatalog())
+        # 真机卷走 NTFS 文件表解析（每次扫描临时打开、用完即关）；
+        # 演示卷在 load_demo 里改成 StaticCatalog。
+        self.core = EngineCore(
+            sink=self.bridge,
+            catalog=UnsupportedCatalog(),
+            catalog_factory=_open_ntfs_catalog,
+        )
         self.service = EngineService(self.core, device_provider=self._provide_device)
 
         self._build_ui()
@@ -329,6 +335,8 @@ class MainWindow(QMainWindow):
         params = self.params_panel.current()
         if params is not None:
             self._params = params
+        # 演示卷用内存目录；真实卷每次扫描时临时打开 MFT
+        self.core.catalog_factory = None if vol.device_path == DEMO_DEVICE_PATH else _open_ntfs_catalog
         self.core.set_target(vol, self._params)
         self.frag_map.set_report(None)
         self.progress.reset()
@@ -542,6 +550,7 @@ class MainWindow(QMainWindow):
             note="内存合成卷，用于演示与冒烟验证",
         )
         self.core.catalog = StaticCatalog(layout.files, layout.free, volume_key=DEMO_DEVICE_PATH)
+        self.core.catalog_factory = None  # 演示卷不走 MFT
         self.log_view.append(
             LogLevel.INFO,
             f"演示卷已就绪：{fmt_bytes(layout.geometry.total_bytes)}，"

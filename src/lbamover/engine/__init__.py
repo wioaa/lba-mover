@@ -9,23 +9,32 @@ from __future__ import annotations
 from .control import RunControl
 from .errors import CancelledError, PlanRejected, VerifyError
 from .engine import DeviceProviderError, EngineCore, EngineService
+from .executor import BlockCopyExecutor, Executor, NtfsMoveExecutor
 from .frag import DEFAULT_BUCKETS, analyze, bucketize, free_extents_from_files
 from .planner import build_plan, select_files, validate_plan
+from .safety import DEFAULT_POLICY, PlanAudit, ProtectionPolicy, audit_plan
 from .scheduler import ExecutionResult, JobRunner, RateLimiter
 
 __all__ = [
+    "BlockCopyExecutor",
     "CancelledError",
+    "DEFAULT_POLICY",
     "DeviceProviderError",
     "DEFAULT_BUCKETS",
     "EngineCore",
     "EngineService",
     "ExecutionResult",
+    "Executor",
     "JobRunner",
+    "NtfsMoveExecutor",
+    "PlanAudit",
+    "ProtectionPolicy",
     "PlanRejected",
     "RateLimiter",
     "RunControl",
     "VerifyError",
     "analyze",
+    "audit_plan",
     "bucketize",
     "build_plan",
     "free_extents_from_files",

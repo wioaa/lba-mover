@@ -128,6 +128,44 @@ def retry_and_cancel():
     return f"重试 {res.retries} 次后成功；取消立即返回"
 
 
+def ntfs_mft_scan():
+    """真机路径的核心：从 NTFS 元数据里读出「文件 → 簇区间」。
+
+    跑在结构合法的合成镜像上——没有管理员权限的机器也必须能验证它，
+    否则"支持 NTFS"就只是句口号。
+    """
+    from lbamover.devices.memory import MemoryDevice
+    from lbamover.ntfs.catalog import MftCatalog
+    from lbamover.ntfs.synth import build_ntfs_image
+
+    dev = MemoryDevice(1024, 4096, writable=True, name="ntfs.img")
+    info = build_ntfs_image(dev, total_clusters=1024, record_slots=64)
+    cat = MftCatalog.open(dev)
+    stats = cat.scan()
+    assert stats.records_bad == 0, f"坏记录 {stats.records_bad} 条"
+
+    got = {f.path: f.extents for f in cat.list_files(None)}
+    for name, extents in info.layout:
+        assert got.get(name) == extents, f"{name} 解析结果 {got.get(name)} != {extents}"
+    assert stats.free_source == "bitmap", stats.free_source
+    return f"{len(got)} 个文件，簇区间逐段一致"
+
+
+def protection_screens():
+    """保护层：系统目录/页面文件/元文件必须被挡在计划之外。"""
+    from lbamover.contract.models import Extent, FileFrag
+    from lbamover.engine.safety import DEFAULT_POLICY
+
+    def v(path, fid="99", attrs=0):
+        return DEFAULT_POLICY.verdict(FileFrag(fid, path, (Extent(0, 4),), attributes=attrs))
+
+    assert v("$MFT", fid="3") is not None
+    assert v("D:" + chr(92) + "Windows" + chr(92) + "System32" + chr(92) + "a.dll") is not None
+    assert v("D:" + chr(92) + "pagefile.sys") is not None
+    assert v("D:" + chr(92) + "data" + chr(92) + "a.bin") is None
+    return "元文件/系统目录/页面文件被拦，普通文件放行"
+
+
 # ----------------------------------------------------------------------
 # 2. UI
 # ----------------------------------------------------------------------
@@ -221,13 +259,17 @@ def main(argv: list[str] | None = None) -> int:
     print("LBAMover 冒烟验证")
     print("=" * 68)
 
-    print("\n[1/3] 引擎流水线")
+    print("\n[1/4] 引擎流水线")
     check("引擎端到端（扫描→规划→执行→逐块校验）", engine_roundtrip)
     check("分块流水线与内存上界", memory_bound)
     check("重试与取消", retry_and_cancel)
 
+    print("\n[2/4] 真机 NTFS 与保护层")
+    check("MFT 解析（合成 NTFS 镜像 → 簇区间）", ntfs_mft_scan)
+    check("保护策略拦截", protection_screens)
+
     if not args.no_gui:
-        print("\n[2/3] GUI 装配与驱动")
+        print("\n[3/4] GUI 装配与驱动")
         import lbamover
 
         print(f"      版本 {lbamover.VERSION_DISPLAY}")
@@ -240,9 +282,9 @@ def main(argv: list[str] | None = None) -> int:
 
         check("窗口构建 + 扫描 + 执行 + 校验", _ui)
     else:
-        print("\n[2/3] GUI 部分已跳过（--no-gui）")
+        print("\n[3/4] GUI 部分已跳过（--no-gui）")
 
-    print("\n[3/3] 结果")
+    print("\n[4/4] 结果")
     failed = [r for r in RESULTS if not r[1]]
     print(f"  通过 {len(RESULTS) - len(failed)} / {len(RESULTS)}")
     if failed:
