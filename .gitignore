@@ -29,3 +29,6 @@ scratch/
 
 # 断点与流水（默认写在仓库内，见 engine/checkpoint.py）
 .lbamover/
+
+# 项目记忆：含本机绝对路径，不入公开仓库
+.workbuddy/
