@@ -67,7 +67,13 @@ pytest 全绿不代表 exe 能跑）：
 3. `LBAMover-cli.exe smoke` 与 `LBAMover.exe --smoke` **各自**无头建窗口并
    跑完一次完整搬迁（窗口程序没有 stdout，靠退出码汇报）。
 
-已额外手工确认：真实 Windows 平台下 `LBAMover.exe --demo` 能创建主窗口
+真实平台启动校验（会弹窗，所以不进构建脚本，手工跑）：
+
+```bash
+python packaging/verify_gui_launch.py   # 5 秒后自动关闭，退出码 0 = 主窗口出现
+```
+
+已确认：`LBAMover.exe --demo` 在真实 Windows 平台创建出主窗口
 （标题 `LBAMover 2.0.0 — LBA 块级流式整理`）。
 
 > exe 未做代码签名，首次运行会有 SmartScreen 提示；内网分发可先用
