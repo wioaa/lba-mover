@@ -1,186 +1,166 @@
 # LBAMover 2.0
 
-以 **LBA 块**为单位的流式整理引擎 + PySide6 桌面控制台。
+**把一个文件的碎片，搬成连续的一段。**
 
-从 0 重建，不含上一代（LBA Tail Mover / LBA Defrag Organizer）的任何代码。
-旧仓库的两个回退标签 `pre-rebuild` / `legacy/1.0.0I` 保留在 `lba-mover` 原仓库，
-本仓库是全新的 2.0.0 起点。
+Windows 上的 NTFS 卷用久了，文件会被切成几十上百个碎片散在盘上。LBAMover
+以 **LBA 块**为最小单位做这事：先在内存里算出「哪个文件的哪几段该搬到哪」，
+再用文件系统自己的搬簇接口落盘，全程有保护层、有断点、有逐条失败原因。
+
+```
+扫描卷 → 规划搬迁 → 审计 → 搬簇 → 复核
+```
+
+Python 3.11+ · Windows x64 · 引擎零第三方依赖 · 界面 PySide6
 
 ---
 
-## 一分钟跑起来
+## ⚠️ 先读这一段
+
+**这个工具会改动磁盘上的块。** 用之前请接受这三件事：
+
+1. **先备份。** 任何声称"安全"的整理工具都不该被盲信，包括这个。
+2. **它只走 `FSCTL_MOVE_FILE`** —— 让 NTFS 自己搬簇并更新元数据，不走裸写。
+   裸写已挂载的卷必然破坏文件系统，那条路在代码里默认拒绝。
+3. **第一次上真机前，先拿镜像验收**：
+   ```bash
+   lbamover ntfs --image dump.img   # 解析文件表，确认识别得对
+   ```
+
+系统卷（C:）执行整理要求**手输盘符**确认，没有"回车即通过"的路径。
+
+---
+
+## 拿到它
+
+### 方式一：直接用（自己封一个 exe）
+
+仓库不随代码分发二进制。封包脚本一条命令，产物在 `dist/`：
 
 ```bash
-# 依赖：Python 3.11+，UI 需要 PySide6（引擎核心零第三方依赖）
 pip install -r requirements.txt
-
-# 启动桌面端，并立刻载入一个内存合成卷（不接触真实磁盘）
-PYTHONPATH=src python -m lbamover gui --demo
-
-# 纯命令行自检：造碎片 → 扫描 → 规划 → 执行 → 逐块校验
-PYTHONPATH=src python -m lbamover selftest --blocks 4096 --files 24
-
-# 列出本机可整理的卷
-PYTHONPATH=src python -m lbamover volumes
-
-# 解析一份 NTFS 卷镜像（上真机前的验收）；没有镜像就先生成一份合成的
-PYTHONPATH=src python -m lbamover ntfs --image .tmp/demo.img --make-demo
-
-# 跑测试（唯一入口）
-python tools/testflow.py
-
-# 全链路冒烟（引擎 + GUI 装配 + 经引擎线程跑一次真实搬迁）
-PYTHONPATH=src python scripts/smoke.py
-```
-
-`selftest` 成功时输出一行 `[PASS]` 并以 0 退出。
-
----
-
-## 封包
-
-```bash
 python packaging/build.py            # 图标 → 版本资源 → PyInstaller → wheel → zip → 校验和
-python packaging/build.py --no-wheel # 只出 exe
 ```
 
-产物：
-
-| 路径 | 说明 |
+| 产物 | 说明 |
 | --- | --- |
-| `dist/LBAMover/LBAMover.exe` | 图形界面，双击即用，无控制台窗口（2.8 MB） |
-| `dist/LBAMover/LBAMover-cli.exe` | 命令行：`volumes` / `selftest` / `smoke` |
-| `dist/LBAMover/_internal/` | Python 运行时 + Qt 插件，两个 exe **共用一份** |
-| `dist/LBAMover-2.0.0-win64.zip` | 分发用压缩包，47.7 MiB |
+| `dist/LBAMover/LBAMover.exe` | 图形界面，双击即用（单一 exe 3 MB，运行库在 `_internal/`） |
+| `dist/LBAMover/LBAMover-cli.exe` | 命令行，`--version` / `volumes` / `scan` / `selftest` / `smoke` |
+| `dist/LBAMover-2.0.0E-win64.zip` | 解包即用，约 48 MiB |
 | `dist/lbamover-2.0.0-py3-none-any.whl` | `pip install` 用 |
 | `dist/SHA256SUMS.txt` | 上述产物的校验和 |
 
-目录解包后 115.7 MiB，其中 94 MiB 是 PySide6（`Qt6Core/Gui/Widgets` 加一个
-19.7 MB 的 `opengl32sw.dll` 软件 OpenGL 回退），6 MB 是 CPython。
+脚本**会自己验证产物**（版本号一致 / 合成卷端到端 / 两个 exe 各自无头跑一次
+完整搬迁），任一项失败即中止退出。源码树里测试全绿不代表 exe 能起来。
 
-**为什么不是 onefile**：onefile 每次启动都要把 ~80 MB 解压到临时目录，冷启动
-3~5 秒，杀软还会额外扫描自解压行为。这个工具经常是"双击后立刻要看到界面"，
-那个代价不合适。onedir 冷启动 0.6 秒左右，代价只是"产物是一个文件夹"。
+> 未做代码签名，首次运行有 SmartScreen 提示。介意就用 `SHA256SUMS.txt` 核对。
 
-**构建脚本会自动验证产物**，任一项失败即中止（这一步不能省——源码树里
-pytest 全绿不代表 exe 能跑）：
-
-1. `LBAMover-cli.exe --version` 与代码里的版本号一致；
-2. `LBAMover-cli.exe selftest` 合成卷端到端 + 逐块校验；
-3. `LBAMover-cli.exe smoke` 与 `LBAMover.exe --smoke` **各自**无头建窗口并
-   跑完一次完整搬迁（窗口程序没有 stdout，靠退出码汇报）。
-
-真实平台启动校验（会弹窗，所以不进构建脚本，手工跑）：
+### 方式二：从源码跑
 
 ```bash
-python packaging/verify_gui_launch.py   # 5 秒后自动关闭，退出码 0 = 主窗口出现
+pip install -r requirements.txt
+PYTHONPATH=src python -m lbamover gui --demo
 ```
 
-已确认：`LBAMover.exe --demo` 在真实 Windows 平台创建出主窗口
-（标题 `LBAMover 2.0.0 — LBA 块级流式整理`）。
-
-> exe 未做代码签名，首次运行会有 SmartScreen 提示；内网分发可先用
-> `SHA256SUMS.txt` 核对。
+`--demo` 会在内存里造一个 32 MiB 合成卷，**全程不碰真实磁盘**，用来先看看界面
+长什么样、流程怎么走。
 
 ---
 
-## 它做什么
+## 三种用法
 
-**引擎**（`src/lbamover/engine`，不依赖 Qt）：
+### 图形界面
 
-- 以 LBA 块为原子单位，把「一个文件的多个碎片区间」搬进一段连续区；
-- 读/写重叠的**有界**流水线：内存上界 = `chunk × block_size × 队列深度 × 并发`，
-  与卷大小无关（默认 8 MiB）；
-- 碎片检测：文件碎片度、自由空间碎片度、等宽分桶热力图；
-- 三个策略：合并碎片 / 向卷首聚拢 / 搬到卷尾，外加只分析（零写入）；
-- 任务调度：并发池、令牌桶限速、优先级排序、`requires_serial` 强制串行；
-- 断点续做：原子落盘 + 计划指纹校验，计划变了就拒绝续做；
-- 错误重试：只重试可重试错误，指数退避 + 抖动，有上限；
-- 进度上报：滑动窗口速率、ETA、重试/失败计数。
+```bash
+PYTHONPATH=src python -m lbamover gui
+```
 
-**界面**（`src/lbamover/ui`）：
+左栏选卷 → 选策略 → 预演 → 开始。中央是碎片分布双带图、指标块、最该整理的文件、
+进度与吞吐曲线；底部是可过滤的日志和固定操作栏。
 
-- 左栏：目标卷 → 策略 → 参数（含「内存上界」实时显示）；
-- 中央：碎片分布双带图（占用 / 碎片热力）、指标块、最值得整理的文件、
-  进度卡 + 吞吐曲线；
-- 底部：运行日志（级别过滤、错误横幅）与固定操作栏；
-- 窄窗口自动收起左栏，中央内容靠流式布局换行；窗口过矮时出现滚动条而
-  不是把卡片压到互相重叠。
+- **整理范围**：整卷，或手动勾选（支持搜索 / 只看碎片 / 按段数或大小排序）。
+  空选择会被锁住——引擎里"空列表"等于整卷，这个歧义不能留在界面上。
+- **权限徽标**：标题栏显示当前权限。非管理员时点一下就是「以管理员身份重启」。
+  这不只是提示——**未提权只能预览**（下面解释），所以它是能不能真干活的分界线。
+- 窗口窄了左栏自动收起，窗口矮了出滚动条，不会把卡片压到互相重叠。
 
-两者之间只有 `contract/` 这一层：8 条命令、6 类事件、若干 Protocol。
+### 命令行
+
+```bash
+lbamover volumes                      # 本机可整理的卷
+lbamover scan --volume D               # 扫描真实卷，打印碎片分布（诊断「扫不动」用）
+lbamover selftest --blocks 4096 --files 24   # 合成卷全链路 + 逐块校验，成功输出 [PASS]
+lbamover ntfs --image dump.img --make-demo   # 没有镜像就先生成一份结构合法的合成 NTFS
+lbamover run --image disk.img --layout layout.json --strategy compact   # 对镜像做离线演练
+lbamover smoke                        # 无头冒烟：建窗口 + 跑完一次真实搬迁
+```
+
+### 当库用
+
+```python
+from lbamover.engine import EngineCore
+# 引擎不依赖 Qt，可以在无 GUI 环境（CI、脚本、服务）跑完整流程
+```
+
+引擎与界面之间只有 `contract/` 一层：9 条命令、6 类事件、若干 Protocol。
 `ui/` 之外没有任何文件 import PySide6。
 
 ---
 
-## 能力矩阵（诚实版）
+## 能做什么，不能做什么
+
+诚实版，不含"即将支持"。
 
 | 能力 | 状态 |
 | --- | --- |
-| **NTFS 文件表解析（$MFT → 文件 → 簇区间）** | ✅ 已实现：引导扇区 → 记录 0 → runlist → 全表扫描 → 路径还原 → `$Bitmap` 自由空间 |
-| **簇级搬迁（`FSCTL_MOVE_FILE`）** | ✅ 已实现：文件系统自己搬簇并更新元数据，这是唯一安全的原地整理路径 |
-| **保护层** | ✅ 元文件 / 系统目录 / 页面文件 / 系统属性文件排除；搬完空闲余量下限；执行前二次审计 |
-| 块级流式搬运（内存盘 / 镜像文件） | ✅ 完整可用，逐块校验通过 |
-| 碎片分析与分桶可视化 | ✅ |
-| 四种整理策略 + 规划静态自检 | ✅ |
-| **可用空间整理** | ✅ 左栏策略选「腾出可用空间」：按 GiB 指定大小，选卷首或卷尾。它只承诺"这段连续空闲确实是空的"——做不到就报差额，不给"搬了一半"的结果。卷首有系统元文件时自动让开并说明实际落点 |
-| **失败原因 + 一键复制诊断** | ✅ 每条失败带阶段（打开文件/复核布局/搬簇/读写数据）、异常类型、错误分类（可重试/不可重试）与 Windows 错误码；日志面板「复制诊断」把版本、卷、参数、失败明细与最近日志打包成一段文本，可直接粘贴求助 |
-| **结局三档** | ✅ 已完成 / 部分完成（有成功有失败）/ 失败。部分完成用警告色，并明确提示"有文件没搬走" |
-| **手动选择文件（只整理勾选的文件）** | ✅ 左栏「整理范围」：整卷 / 手动。选择器支持搜索、只看碎片、按段数/大小/路径排序；未选文件时「开始整理」被锁住（空选择在引擎里等于整卷，不能含糊） |
-| **扫描进度** | ✅ 扫描与规划是没有总量的阶段，进度条走不确定模式并实时显示"已看 N 项 + 当前路径"，不编假百分比 |
-| 并发 / 限速 / 暂停 / 停止 / 断点续做 | ✅ |
-| 卷枚举、系统卷识别 | ✅ 普通权限即可 |
-| **权限提权入口** | ✅ 标题栏权限徽标可点：非管理员时直接「以管理员身份重启」（会弹 UAC，不在启动时自动弹） |
-| **未提权扫描（目录遍历 + 逐文件簇映射）** | ✅ 不需要任何权限。C: 卷 126.7 万条目 → 88.2 万文件 / 约 150s（8 路并发）；**只能预览**（拿不到 `$Bitmap`，看不到打不开的文件，界面会锁住「开始整理」） |
-| Windows 原始卷读写（离线镜像用） | ✅ 已实现（页对齐 + 短读补齐 + 锁卷），未在管理员权限下真机验证 |
-| **MFT 扫描（真实卷）** | ✅ 已在数据卷上跑通：3937 文件 / 全流程 0.8s / 841 段自由区。系统卷的卷句柄被 ACL 拒绝时自动回落到目录遍历 |
-| **真机搬簇执行（`FSCTL_MOVE_FILE`）** | ⚠ 代码完整，**未在真实卷上执行过**（见下） |
-| exFAT / FAT32 | ⚠ 只读预览（走目录遍历），不支持执行 |
+| 块级流式搬运（内存盘 / 镜像文件） | ✅ 逐块校验通过，内存上界与卷大小无关（默认 8 MiB） |
+| NTFS 文件表解析（`$MFT` → 文件 → 簇区间） | ✅ 数据卷上跑通：3937 文件 / 0.8s |
+| 簇级搬迁（`FSCTL_MOVE_FILE`） | ✅ 代码完整，⚠ **尚未在真实卷上执行过** |
+| 保护层（元文件 / 系统目录 / 页面文件 / 空闲余量） | ✅ 规划前过滤 + 执行前二次审计 |
+| 三个动作策略：合并碎片 / 向卷首聚拢 / 搬到卷尾 | ✅ 外加「只分析」零写入模式 |
+| **可用空间整理** | ✅ 按 GiB 指定大小，选卷首或卷尾。只承诺"这段连续空闲确实是空的"——做不到就报差额，不给"搬了一半"的结果 |
+| **手动选文件** | ✅ 只整理勾选的，选择身份是文件路径而非行号（跨扫描稳定） |
+| **失败原因 + 一键复制诊断** | ✅ 每条失败带阶段、异常类型、错误分类、Windows 错误码；日志面板把版本与明细打包成一段可直接粘贴求助的文本 |
+| **结局三档** | ✅ 已完成 / 部分完成 / 失败。19 成功 1 失败不会再显示成绿色"已完成" |
+| 并发 / 限速 / 暂停 / 停止 / 断点续做 | ✅ 断点带计划指纹，计划变了拒绝续做 |
+| **未提权扫描** | ⚠ 只读预览。走目录遍历 + 逐文件簇映射（不需要权限），但拿不到 `$Bitmap`、看不到打不开的文件 → 界面锁住「开始整理」 |
+| **MFT 扫描（提权后）** | ✅ 88 万文件约 20s（未提权约 150s）。权限徽标就是性能开关 |
+| exFAT / FAT32 | ⚠ 只读预览，不支持执行 |
 
-**上真机之前请先做这一步**：把目标分区导成镜像（`dd` / Win32DiskImager），
-用 `lbamover ntfs --image dump.img` 确认文件表读得对，再动真卷。
+扫描速度快慢的分层原因、位图与 MFT 的实现细节、为什么并发只有 1.6x：
+见 [`docs/ARCHITECTURE.md` §7.1](docs/ARCHITECTURE.md)。
+
+---
+
+## 开发
 
 ```bash
-# 没有真盘也能验收解析器：先生成一份结构合法的合成 NTFS 镜像再解析
-PYTHONPATH=src python -m lbamover ntfs --image .tmp/demo.img --make-demo
+python tools/testflow.py        # 唯一测试入口，只看 summary 一行
+PYTHONPATH=src python scripts/smoke.py    # 全链路冒烟（GUI 装配 + 经引擎线程真实搬迁）
+python scripts/shots.py         # 界面截图（视觉评审）
 ```
 
----
+测试断言的是数据正确性：搬完之后用 `synth.apply_plan()` 算出预期布局，再逐块哈希
+比对。`INVALID` 表示跑的过程中受版本控制或源码文件被改动，成败都不作数，只许重跑。
 
-## 安全须知
+| 目录 | 职责 |
+| --- | --- |
+| `src/lbamover/contract/` | 枚举 / 模型 / 命令 / 事件 / 端口。引擎与 UI 的唯一共享词汇 |
+| `src/lbamover/engine/` | 扫描 / 规划 / 调度 / 流水线 / 保护层 / 断点 |
+| `src/lbamover/ntfs/` | boot / runlist / record / catalog / bitmap / synth |
+| `src/lbamover/devices/` | 内存 / 镜像文件 / Windows 原始卷 |
+| `src/lbamover/platform/` | ctypes 封装，唯一的平台相关层 |
+| `src/lbamover/ui/` | PySide6 桌面端 |
+| `docs/ARCHITECTURE.md` | 目录职责、数据流、算法、取舍记录、真机边界 |
 
-1. **本工具会改块**。真机路径走 `FSCTL_MOVE_FILE`（文件系统自己搬簇），
-   不走裸写——裸写已挂载卷必然破坏文件系统，代码对那条路默认拒绝。
-2. 系统卷执行整理要求手输盘符确认，不提供"回车即通过"的路径。
-3. **保护层默认生效**：MFT 元文件、`Windows\System32` / `WinSxS` / `$Recycle.Bin`
-   等系统目录、`pagefile.sys` / `hiberfil.sys` 等系统文件、带系统属性的文件，
-   一律不进计划。规划阶段过滤一次，执行前再审计一次。
-4. 搬完后必须至少留 5% 空闲（或卷容量的 1/20，取较大者），否则拒绝执行。
-5. 演示模式（`--demo` / 「演示模式」按钮）在内存里造一个 32 MiB 合成卷，
-   全程不碰真实磁盘，用于验收与演示。
-6. `verify`（回读校验）默认开启。真机路径下它校验的是"搬完后文件是否真的
-   变成一段连续簇"，而不是逐块比对（那需要把数据读一遍）。
-7. **未提权时只能预览**：扫描会回落到目录遍历（拿到的是真实簇映射，但自由
-   空间靠反推、打不开的文件看不到），这种报告带 `restricted` 标记，
-   「开始整理」会被锁住并提示提权。不是限制你，是那种数据不足以决定"哪里安全"。
-
----
-
-## 目录速览
-
-```
-src/lbamover/{contract,engine,devices,ntfs,platform,ui}/   见 docs/ARCHITECTURE.md
-src/lbamover/ntfs/         NTFS 解析：boot / runlist / record / catalog / synth
-tests/                     404 个用例
-scripts/smoke.py           全链路冒烟
-scripts/shots.py           界面截图（视觉评审用）
-tools/testflow.py          测试入口（零第三方依赖）
-docs/ARCHITECTURE.md       目录职责、数据流、算法、取舍记录、后端边界
-```
+依赖**只向下**：`ui → contract ← engine → devices → platform`。由此保证引擎能在无
+GUI 的 CI 上跑完整流程，UI 能用假引擎单测，平台差异没有渗进引擎。
 
 ---
 
 ## 版本号约定
 
-`pyproject.toml` 的 `version` 永远只写三段（PEP 440 合法），小版本字母放在
-`[tool.lbamover].revision`，由 `lbamover/__init__.py` 拼成 `2.0.0E` 展示。
-`2.0.0E` 不是合法 PEP 440，pip 会直接拒绝——所以字母不能进 version 字段。
+`pyproject.toml` 的 `version` 永远只写三段（`2.0.0`，PEP 440 合法），小版本字母放在
+`[tool.lbamover].revision`，由代码拼成 `2.0.0E` 对外展示。
+
+`2.0.0E` 不是合法 PEP 440，pip 会直接拒绝——所以字母不能进 `version` 字段。
+两处必须一致，`tests/test_version.py` 盯着这件事。
