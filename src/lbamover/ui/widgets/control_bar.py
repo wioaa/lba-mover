@@ -92,7 +92,13 @@ class ControlBar(QWidget):
         self._state = state
         running = state in (JobState.RUNNING, JobState.PAUSED, JobState.STOPPING)
         busy = state in (JobState.SCANNING, JobState.PLANNING)
-        idle = state in (JobState.IDLE, JobState.DONE, JobState.FAILED, JobState.CANCELLED)
+        idle = state in (
+            JobState.IDLE,
+            JobState.DONE,
+            JobState.PARTIAL,
+            JobState.FAILED,
+            JobState.CANCELLED,
+        )
 
         self.btn_scan.setEnabled(self._has_target and not running and not busy)
         # 受限扫描（未提权）只给了预览数据，按它去写盘等于拿别人的簇当空地
@@ -129,6 +135,11 @@ class ControlBar(QWidget):
             self.summary.setText("正在停止，等待在途 chunk 写完…")
         elif state is JobState.DONE:
             self.summary.setText("已完成。可再次扫描确认碎片度变化")
+        elif state is JobState.PARTIAL:
+            self.summary.setText(
+                "部分完成：有文件没能搬走（多数是被独占打开或权限不足）。"
+                "详情见日志，处理占用后可再次开始"
+            )
         elif state is JobState.FAILED:
             self.summary.setText("执行失败，详情见日志面板")
         elif state is JobState.CANCELLED:

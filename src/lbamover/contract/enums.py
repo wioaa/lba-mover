@@ -7,6 +7,7 @@ from enum import Enum
 __all__ = [
     "ErrorClass",
     "EventKind",
+    "FreeSpaceSide",
     "JobState",
     "LogLevel",
     "Strategy",
@@ -23,7 +24,12 @@ class JobState(str, Enum):
                                              │         │
                                              └─────────┴─> STOPPING ─> CANCELLED
                                                           └────────> DONE
+                                                          └────────> PARTIAL
                                                           └────────> FAILED
+
+    ``DONE`` / ``PARTIAL`` / ``FAILED`` 三者的区别只在失败比例：全成功是
+    ``DONE``，有成功也有失败是 ``PARTIAL``，一个都没成功是 ``FAILED``。
+    合并成"完成/失败"两档会让"19 个成功 1 个失败"这种最常见的结局无家可归。
     """
 
     IDLE = "idle"
@@ -33,12 +39,18 @@ class JobState(str, Enum):
     PAUSED = "paused"
     STOPPING = "stopping"
     DONE = "done"
+    #: 大部分文件搬完了，但有若干个失败。
+    #:
+    #: 单独列出来是因为把它并进 ``DONE`` 会造成一个具体的误导：用户看到
+    #: 「已完成」，就认为"这块盘整理好了"，而实际上有些文件原样躺在碎片里。
+    #: 也不能一律 ``FAILED``：19 个成功 1 个失败说成"失败"同样不诚实。
+    PARTIAL = "partial"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
     @property
     def is_terminal(self) -> bool:
-        return self in (JobState.DONE, JobState.FAILED, JobState.CANCELLED)
+        return self in (JobState.DONE, JobState.PARTIAL, JobState.FAILED, JobState.CANCELLED)
 
     @property
     def is_active(self) -> bool:
@@ -55,7 +67,7 @@ class JobState(str, Enum):
 class Strategy(str, Enum):
     """整理策略。
 
-    只保留三个**动作语义明确**的策略。旧版把 ``range/auto_fill/compact/
+    只保留**动作语义明确**的策略。旧版把 ``range/auto_fill/compact/
     fragment/zone/relocate`` 六个并列塞进一个下拉，用户无法自解释，
     因此新版按「优化目标」而不是「算法名」命名。
     """
@@ -68,10 +80,26 @@ class Strategy(str, Enum):
     COMPACT = "compact"
     #: 把选中文件搬到卷尾，为卷首让出连续空间。
     RELOCATE_TAIL = "relocate_tail"
+    #: 腾出**指定大小**的连续可用空间，位置可由 ``FreeSpaceSide`` 指定卷首/卷尾。
+    #: 与 ``COMPACT`` 的差别是它不关心碎片度，只关心"目标区最后是不是全空"。
+    RECLAIM = "reclaim"
 
     @property
     def writes_blocks(self) -> bool:
         return self is not Strategy.ANALYZE_ONLY
+
+
+class FreeSpaceSide(str, Enum):
+    """「可用空间整理」把连续空闲区放在卷的哪一侧。"""
+
+    #: 卷首（低 LBA）。
+    HEAD = "head"
+    #: 卷尾（高 LBA）。
+    TAIL = "tail"
+
+    @property
+    def label(self) -> str:
+        return "卷首" if self is FreeSpaceSide.HEAD else "卷尾"
 
 
 class LogLevel(str, Enum):
@@ -107,6 +135,20 @@ class ErrorClass(str, Enum):
     CANCELLED = "cancelled"
     #: 数据校验不一致，重试一次通常能过（坏块多为随机）。
     VERIFY_MISMATCH = "verify_mismatch"
+
+    @property
+    def label(self) -> str:
+        """中文短标签。
+
+        英文枚举值不该出现在给用户看的文本里：``retryable`` 对程序员是
+        信息，对用户是噪音 —— 而这一档最重要的信息恰恰是"还要不要再点一次"。
+        """
+        return {
+            ErrorClass.RETRYABLE: "可重试",
+            ErrorClass.FATAL: "不可重试",
+            ErrorClass.VERIFY_MISMATCH: "校验不一致",
+            ErrorClass.CANCELLED: "已取消",
+        }[self]
 
 
 class VolumeKind(str, Enum):

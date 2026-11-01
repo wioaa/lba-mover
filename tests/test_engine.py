@@ -369,3 +369,96 @@ class TestScanProgress:
         counts = [e.progress.scanned_items for e in events]
         assert counts and max(counts) >= 120, f"没有上报扫描条目数：{counts}"
         assert any("f120" in e.progress.current_path for e in events), "没有上报当前路径"
+
+
+class TestPartialOutcome:
+    """结局必须三档：全成功 / 部分完成 / 全失败。
+
+    原来只有两档，于是"19 个成功 1 个失败"落进 ``DONE``，界面显示「已完成」。
+    用户看到绿色的"已完成"就走了，而没搬走的那些文件还躺在碎片里 —— 状态
+    在撒谎，比报错更糟：报错至少会让人去查。
+    """
+
+    def _prepare(self, core, vol, dev, *, fail_all: bool = False):
+        from dataclasses import replace
+
+        core.scan(vol)
+        core.params = replace(core.params, verify=False, max_retries=0)
+        plan = core.make_plan(Strategy.COALESCE)
+        assert plan.op_count >= 2, "这个合成卷至少要产生两个 op 才谈得上部分失败"
+        for op in plan.ops if fail_all else plan.ops[:1]:
+            dev.fail_lba_set.update(range(op.dst_start, op.dst_start + op.blocks))
+        return plan
+
+    def test_some_failed_reports_partial(self, scenario):
+        core, sink, dev, _layout, vol = scenario
+        plan = self._prepare(core, vol, dev)
+        res = core.execute(plan, dev, resume=False)
+
+        assert res.failed_ops == 1
+        assert res.moved_ops == plan.op_count - 1, "一个文件失败后其余被跳过了"
+        assert core.state is JobState.PARTIAL, (
+            f"有失败却报成了 {core.state.value} —— 界面会显示「已完成」"
+        )
+        done = [e for e in sink.events if e.kind is EventKind.JOB_DONE][-1]
+        assert done.state is JobState.PARTIAL
+        assert "1 个失败" in done.message, f"事件里没说失败数：{done.message}"
+        assert done.failed_ops == 1
+
+    def test_all_failed_reports_failed(self, scenario):
+        core, _sink, dev, _layout, vol = scenario
+        plan = self._prepare(core, vol, dev, fail_all=True)
+        res = core.execute(plan, dev, resume=False)
+        assert res.moved_ops == 0
+        assert core.state is JobState.FAILED
+
+    def test_partial_keeps_checkpoint_for_resume(self, tmp_path):
+        """有失败时必须留着断点：否则"再点一次开始"会把已搬的又搬一遍。"""
+        layout = build_layout(1024, file_count=16, seed=42)
+        dev = MemoryDevice(layout.total_blocks, layout.geometry.block_size, name="t")
+        populate(dev, layout)
+        vol = make_volume(layout.geometry)
+        core = EngineCore(
+            sink=ListSink(),
+            catalog=StaticCatalog(layout.files, layout.free, volume_key=vol.device_path),
+            state_dir=tmp_path / "state",
+        )
+        plan = self._prepare(core, vol, dev)
+        core.execute(plan, dev, resume=False)
+        assert core.state is JobState.PARTIAL
+        store = CheckpointStore(tmp_path / "state" / f"{plan.job_id}.checkpoint.json")
+        assert store.exists, "部分完成却把断点清了，续做就没了依据"
+
+
+class TestErrorSummary:
+    """失败原因要归并后再报。
+
+    几十个文件逐行刷屏等于没有信息：用户真正要知道的是"是不是同一个原因"——
+    同一个原因往往意味着关掉一个占用程序就能重跑，各不相同的则说明是散点问题。
+    """
+
+    def test_groups_same_reason(self):
+        from lbamover.engine.engine import _summarize_errors
+
+        rows = _summarize_errors(
+            [
+                r"C:\a.pst: DeviceError: 文件被独占打开",
+                r"C:\b.pst: DeviceError: 文件被独占打开",
+                r"C:\c.tmp: DeviceError: 拒绝访问",
+            ]
+        )
+        assert rows[0] == ("DeviceError: 文件被独占打开", 2)
+        assert ("DeviceError: 拒绝访问", 1) in rows
+
+    def test_keeps_top_n_and_folds_rest(self):
+        from lbamover.engine.engine import _summarize_errors
+
+        rows = _summarize_errors([f"/f{i}: 原因{i % 6}" for i in range(12)], limit=3)
+        assert len(rows) == 4
+        assert rows[-1][0].startswith("其它")
+        assert sum(count for _k, count in rows) == 12, "归并后不能丢条数"
+
+    def test_empty_stays_empty(self):
+        from lbamover.engine.engine import _summarize_errors
+
+        assert _summarize_errors([]) == []

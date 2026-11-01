@@ -43,6 +43,11 @@ class Card(QFrame):
         self.title_label.setObjectName("cardTitle")
         self.hint_label = QLabel(hint)
         self.hint_label.setObjectName("cardHint")
+        # 卡片标题行只放得下一小段字。提示太长时 Qt 会把它画到卡片边框外面
+        # （实测"整卷 / 只整理勾选的文件"末尾就被裁掉了），所以既限制宽度，
+        # 也把全文放进 tooltip —— 界面上短、悬停能看到完整的。
+        self.hint_label.setToolTip(hint)
+        self.hint_label.setMaximumWidth(150)
         self.header.addWidget(self.title_label)
         self.header.addStretch(1)
         self.header.addWidget(self.hint_label)

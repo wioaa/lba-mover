@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..contract.enums import Strategy
 from ..contract.models import FileFrag, FragReport, Plan, VolumeInfo
 from ..ntfs.record import FILE_ATTR_SYSTEM
 
@@ -164,6 +165,42 @@ class PlanAudit:
 DEFAULT_POLICY = ProtectionPolicy()
 
 
+def _audit_reclaim_region(plan: Plan, report: FragReport) -> list[str]:
+    """复核「目标区最后是不是真的全空」。
+
+    三条缺一不可：挡路的文件都搬走、目标区没有搬不动的占用、没有任何
+    op 的落点又写回目标区。少查一条就等于允许"搬了一整天，空间没到手"。
+    """
+    target = plan.reclaim_extent
+    assert target is not None
+    problems: list[str] = []
+    moved = {op.file_id for op in plan.ops}
+    left: list[str] = []
+    for f in report.files:
+        if not f.extents:
+            continue
+        if f.extents[-1].end <= target.start or f.extents[0].start >= target.end:
+            continue
+        if f.file_id not in moved:
+            left.append(f.path)
+    if left:
+        problems.append(
+            f"目标区 {target.start}–{target.end} 里还有 {len(left)} 个文件没搬走"
+            f"（如 {left[0]}），腾不空"
+        )
+    stuck = [e for e in report.protected_extents if e.start < target.end and e.end > target.start]
+    if stuck:
+        problems.append(
+            f"目标区里有 {sum(e.length for e in stuck)} 块受保护数据，无法腾空"
+        )
+    for op in plan.ops:
+        dst = op.dst_extent
+        if dst.start < target.end and dst.end > target.start:
+            problems.append(f"op{op.op_id} 的落点又写回了目标区")
+            break
+    return problems
+
+
 def audit_plan(
     plan: Plan,
     report: FragReport,
@@ -199,7 +236,18 @@ def audit_plan(
     if blockers:
         reasons.append(f"{len(blockers)} 个受保护或已失效的文件出现在计划中")
 
-    free_after = report.free_blocks - plan.total_blocks
+    # 「可用空间整理」多一道几何复核：它卖的是"这几块会空出来"这个承诺，
+    # 承诺没兑现等于白搬几十 GB。规划器已经算过，但那依赖它自己不出错。
+    if plan.strategy is Strategy.RECLAIM and plan.reclaim_extent is not None:
+        reasons.extend(_audit_reclaim_region(plan, report))
+
+    if plan.strategy is Strategy.RECLAIM:
+        # 只是把数据挪位，空闲总量不变；"搬出去的文件要有地方落"这个峰值
+        # 需求由规划器用目标区外的空闲量卡过，这里再按净变化算一遍反而会
+        # 把合法的计划误判成"搬完没空间了"。
+        free_after = report.free_blocks
+    else:
+        free_after = report.free_blocks - plan.total_blocks
     # 绝对下限不能压过比例下限：小卷（测试用的 1024 块合成盘）上"至少留
     # 4096 块"是不可能满足的，一刀切会把所有小卷判死。取两者中较小者兜底，
     # 再用比例保证大卷一定有足够余量。

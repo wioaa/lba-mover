@@ -42,7 +42,11 @@ _TAG = {
 
 
 class LogView(QWidget):
-    """带级别过滤与异常横幅的日志视图。"""
+    """带级别过滤、异常横幅与"复制诊断"的日志视图。"""
+
+    #: 用户点了「复制诊断」。生成报告要用到版本、卷、参数、结果，
+    #: 这些只有主窗口知道，所以这里只发信号，不去拼内容。
+    diagnoseRequested = Signal()
 
     max_lines = 3000
 
@@ -67,6 +71,15 @@ class LogView(QWidget):
         self.filter.currentIndexChanged.connect(self._on_filter)
         self.filter.setFixedWidth(96)
         head.addWidget(self.filter)
+
+        self.diagnose_btn = QPushButton("复制诊断")
+        self.diagnose_btn.setObjectName("ghost")
+        self.diagnose_btn.setToolTip(
+            "把版本、目标卷、参数、失败明细与最近日志打包成一段文本复制到剪贴板，"
+            "可以直接贴给 AI 或贴进 issue"
+        )
+        self.diagnose_btn.clicked.connect(self.diagnoseRequested.emit)
+        head.addWidget(self.diagnose_btn)
 
         self.clear_btn = QPushButton("清空")
         self.clear_btn.setObjectName("ghost")
@@ -124,6 +137,15 @@ class LogView(QWidget):
         if level is LogLevel.ERROR:
             self.show_banner(message)
         self.text.moveCursor(QTextCursor.MoveOperation.End)
+
+    def plain_tail(self, lines: int = 40) -> list[str]:
+        """最近若干行**纯文本**。
+
+        诊断报告要的是能直接读的文字，而 ``_lines`` 里存的是带颜色的 HTML。
+        从控件取纯文本还能顺带反映"用户当前看到的过滤条件"。
+        """
+        text = self.text.toPlainText().splitlines()
+        return text[-lines:] if lines > 0 else text
 
     def show_banner(self, message: str) -> None:
         self.banner.setText(f"⚠ {message}")

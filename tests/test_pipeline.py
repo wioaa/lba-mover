@@ -225,3 +225,36 @@ class TestRetryPolicy:
 
         with pytest.raises(CancelledError):
             run_with_retry(boom, RetryPolicy(max_retries=5), control=ctrl)
+
+
+class TestFailureStage:
+    """失败必须记下"卡在哪一步"。
+
+    "读不出来"和"写不进去"的处理方式完全不同：前者多半是坏块或介质问题，
+    后者多半是目标越界、卷写保护或者空间不够。以前两者都只报一句
+    ``DeviceError``，等于把最重要的信息扔了。
+    """
+
+    def test_write_failure_records_stage(self):
+        src, dst = pair()
+        dst.fail_lba_set = set(range(100, 108))
+        params = JobParams(chunk_blocks=4, verify=False, max_retries=0)
+        op = MoveOp(0, "f", "f", (Extent(0, 8),), dst_start=100)
+
+        res = ChunkPipeline(src, dst, params, RunControl()).run_op(op)
+
+        assert not res.ok
+        assert res.stage == "写入数据", f"阶段记成了 {res.stage!r}"
+        assert res.error_type, "没有异常类型，贴给 AI 也无从定位"
+        assert res.error_class, "没有错误分类，用户不知道该不该重试"
+
+    def test_read_failure_records_stage(self):
+        src, dst = pair()
+        src.fail_lba_set = {0}
+        params = JobParams(chunk_blocks=4, verify=False, max_retries=0)
+        op = MoveOp(0, "f", "f", (Extent(0, 8),), dst_start=100)
+
+        res = ChunkPipeline(src, dst, params, RunControl()).run_op(op)
+
+        assert not res.ok
+        assert res.stage == "读取数据", f"阶段记成了 {res.stage!r}"

@@ -305,3 +305,207 @@ class TestScanProgressCard:
         card.set_state(JobState.SCANNING)
         card.reset()
         assert card.bar.maximum() == 1000
+
+
+class TestPartialState:
+    """「部分完成」在界面上的呈现。
+
+    这一档状态的唯一目的就是让用户不要误以为"整盘已经整理好了"，所以
+    必须同时满足：文案写明"部分完成"、颜色是警告而不是成功、按钮恢复可用
+    （否则用户没法再跑一次处理剩下的）。
+    """
+
+    def test_progress_card_chip_says_partial(self, app):
+        from lbamover.contract.enums import JobState
+        from lbamover.ui.widgets.progress_card import ProgressCard
+
+        card = ProgressCard(DARK)
+        card.set_state(JobState.PARTIAL)
+        assert card.state_chip.text() == "部分完成"
+
+    def test_progress_card_partial_uses_warn_not_ok(self, app):
+        from lbamover.contract.enums import JobState
+        from lbamover.ui.widgets.progress_card import ProgressCard
+
+        card = ProgressCard(DARK)
+        card.set_state(JobState.DONE)
+        done_style = card.state_chip.styleSheet()
+        card.set_state(JobState.PARTIAL)
+        partial_style = card.state_chip.styleSheet()
+        assert partial_style != done_style, "部分完成和已完成用了同一个颜色"
+        assert DARK.warn in partial_style and DARK.ok not in partial_style
+
+    def test_control_bar_recovers_buttons_after_partial(self, app):
+        from lbamover.contract.enums import JobState
+        from lbamover.ui.widgets.control_bar import ControlBar
+
+        bar = ControlBar(DARK)
+        bar.set_target_available(True)
+        bar.sync_state(JobState.RUNNING)
+        assert not bar.btn_start.isEnabled()
+
+        bar.sync_state(JobState.PARTIAL)
+        assert bar.btn_start.isEnabled(), "部分完成后必须能再次开始（处理没搬走的文件）"
+        assert "部分完成" in bar.summary.text()
+        assert "日志" in bar.summary.text(), "要告诉用户去哪儿看原因"
+
+
+class TestDiagnoseCopy:
+    """「复制诊断」按钮。
+
+    这是用户唯一的求助出口：出问题时他手里只有这个程序的界面。点一下就能
+    得到一段自带版本、卷、参数、失败阶段与系统错误码的文字，别人（或 AI）
+    拿到就能直接开始定位，而不必先追问五个问题。
+    """
+
+    def test_button_exists_and_is_wired(self, app, monkeypatch):
+        w = demo_window(monkeypatch)
+        try:
+            assert w.log_view.diagnose_btn.text() == "复制诊断"
+            copied: list[bool] = []
+            monkeypatch.setattr(w, "_copy_diagnostic", lambda: copied.append(True))
+            w.log_view.diagnose_btn.click()
+            assert copied, "按钮没有连到 _copy_diagnostic"
+        finally:
+            w.close()
+
+    def test_clipboard_gets_a_self_contained_report(self, app, monkeypatch):
+        w = demo_window(monkeypatch)
+        try:
+            QApplication.clipboard().clear()
+            w._copy_diagnostic()
+            text = QApplication.clipboard().text()
+
+            assert "LBAMover" in text, "报告里没有版本，别人无法判断是不是老版本的问题"
+            assert "目标卷" in text, "报告里没有目标卷，无法复现"
+            assert "参数:" in text, "报告里没有参数，无法判断是不是配置导致"
+            assert "报告结束" in text, "没有结束标记，用户不知道该复制到哪"
+        finally:
+            w.close()
+
+    def test_copy_is_announced_in_log(self, app, monkeypatch):
+        w = demo_window(monkeypatch)
+        try:
+            lines: list[str] = []
+            monkeypatch.setattr(
+                w.log_view, "append", lambda level, msg, *a, **k: lines.append(str(msg))
+            )
+            w._copy_diagnostic()
+            assert any("已复制到剪贴板" in line for line in lines), (
+                "复制之后没有任何反馈，用户不知道到底复制成功了没有"
+            )
+        finally:
+            w.close()
+
+    def test_tail_is_plain_text_not_html(self, app, monkeypatch):
+        """报告里不能出现 HTML 标签 —— 贴进聊天窗口会变成一串尖括号。"""
+        w = demo_window(monkeypatch)
+        try:
+            w.log_view.append(
+                __import__("lbamover.contract.enums", fromlist=["LogLevel"]).LogLevel.INFO,
+                "一条普通日志",
+            )
+            tail = w.log_view.plain_tail(10)
+            assert any("一条普通日志" in line for line in tail)
+            assert all("<span" not in line for line in tail)
+        finally:
+            w.close()
+
+
+class TestReclaimPanel:
+    """「可用空间整理」的两个参数控件。
+
+    单位用 GiB（用户想的是"腾 200 G 给虚拟机"），引擎内部一律按块 ——
+    换算只在边界做一次。这类换算最容易出的错是"少乘或多乘一个 1024"，
+    结果是要 200 GiB 却只腾了 200 MiB，所以值得单独钉住。
+    """
+
+    def test_default_is_ten_gib_on_tail(self, app):
+        from lbamover.contract.enums import FreeSpaceSide
+        from lbamover.ui.widgets.strategy_panel import ReclaimPanel
+
+        p = ReclaimPanel(DARK)
+        assert p.size.value() == 10
+        assert p.side() is FreeSpaceSide.TAIL
+
+    def test_gib_is_converted_to_blocks(self, app):
+        from lbamover.ui.widgets.strategy_panel import ReclaimPanel
+
+        p = ReclaimPanel(DARK)
+        p.set_geometry(4096, 100 * 1024**3 // 4096)  # 100 GiB 的卷
+        p.size.setValue(2)
+        assert p.blocks() == 2 * 1024**3 // 4096
+
+    def test_capacity_caps_the_spinbox(self, app):
+        from lbamover.ui.widgets.strategy_panel import ReclaimPanel
+
+        p = ReclaimPanel(DARK)
+        p.set_geometry(4096, 5 * 1024**3 // 4096)  # 只有 5 GiB
+        assert p.size.maximum() == 5
+        assert p.size.value() <= 5, "换到小卷后要腾的量必须自动收进来"
+
+    def test_change_emits(self, app):
+        from lbamover.ui.widgets.strategy_panel import ReclaimPanel
+
+        p = ReclaimPanel(DARK)
+        p.set_geometry(4096, 100 * 1024**3 // 4096)
+        seen: list[int] = []
+        p.changed.connect(lambda: seen.append(1))
+        p.size.setValue(20)
+        p.btn_head.click()
+        assert len(seen) == 2, "改大小或换边都必须通知外面重算预演"
+
+
+class TestReclaimStrategyWiring:
+    def test_panel_reveals_only_for_reclaim(self, app):
+        from lbamover.contract.enums import Strategy
+        from lbamover.ui.widgets.strategy_panel import StrategyPanel
+
+        s = StrategyPanel(DARK)
+        assert s.strategy() is Strategy.COALESCE
+        # 窗口没 show 过时 isVisible() 恒为 False，只能用 isHidden() 判断
+        assert s.reclaim.isHidden()
+        s.set_strategy(Strategy.RECLAIM)
+        assert not s.reclaim.isHidden()
+        assert "连续可用空间" in s.hint.text()
+
+    def test_switching_to_reclaim_sets_a_nonzero_size(self, app, monkeypatch):
+        """0 在引擎里等于"没设置"，会让功能一上手就判不可行。"""
+        from lbamover.contract.enums import Strategy
+
+        w = demo_window(monkeypatch)
+        try:
+            w._on_strategy(Strategy.RECLAIM)
+            assert w._params.reclaim_blocks > 0
+            assert w._params.reclaim_at is w.strategy_panel.reclaim.side()
+        finally:
+            w.close()
+
+    def test_changing_size_updates_params(self, app, monkeypatch):
+        w = demo_window(monkeypatch)
+        try:
+            w.strategy_panel.reclaim.set_geometry(4096, 100 * 1024**3 // 4096)
+            w.strategy_panel.reclaim.size.setValue(30)
+            assert w._params.reclaim_blocks == 30 * 1024**3 // 4096
+        finally:
+            w.close()
+
+    def test_params_panel_edit_does_not_wipe_reclaim(self, app, monkeypatch):
+        """参数面板不知道自己不该覆盖 reclaim 字段。
+
+        用户改一次并发数，``ParamsPanel`` 会造一份全新的 ``JobParams``；
+        不合并的话"腾 30 GiB"会静默变回"没设置"。
+        """
+        from lbamover.contract.enums import Strategy
+        from lbamover.contract.models import JobParams
+
+        w = demo_window(monkeypatch)
+        try:
+            w._on_strategy(Strategy.RECLAIM)
+            before = w._params.reclaim_blocks
+            assert before > 0
+            w._on_params(JobParams(chunk_blocks=64, concurrency=3))
+            assert w._params.reclaim_blocks == before
+            assert w._params.concurrency == 3
+        finally:
+            w.close()

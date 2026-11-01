@@ -17,10 +17,11 @@ import json
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Sequence
 
-from .enums import Strategy, VolumeKind
+from .enums import ErrorClass, FreeSpaceSide, Strategy, VolumeKind
 
 __all__ = [
     "Extent",
+    "FailureDetail",
     "FileFrag",
     "FragReport",
     "Bucket",
@@ -357,6 +358,12 @@ class FragReport:
     #: 区间反推，打不开的文件也不在内。这样的报告够用来"看"，**不够用来改**，
     #: 因此引擎会拒绝在受限报告上执行。
     restricted: bool = False
+    #: 被保护策略拦下、**本次不会搬**的文件的区间。
+    #:
+    #: 单独记一份而不是从 ``files`` 里推断，是因为「可用空间整理」必须知道
+    #: 目标区里哪些块是**搬不动**的：把 ``pagefile.sys`` 或 ``$MFT`` 算成
+    #: "能腾出来"，用户会得到一个永远达不到的承诺。
+    protected_extents: tuple[Extent, ...] = ()
 
     # -- 派生指标 ---------------------------------------------------------
 
@@ -501,6 +508,72 @@ class MoveOp:
 
 
 @dataclass(frozen=True, slots=True)
+class FailureDetail:
+    """一个文件的失败详情。
+
+    存在的唯一目的：让用户能**原样复制**给 AI 或贴进 issue，而不用自己
+    描述"它在搬某个文件的时候报错了"。所以每个字段都要么能让人看懂，
+    要么能让下一个接手的人定位：阶段说明"卡在哪一步"，``winerror`` 说明
+    "系统到底说了什么"，``error_class`` 说明"该重试还是该改环境"。
+
+    旧版只往日志里写一行 ``op12 失败：R:\\a.pst — 拒绝访问``，用户既不知道
+    是打开文件失败还是搬簇失败，也不知道是权限问题还是共享冲突 —— 而这两类
+    问题的处理方式完全不同。
+    """
+
+    path: str
+    op_id: int
+    #: 出错的阶段：打开文件 / 复核布局 / 搬簇 / 读取数据 / 写入数据 / 回读校验
+    stage: str = ""
+    #: 人类可读的一句话原因
+    reason: str = ""
+    #: 异常类名，便于搜代码
+    error_type: str = ""
+    #: ``retryable`` / ``fatal`` / ``verify_mismatch`` / ``cancelled``
+    error_class: str = ""
+    #: Windows 错误码。0 表示不适用（非系统调用失败）
+    winerror: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "op_id": self.op_id,
+            "path": self.path,
+            "stage": self.stage,
+            "reason": self.reason,
+            "error_type": self.error_type,
+            "error_class": self.error_class,
+            "winerror": self.winerror,
+        }
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any]) -> "FailureDetail":
+        return cls(
+            path=str(raw.get("path", "")),
+            op_id=int(raw.get("op_id", -1)),
+            stage=str(raw.get("stage", "")),
+            reason=str(raw.get("reason", "")),
+            error_type=str(raw.get("error_type", "")),
+            error_class=str(raw.get("error_class", "")),
+            winerror=int(raw.get("winerror", 0)),
+        )
+
+    @property
+    def error_class_label(self) -> str:
+        """错误分类的中文标签；无法识别时原样返回。"""
+        try:
+            return ErrorClass(self.error_class).label
+        except ValueError:
+            return self.error_class
+
+    def one_line(self) -> str:
+        """单行摘要，用于日志与归并。"""
+        where = f"[{self.stage}] " if self.stage else ""
+        code = f" winerror={self.winerror}" if self.winerror else ""
+        kind = f"（{self.error_class_label}）" if self.error_class else ""
+        return f"{where}{self.reason}{code}{kind}"
+
+
+@dataclass(frozen=True, slots=True)
 class Plan:
     """一次整理的完整执行计划。可落盘、可校验、可增量续做。"""
 
@@ -515,6 +588,10 @@ class Plan:
     #: 腾出来的空间）。这类计划必须串行执行，否则后一个 op 可能在前一个
     #: op 读完之前覆盖它的源。规划器负责置位，调度器负责遵守。
     requires_serial: bool = False
+    #: 「可用空间整理」最终腾出的连续空闲区（块）。别的策略为 ``None``。
+    #: 计划里带着它，是因为"用户要的那段空间到底在哪、有多大"必须能被
+    #: 执行前的审计与界面复核 —— 只写进 notes 字符串就没法校验。
+    reclaim_extent: Extent | None = None
 
     @property
     def total_blocks(self) -> int:
@@ -549,11 +626,15 @@ class Plan:
             "notes": list(self.notes),
             "reserved_tail": self.reserved_tail,
             "requires_serial": self.requires_serial,
+            "reclaim_extent": (
+                None if self.reclaim_extent is None else self.reclaim_extent.to_dict()
+            ),
             "plan_hash": self.plan_hash,
         }
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Plan":
+        reclaim = raw.get("reclaim_extent")
         return cls(
             job_id=raw["job_id"],
             strategy=Strategy(raw["strategy"]),
@@ -563,6 +644,7 @@ class Plan:
             notes=tuple(raw.get("notes", ())),
             reserved_tail=int(raw.get("reserved_tail", 0)),
             requires_serial=bool(raw.get("requires_serial", False)),
+            reclaim_extent=None if reclaim is None else Extent.from_dict(reclaim),
         )
 
 
@@ -604,6 +686,18 @@ class JobParams:
     allow_raw_write_on_mounted: bool = False
     #: 保留卷尾块数（relocate_tail 用）。
     reserve_tail_blocks: int = 0
+    #: 「可用空间整理」要腾出的**连续空闲块数**。0 表示没设置 —— 规划器会
+    #: 直接判不可行并提示，而不是猜一个默认值然后把盘搬了。
+    reclaim_blocks: int = 0
+    #: 腾到卷首还是卷尾。
+    reclaim_at: FreeSpaceSide = FreeSpaceSide.TAIL
+    #: 目标区撞上搬不动的占用（系统元文件、pagefile 等）时，是否把整段
+    #: 目标区让开它们。关闭时一律判不可行。
+    #:
+    #: 打开是默认行为，因为卷首 1 GiB 内几乎必然躺着 ``$MFT`` / ``$LogFile``，
+    #: 不让开的话「整理到卷首」这个功能永远只报错。让开之后要说清楚实际
+    #: 落在哪个区间（``Plan.reclaim_extent``），不能让用户以为贴着头。
+    reclaim_avoid_protected: bool = True
 
     def __post_init__(self) -> None:
         errors: list[str] = []
@@ -625,8 +719,16 @@ class JobParams:
             errors.append("checkpoint_every_chunks 不能为负")
         if self.reserve_tail_blocks < 0:
             errors.append("reserve_tail_blocks 不能为负")
+        if self.reclaim_blocks < 0:
+            errors.append("reclaim_blocks 不能为负")
+        if not isinstance(self.reclaim_at, FreeSpaceSide):
+            errors.append("reclaim_at 必须是 FreeSpaceSide")
         if errors:
             raise ValueError("; ".join(errors))
+
+    @property
+    def reclaim_bytes(self) -> int:
+        return self.reclaim_blocks * self.block_size
 
     @property
     def chunk_bytes(self) -> int:

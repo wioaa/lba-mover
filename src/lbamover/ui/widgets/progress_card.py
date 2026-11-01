@@ -27,6 +27,7 @@ _STATE_TEXT = {
     JobState.PAUSED: "已暂停",
     JobState.STOPPING: "正在停止",
     JobState.DONE: "已完成",
+    JobState.PARTIAL: "部分完成",
     JobState.FAILED: "失败",
     JobState.CANCELLED: "已停止",
 }
@@ -102,7 +103,11 @@ class ProgressCard(QWidget):
             color = self._p.warn
         elif state is JobState.DONE:
             color = self._p.ok
-        elif state in (JobState.FAILED,):
+        elif state is JobState.PARTIAL:
+            # 部分完成必须是警告色，不能是成功色：用户扫一眼"绿的"就走了，
+            # 而那些没搬走的文件还躺在碎片里。
+            color = self._p.warn
+        elif state is JobState.FAILED:
             color = self._p.danger
         elif state is JobState.CANCELLED:
             color = self._p.warn

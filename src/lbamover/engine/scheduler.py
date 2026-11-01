@@ -22,15 +22,27 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Callable
 
-from ..contract.models import JobParams, MoveOp, Plan
+from ..contract.models import FailureDetail, JobParams, MoveOp, Plan
 from .checkpoint import Checkpoint, CheckpointStore, JsonlJournal, merge_op_progress
 from .chunk import BlockSlice
 from .control import RunControl
 from .executor import BlockCopyExecutor, Executor
+from ..diagnostics import hint_for
 from .pipeline import OpResult
 from .progress import ProgressTracker
 
 __all__ = ["RateLimiter", "ExecutionResult", "JobRunner"]
+
+#: 连续失败到多少个就熔断。
+#:
+#: **单个文件失败绝不中止**（被独占打开、权限不足都是常态，几十个文件里
+#: 有几个失败完全正常）。但如果连着这么多个都失败，说明是系统性故障 ——
+#: 卷被别的进程写保护、句柄失效、盘开始掉块。这时候继续跑只是在把剩下的
+#: 操作一个个撞死，还白白写日志、拖时间，用户看到的是"进度条飞快走完但
+#: 什么都没搬"。
+#:
+#: 20 这个值是"够多到不可能是巧合、够少到不用等一小时才反应过来"。
+MAX_CONSECUTIVE_FAILURES = 20
 
 
 class RateLimiter:
@@ -86,8 +98,14 @@ class ExecutionResult:
     bytes_moved: int = 0
     elapsed_s: float = 0.0
     cancelled: bool = False
+    #: 单行文本，保留给"扫一眼日志"的场合
     errors: list[str] = field(default_factory=list)
+    #: 结构化失败明细。用户要把它贴给 AI 时，单行文本里没有阶段与错误码，
+    #: 光凭"拒绝访问"这四个字谁都判断不了是权限还是占用。
+    failures: list[FailureDetail] = field(default_factory=list)
     op_results: list[OpResult] = field(default_factory=list)
+    #: 非用户主动停止的中止原因（例如连续失败熔断）。空串表示没发生。
+    aborted: str = ""
 
     @property
     def ok(self) -> bool:
@@ -199,6 +217,7 @@ class JobRunner:
     def _run_pool(self, ops: list[MoveOp], workers: int, result: ExecutionResult) -> None:
         executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lba-op")
         futures: dict[Future, MoveOp] = {}
+        consecutive = 0
         try:
             for op in ops:
                 if self.control.cancelled:
@@ -220,9 +239,23 @@ class JobRunner:
                 if self.control.cancelled:
                     result.cancelled = True
                     break
-                if not res.ok and self.halt_on_error:
+                if res.ok:
+                    consecutive = 0
+                    continue
+                if res.cancelled:
+                    continue
+                consecutive += 1
+                if self.halt_on_error:
                     self._log(f"遇到错误且开启了 fail-fast，停止后续任务：{res.error}")
                     self.control.request_cancel()
+                    break
+                if consecutive >= MAX_CONSECUTIVE_FAILURES:
+                    # 熔断的门槛是"连续"，不是"一个"：单个文件被独占打开、
+                    # 权限不足都是常态，绝不能因此停掉整卷整理。
+                    result.aborted = (
+                        f"连续 {consecutive} 个文件失败，判断为系统性故障，已中止剩余任务"
+                    )
+                    self._log(result.aborted)
                     break
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
@@ -316,6 +349,16 @@ class JobRunner:
                 self.tracker.skip_op()
             else:
                 result.failed_ops += 1
+                detail = FailureDetail(
+                    path=op.path,
+                    op_id=op.op_id,
+                    stage=res.stage or "未知阶段",
+                    reason=res.error or "（没有错误描述）",
+                    error_type=res.error_type,
+                    error_class=res.error_class,
+                    winerror=res.winerror,
+                )
+                result.failures.append(detail)
                 result.errors.append(f"{op.path}: {res.error}")
                 self.tracker.note_failure()
                 self.tracker.skip_op()
@@ -335,7 +378,14 @@ class JobRunner:
         if self.on_op_done is not None:
             self.on_op_done(res)
         if not res.ok and not res.cancelled:
-            self._log(f"op{op.op_id} 失败：{op.path} — {res.error}")
+            detail = result.failures[-1] if result.failures else None
+            if detail is not None:
+                # 一行摘要 + 一行建议。摘要里带阶段与错误码，够用户转述；
+                # 建议给出"下一步做什么"，否则等于只说了"不行"。
+                self._log(f"op{op.op_id} 失败：{op.path} —— {detail.one_line()}")
+                self._log(f"  建议：{hint_for(detail)}")
+            else:  # pragma: no cover - failures 与 errors 同步追加，理论到不了
+                self._log(f"op{op.op_id} 失败：{op.path} — {res.error}")
 
     # -- 断点 -------------------------------------------------------------
 

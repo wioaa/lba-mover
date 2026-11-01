@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -31,7 +32,7 @@ from ..devices.base import DeviceError
 from .chunk import BlockSlice, slice_move_op
 from .control import RunControl
 from .errors import CancelledError, VerifyError
-from .retry import RetryPolicy, run_with_retry
+from .retry import RetryPolicy, classify_exception, run_with_retry
 
 __all__ = ["ChunkPipeline", "OpResult"]
 
@@ -49,6 +50,16 @@ class OpResult:
     retries: int = 0
     verified: bool = True
     skipped_blocks: int = 0
+    #: 出错阶段（"打开文件" / "读取数据" / "搬簇" …），见 FailureDetail。
+    #: 没有它的话日志只能说"这个文件失败了"，用户和 AI 都不知道卡在哪。
+    stage: str = ""
+    #: Windows 错误码，0 表示不适用
+    winerror: int = 0
+    #: 异常类名，便于在代码里定位抛出点
+    error_type: str = ""
+    #: 错误分类（retryable / fatal / verify_mismatch / cancelled）。
+    #: 用户最想知道的一条是"还要不要再点一次开始"，它就写在这里。
+    error_class: str = ""
 
 
 class ChunkPipeline:
@@ -90,20 +101,38 @@ class ChunkPipeline:
             return OpResult(op.op_id, 0, 0, ok=True, verified=self.params.verify)
 
         q: queue.Queue = queue.Queue(maxsize=max(1, self.params.queue_depth))
+        #: 消费者不干了（写失败 / 已取消 / 已决定放弃）的信号。
+        #:
+        #: **不能只靠 ``control.cancelled``**：单个文件写失败时整个任务并没有
+        #: 取消，生产者不知道消费者已经走了，就会一直卡在满队列的 ``put()``
+        #: 上。``join(timeout=5)`` 等不到它，于是每失败一个文件就泄漏一条
+        #: 读线程 —— 失败几十个之后进程里全是睡死的线程。
+        stop = threading.Event()
         done_blocks = 0
         skipped = 0
         cancelled = False
         failure: BaseException | None = None
+        #: 主循环是否**自己读到过** ``_DONE``。收尾时用它决定还要不要排空：
+        #: 已经读到就没有第二个 ``_DONE`` 了，再等只会白白等到超时。
+        saw_done = False
+        #: 失败发生在哪一端。"读不出来"和"写不进去"的处理方式完全不同：
+        #: 前者多是坏块/介质问题，后者多是目标越界或卷写保护。
+        failure_stage = ""
 
         def producer() -> None:
             try:
                 for sl in slices:
+                    if stop.is_set() or self.control.cancelled:
+                        raise CancelledError("读取阶段已停止")
                     if sl.offset_blocks + sl.blocks <= start_blocks:
                         continue  # 断点之前的块已经写好了
                     self.control.checkpoint()
                     payload = self._read_slice(sl)
-                    # put 可能阻塞：消费者慢时这是我们想要的背压
+                    # put 可能阻塞：消费者慢时这是我们想要的背压。
+                    # 每一轮都先看 stop，否则消费者退出后就再也出不来了。
                     while True:
+                        if stop.is_set():
+                            raise CancelledError("读取阶段已停止")
                         try:
                             q.put((sl, payload), timeout=0.1)
                             break
@@ -111,9 +140,9 @@ class ChunkPipeline:
                             if self.control.cancelled:
                                 raise CancelledError("读取阶段被取消") from None
             except BaseException as exc:  # noqa: BLE001 - 交给消费者统一处理
-                q.put(("__error__", exc))
+                _put_blocking(q, ("__error__", exc), stop)
             finally:
-                q.put(_DONE)
+                _put_blocking(q, _DONE, stop)
 
         th = threading.Thread(target=producer, name=f"lba-read-op{op.op_id}", daemon=True)
         th.start()
@@ -122,10 +151,12 @@ class ChunkPipeline:
             while True:
                 item = q.get()
                 if item is _DONE:
+                    saw_done = True
                     break
                 marker, payload = item
                 if marker == "__error__":
                     failure = payload
+                    failure_stage = "读取数据"
                     cancelled = isinstance(payload, CancelledError)
                     break
                 sl, data = marker, payload
@@ -139,15 +170,19 @@ class ChunkPipeline:
                     continue
                 except BaseException as exc:  # noqa: BLE001
                     failure = exc
+                    failure_stage = "写入数据"
                     cancelled = False
                     break
                 done_blocks += sl.blocks
                 if self.on_chunk is not None:
                     self.on_chunk(sl)
         finally:
-            # 无论成功失败，都要把生产者收干净：消费剩余项直到 _DONE
-            self._drain(q)
-            th.join(timeout=5.0)
+            # 顺序不能反：先立牌子告诉生产者"别读了"，再排空队列，
+            # 最后才 join。反过来的话生产者会继续往队列里塞，排空永远追不上。
+            stop.set()
+            if not saw_done:
+                self._drain(q)
+            th.join(timeout=1.0)
 
         skipped = start_blocks
         bytes_done = done_blocks * self.params.block_size
@@ -161,6 +196,10 @@ class ChunkPipeline:
                 error=f"{type(failure).__name__}: {failure}",
                 retries=self.retries,
                 skipped_blocks=skipped,
+                stage=failure_stage,
+                winerror=int(getattr(failure, "winerror", 0) or 0),
+                error_type=type(failure).__name__,
+                error_class=classify_exception(failure).value,
             )
         if cancelled:
             return OpResult(
@@ -225,11 +264,41 @@ class ChunkPipeline:
             self.on_retry(attempt, exc, delay)
 
     @staticmethod
-    def _drain(q: queue.Queue) -> None:
+    def _drain(q: queue.Queue, timeout: float = 5.0) -> None:
+        """消费队列直到 ``_DONE``。
+
+        **必须是阻塞式的。** 原来是 ``get_nowait``，队列一空就返回 —— 而
+        队列空恰恰是生产者正在读取、马上就要 ``put`` 的时刻。返回之后没人
+        消费，生产者就永久卡在 ``put`` 上，``join`` 超时，线程留了下来。
+        症状是"失败的文件越多，程序越慢"以及进程里堆着一堆睡死的读线程。
+        """
+        deadline = time.monotonic() + timeout
         while True:
-            try:
-                item = q.get_nowait()
-            except queue.Empty:
+            remain = deadline - time.monotonic()
+            if remain <= 0:
                 return
+            try:
+                item = q.get(timeout=min(0.05, remain))
+            except queue.Empty:
+                continue
             if item is _DONE:
                 return
+
+
+def _put_blocking(q: "queue.Queue", item, stop: threading.Event) -> None:
+    """往队列里放一项，直到成功或收到 ``stop``。
+
+    生产者收尾时用：消费者可能已经退出，此时普通 ``put`` 会永远阻塞在
+    满队列上（daemon 线程不会阻止进程退出，但会一直占着内存与句柄）。
+    """
+    while True:
+        if stop.is_set() and item is not None:
+            # stop 之后我们只关心把 _DONE 送出去；__error__ 可以丢，
+            # 因为主循环此时已经在退出路径上了。
+            if item is not _DONE:
+                return
+        try:
+            q.put(item, timeout=0.1)
+            return
+        except queue.Full:
+            continue

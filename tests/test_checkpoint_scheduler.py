@@ -298,3 +298,99 @@ class TestJobRunner:
 def test_default_state_dir_respects_env(monkeypatch, tmp_path):
     monkeypatch.setenv("LBAMOVER_STATE_DIR", str(tmp_path / "custom"))
     assert str(default_state_dir()).endswith("custom")
+
+
+class TestFailureIsolation:
+    """一个文件失败，绝不能带走其它文件。
+
+    2026-11 的真实故障：某个文件被独占打开而失败，界面直接切到「已完成」，
+    剩下的一大批文件根本没搬。查下来是两件事叠在一起：
+
+    * 执行层其实**没有**停（这条用例把这一点钉住，防止以后"顺手加个
+      fail-fast"把它改坏）；
+    * 结局判定把"19 个成功 1 个失败"报成 ``DONE``，于是"没搬完"看起来
+      和"搬完了"一模一样。
+
+    所以这里同时锁两件事：失败隔离，以及**连续**失败才熔断。
+    """
+
+    def _plan(self, ops: int = 4) -> Plan:
+        return Plan(
+            job_id="t",
+            strategy=Strategy.COMPACT,
+            ops=tuple(
+                MoveOp(
+                    op_id=i,
+                    file_id=str(i),
+                    path=f"/f{i}",
+                    src_extents=(Extent(800 + i * 32, 32),),
+                    dst_start=100 + i * 200,
+                    verify=False,
+                )
+                for i in range(ops)
+            ),
+        )
+
+    def test_one_bad_target_does_not_stop_the_rest(self, tmp_path):
+        dev = MemoryDevice(2048, 4096)
+        plan = self._plan(4)
+        # 只让第 2 个 op 的落点坏掉
+        bad = plan.ops[1]
+        dev.fail_lba_set = set(range(bad.dst_start, bad.dst_start + 32))
+
+        runner = JobRunner(
+            dev, dev, JobParams(chunk_blocks=8, max_retries=0, concurrency=1), RunControl(),
+            store=CheckpointStore(tmp_path / "cp.json"),
+        )
+        res = runner.run(plan)
+        assert res.failed_ops == 1
+        assert res.moved_ops == 3, "一个文件失败后，其余文件被跳过了"
+        assert not res.cancelled
+        assert res.aborted == ""
+
+    def test_consecutive_failures_trip_the_breaker(self, tmp_path):
+        from lbamover.engine.scheduler import MAX_CONSECUTIVE_FAILURES
+
+        dev = MemoryDevice(4096, 4096)
+        total = MAX_CONSECUTIVE_FAILURES + 10
+        plan = self._plan(total)
+        # 全部落点都坏 → 连续失败
+        for op in plan.ops:
+            dev.fail_lba_set.update(range(op.dst_start, op.dst_start + 32))
+
+        logs: list[str] = []
+        runner = JobRunner(
+            dev, dev, JobParams(chunk_blocks=8, max_retries=0, concurrency=1), RunControl(),
+            store=CheckpointStore(tmp_path / "cp.json"), on_log=logs.append,
+        )
+        res = runner.run(plan)
+        assert res.failed_ops == MAX_CONSECUTIVE_FAILURES, (
+            f"熔断没有在 {MAX_CONSECUTIVE_FAILURES} 个连续失败处生效：{res.failed_ops}"
+        )
+        assert res.aborted, "熔断必须留下原因，否则用户只看到「任务结束了」"
+        assert any("系统性故障" in m for m in logs)
+
+    def test_isolated_failure_does_not_trip_breaker(self, tmp_path):
+        """失败之间夹着成功就不该熔断 —— 那是"个别文件有问题"，不是系统故障。"""
+        from lbamover.engine.scheduler import MAX_CONSECUTIVE_FAILURES
+
+        dev = MemoryDevice(8192, 4096)
+        # 每个成功 op 后面跟一个失败的：连续失败数永远是 1
+        ops = []
+        for i in range(MAX_CONSECUTIVE_FAILURES + 6):
+            ops.append(
+                MoveOp(op_id=i, file_id=str(i), path=f"/f{i}",
+                       src_extents=(Extent(6000 + i * 16, 8),),
+                       dst_start=100 + i * 32, verify=False)
+            )
+        plan = Plan(job_id="t", strategy=Strategy.COMPACT, ops=tuple(ops))
+        for i in range(1, len(ops), 2):  # 奇数号坏掉
+            dev.fail_lba_set.update(range(ops[i].dst_start, ops[i].dst_start + 8))
+
+        runner = JobRunner(
+            dev, dev, JobParams(chunk_blocks=8, max_retries=0, concurrency=1), RunControl(),
+            store=CheckpointStore(tmp_path / "cp.json"),
+        )
+        res = runner.run(plan)
+        assert res.aborted == "", "零星失败不该触发熔断"
+        assert res.failed_ops == (MAX_CONSECUTIVE_FAILURES + 6) // 2

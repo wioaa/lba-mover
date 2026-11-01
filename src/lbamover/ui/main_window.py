@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 import traceback
+from dataclasses import replace
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
@@ -209,14 +210,14 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 6, 0)
         lay.setSpacing(10)
 
-        card_vol = Card("目标卷", "本机可整理的卷")
+        card_vol = Card("目标卷", "本机卷")
         self.picker = VolumePicker(self._p)
         # 卷多时列表自己滚，别把下面的参数卡挤到视口外
         self.picker.setMaximumHeight(182)
         card_vol.add(self.picker, 1)
         card_vol.setMinimumHeight(206)
 
-        card_scope = Card("整理范围", "整卷 / 只整理勾选的文件")
+        card_scope = Card("整理范围", "整卷 / 手动")
         self.scope_panel = ScopePanel(self._p)
         card_scope.add(self.scope_panel)
 
@@ -328,6 +329,7 @@ class MainWindow(QMainWindow):
         self.picker.volumeSelected.connect(self._on_volume_selected)
         self.picker.refreshRequested.connect(self._load_volumes)
         self.strategy_panel.strategyChanged.connect(self._on_strategy)
+        self.strategy_panel.reclaimChanged.connect(self._on_reclaim_changed)
         self.scope_panel.scopeChanged.connect(self._on_scope_changed)
         self.scope_panel.pickRequested.connect(self._open_file_picker)
         self.scope_panel.clearRequested.connect(self._clear_selection)
@@ -345,6 +347,7 @@ class MainWindow(QMainWindow):
         self.bridge.fragReportReady.connect(self._on_report)
         self.bridge.planReady.connect(self._on_plan)
         self.bridge.jobFinished.connect(self._on_job_finished)
+        self.log_view.diagnoseRequested.connect(self._copy_diagnostic)
 
     # ------------------------------------------------------------------
     # 目标与参数
@@ -389,9 +392,13 @@ class MainWindow(QMainWindow):
         if vol is None:
             return
         self.params_panel.set_block_size(vol.geometry.block_size)
+        # 「可用空间整理」的大小上限与单位换算都跟着卷走，换卷必须重新校准
+        self.strategy_panel.reclaim.set_geometry(
+            vol.geometry.block_size, vol.geometry.block_count
+        )
         params = self.params_panel.current()
         if params is not None:
-            self._params = params
+            self._params = self._merge_reclaim(params)
         # 演示卷用内存目录；真实卷每次扫描时临时打开 MFT
         self.core.catalog_factory = None if vol.device_path == DEMO_DEVICE_PATH else _open_ntfs_catalog
         self.core.set_target(vol, self._params)
@@ -416,6 +423,13 @@ class MainWindow(QMainWindow):
 
     def _on_strategy(self, strategy: Strategy) -> None:
         self._strategy = strategy
+        if strategy is Strategy.RECLAIM:
+            # 切到这一档时必须立刻有一个有效的大小：0 在引擎里等于"没设置"，
+            # 会直接判不可行，用户会以为功能坏了。
+            panel = self.strategy_panel.reclaim
+            self._params = replace(
+                self._params, reclaim_blocks=panel.blocks(), reclaim_at=panel.side()
+            )
         self.log_view.append(LogLevel.INFO, f"策略：{STRATEGY_HELP.get(strategy, strategy.value)}")
 
     # -- 整理范围（手动选择文件） -----------------------------------------
@@ -511,8 +525,34 @@ class MainWindow(QMainWindow):
         if self._report is not None:
             self.service.submit(Replan(self._strategy, self._scope_file_ids()))
 
+    def _merge_reclaim(self, params: JobParams) -> JobParams:
+        """把「可用空间整理」的两个参数并进 params。
+
+        这两项由策略面板提供，而参数面板不知道自己不该覆盖它们：用户改一次
+        并发数，``ParamsPanel`` 会造一份全新的 ``JobParams``，reclaim 字段
+        回到默认的 0 —— 于是"腾 100 GiB"静默变成"没设置"。
+        """
+        return replace(
+            params,
+            reclaim_blocks=self._params.reclaim_blocks,
+            reclaim_at=self._params.reclaim_at,
+            reclaim_avoid_protected=self._params.reclaim_avoid_protected,
+        )
+
+    def _on_reclaim_changed(self) -> None:
+        panel = self.strategy_panel.reclaim
+        self._params = replace(
+            self._params, reclaim_blocks=panel.blocks(), reclaim_at=panel.side()
+        )
+        size = fmt_bytes(self._params.reclaim_bytes)
+        self.log_view.append(
+            LogLevel.INFO, f"可用空间整理：腾出 {size}，位于{panel.side().label}"
+        )
+        if self._strategy is Strategy.RECLAIM and self._report is not None:
+            self.service.submit(Replan(self._strategy, self._scope_file_ids()))
+
     def _on_params(self, params: JobParams) -> None:
-        self._params = params
+        self._params = self._merge_reclaim(params)
         if self.core.state in (JobState.RUNNING, JobState.PAUSED):
             # 运行期只热更新限速与校验；结构性参数要下次规划才生效
             self.service.submit(SetParams(params))
@@ -697,6 +737,40 @@ class MainWindow(QMainWindow):
         else:
             self.preview.setText("预演：没有可执行的操作")
 
+    def _copy_diagnostic(self) -> None:
+        """把当前状态打成一段可粘贴的报告放进剪贴板。
+
+        这是这个工具唯一的"求助出口"。设计目标是：用户不需要理解任何内部
+        概念，点一下、粘出去，对方就能看到版本、卷、参数、卡在哪一步、
+        系统错误码是什么。
+        """
+        from ..diagnostics import build_report
+
+        result = getattr(self.core, "last_result", None)
+        scope = (
+            f"手动选择 {len(self._selection)} 个文件"
+            if self._manual_scope and self._selection
+            else "整卷"
+        )
+        text = build_report(
+            volume=self._volume,
+            strategy=self._strategy.value,
+            scope=scope,
+            params=self._params,
+            moved_ops=getattr(result, "moved_ops", 0),
+            failed_ops=getattr(result, "failed_ops", 0),
+            skipped_ops=getattr(result, "skipped_ops", 0),
+            elapsed_s=getattr(result, "elapsed_s", 0.0),
+            aborted=getattr(result, "aborted", ""),
+            failures=getattr(result, "failures", ()) or (),
+            log_tail=self.log_view.plain_tail(40),
+        )
+        QApplication.clipboard().setText(text)
+        self.log_view.append(
+            LogLevel.INFO,
+            f"诊断报告已复制到剪贴板（{len(text)} 字符），可直接粘贴给 AI 或贴进 issue",
+        )
+
     def _on_job_finished(self, event) -> None:
         self.log_view.append(
             LogLevel.INFO if event.failed_ops == 0 else LogLevel.WARNING,
@@ -705,6 +779,14 @@ class MainWindow(QMainWindow):
             f"耗时 {event.elapsed_s:.1f} 秒",
             event.message,
         )
+        if event.failed_ops:
+            # 有失败时把"下一步该做什么"直接说出来：只写"失败 N 个"，用户
+            # 除了截图整屏日志没有别的办法求助。
+            self.log_view.append(
+                LogLevel.WARNING,
+                f"{event.failed_ops} 个文件没能搬走。点日志右上角「复制诊断」，"
+                "把生成的内容整段贴出来即可定位原因",
+            )
         if self._demo_layout is not None and self._demo_device is not None and event.moved_ops > 0:
             self._verify_demo()
 

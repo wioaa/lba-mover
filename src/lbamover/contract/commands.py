@@ -161,4 +161,5 @@ STRATEGY_LABELS: dict[Strategy, str] = {
     Strategy.COALESCE: "合并碎片（每个文件合成一段）",
     Strategy.COMPACT: "向卷首聚拢（腾出尾部大块连续空间）",
     Strategy.RELOCATE_TAIL: "搬到卷尾（为卷首让出连续空间）",
+    Strategy.RECLAIM: "腾出可用空间（指定大小的连续空闲，位置可选卷首/卷尾）",
 }

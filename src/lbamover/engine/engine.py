@@ -75,13 +75,21 @@ _ALLOWED: dict[JobState, set[JobState]] = {
         JobState.PAUSED,
         JobState.STOPPING,
         JobState.DONE,
+        JobState.PARTIAL,
         JobState.FAILED,
         JobState.IDLE,
         JobState.PLANNING,
     },
     JobState.PAUSED: {JobState.RUNNING, JobState.STOPPING, JobState.CANCELLED, JobState.IDLE},
-    JobState.STOPPING: {JobState.CANCELLED, JobState.DONE, JobState.FAILED, JobState.IDLE},
+    JobState.STOPPING: {
+        JobState.CANCELLED,
+        JobState.DONE,
+        JobState.PARTIAL,
+        JobState.FAILED,
+        JobState.IDLE,
+    },
     JobState.DONE: {JobState.IDLE, JobState.SCANNING, JobState.PLANNING},
+    JobState.PARTIAL: {JobState.IDLE, JobState.SCANNING, JobState.PLANNING},
     JobState.FAILED: {JobState.IDLE, JobState.SCANNING, JobState.PLANNING},
     JobState.CANCELLED: {JobState.IDLE, JobState.SCANNING, JobState.PLANNING},
 }
@@ -333,7 +341,12 @@ class EngineCore:
             self.report.free_extents,
             len(self.report.buckets) or DEFAULT_BUCKETS,
         )
-        return replace(self.report, files=allowed, buckets=buckets)
+        # 被拦下的文件区间单独留一份：它们不会被搬，但"可用空间整理"必须
+        # 知道目标区里哪些块是搬不动的，否则会承诺一个腾不出来的空间。
+        protected = tuple(e for f, _why in blocked for e in f.extents)
+        return replace(
+            self.report, files=allowed, buckets=buckets, protected_extents=protected
+        )
 
     # -- 执行器选择 -------------------------------------------------------
 
@@ -527,13 +540,35 @@ class EngineCore:
             journal.close()
 
         self.last_result = result
+        # 结局判定必须三档。原来只有"失败/其它"，于是"19 个成功 1 个失败"
+        # 直接落进 DONE，界面显示「已完成」—— 用户以为整盘整理好了，实际
+        # 还有文件原样躺在碎片里。这不是措辞问题，是状态在撒谎。
         if result.cancelled:
             self._set_state(JobState.CANCELLED, "用户停止")
         elif result.failed_ops and not result.moved_ops:
-            self._set_state(JobState.FAILED, "全部操作失败")
+            self._set_state(JobState.FAILED, f"全部 {result.failed_ops} 个文件失败")
+        elif result.failed_ops:
+            self._set_state(
+                JobState.PARTIAL,
+                f"{result.moved_ops} 个完成、{result.failed_ops} 个失败",
+            )
         else:
             self._set_state(JobState.DONE, "执行完成")
 
+        # 失败原因归并成"同类错误 × 个数"：几十条逐行刷屏没人看得进去，
+        # 而归并之后一眼就能看出是"都被独占打开"还是"卷写保护"。
+        if result.failed_ops:
+            for summary, count in _summarize_errors(result.errors):
+                self._log(
+                    LogLevel.WARNING,
+                    f"{count} 个文件失败：{summary}",
+                )
+
+        message = "已停止" if result.cancelled else (
+            f"完成 {result.moved_ops} 个文件"
+            + (f"，{result.failed_ops} 个失败" if result.failed_ops else "")
+            + (f"（{result.aborted}）" if result.aborted else "")
+        )
         self._emit(
             JobDoneEvent(
                 self.state,
@@ -542,7 +577,7 @@ class EngineCore:
                 skipped_ops=result.skipped_ops,
                 bytes_moved=result.bytes_moved,
                 elapsed_s=result.elapsed_s,
-                message=("已停止" if result.cancelled else f"完成 {result.moved_ops} 个文件"),
+                message=message,
                 seq=self._next_seq(),
                 job_id=plan.job_id,
             )
@@ -557,6 +592,24 @@ class EngineCore:
             return
         self._last_progress_at = now
         self._emit(ProgressEvent(snapshot, seq=self._next_seq(), job_id=self.job_id))
+
+
+def _summarize_errors(errors: list[str], limit: int = 3) -> list[tuple[str, int]]:
+    """把逐条 ``路径: 原因`` 归并成 ``[(原因, 个数), ...]``，按个数降序。
+
+    失败几十个文件时逐行刷屏等于没有信息：用户真正要知道的是"是同一个原因
+    还是各不相同的、要不要重试"。归并之后一眼可判。
+    """
+    counts: dict[str, int] = {}
+    for item in errors:
+        _path, sep, reason = item.partition(": ")
+        key = reason if sep else item
+        counts[key] = counts.get(key, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    if len(ordered) <= limit:
+        return ordered
+    rest = sum(count for _key, count in ordered[limit:])
+    return ordered[:limit] + [(f"其它 {len(ordered) - limit} 类错误", rest)]
 
 
 def _default_open(volume: VolumeInfo):

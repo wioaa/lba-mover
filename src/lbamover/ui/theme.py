@@ -269,6 +269,26 @@ QPushButton#option:checked {{
     font-weight: 600;
 }}
 
+/* 小尺寸的"二选一"按钮（卷首/卷尾）。比 option 更紧凑：它和输入框挤在一行。 */
+QPushButton#chip {{
+    background: transparent;
+    border: 1px solid {p.border};
+    border-radius: 7px;
+    padding: 2px 6px;
+    font-size: 11px;
+    color: {p.text_dim};
+}}
+QPushButton#chip:hover {{
+    border-color: {p.border_strong};
+    color: {p.text};
+}}
+QPushButton#chip:checked {{
+    border-color: {p.accent};
+    background: {p.accent}1F;
+    color: {p.text};
+    font-weight: 600;
+}}
+
 /* ---------------- 列表 / 卷卡片 ---------------- */
 QListWidget {{
     background: transparent;

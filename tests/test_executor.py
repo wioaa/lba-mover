@@ -193,3 +193,34 @@ class TestNtfsMoveExecutor:
         ex = NtfsMoveExecutor(mover, params(), RunControl(), cluster_size=4096)
         ex.close()
         assert mover.closed
+
+
+class TestFailureStage:
+    """真机路径的失败阶段。
+
+    这条路径上"打不开文件"远多于"搬簇失败"——被独占打开的文件在系统盘上
+    成百上千。而"打不开"和"搬不动"的处置完全不同，所以阶段必须带出去。
+    """
+
+    def test_open_failure_records_stage(self):
+        mover = FakeMover({"D:\\a.bin": [10, 11]})
+        mover.missing = {"D:\\a.bin"}
+        ex = NtfsMoveExecutor(mover, params(), RunControl(), cluster_size=4096)
+        op = op_for("D:\\a.bin", (Extent(10, 2),), dst=100)
+
+        res = ex.run_op(op)
+
+        assert not res.ok
+        assert res.stage == "打开文件"
+        assert res.error_type == "DeviceError"
+        assert res.error_class
+
+    def test_layout_mismatch_records_stage(self):
+        mover = FakeMover({"D:\\c.bin": [10, 11, 70, 71, 72]})
+        ex = NtfsMoveExecutor(mover, params(), RunControl(), cluster_size=4096)
+        op = op_for("D:\\c.bin", (Extent(10, 2), Extent(50, 3)), dst=100)
+
+        res = ex.run_op(op)
+
+        assert not res.ok
+        assert res.stage == "复核布局"

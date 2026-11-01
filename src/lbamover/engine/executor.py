@@ -24,13 +24,14 @@ from __future__ import annotations
 
 from typing import Callable, Protocol, runtime_checkable
 
+from ..contract.enums import ErrorClass
 from ..contract.models import Extent, JobParams, MoveOp
 from ..devices.base import DeviceError
 from .chunk import BlockSlice
 from .control import RunControl
 from .errors import CancelledError
 from .pipeline import ChunkPipeline, OpResult
-from .retry import RetryPolicy, run_with_retry
+from .retry import RetryPolicy, classify_exception, run_with_retry
 
 __all__ = [
     "Executor",
@@ -203,7 +204,14 @@ class NtfsMoveExecutor:
         try:
             handle = self.mover.open_file(op.path, writable=True)
         except DeviceError as exc:
-            return self._fail(op, str(exc), cancelled=False)
+            # 打不开文件是**最常见**的失败（被独占、权限不足、路径太长），
+            # 而这三者的处理方式完全不同，所以阶段与系统错误码必须带出去。
+            return self._fail(op, str(exc), cancelled=False, stage="打开文件", exc=exc)
+        except OSError as exc:
+            return self._fail(
+                op, str(exc), cancelled=False, stage="打开文件",
+                exc=exc, error_type=type(exc).__name__,
+            )
 
         done = 0
         try:
@@ -212,7 +220,10 @@ class NtfsMoveExecutor:
             mismatch = layout_mismatch(live, expected)
             if mismatch is not None:
                 # 扫描到执行之间文件变了：宁可不搬，也不能搬到错位置
-                return self._fail(op, f"布局复核不通过：{mismatch}", cancelled=False)
+                return self._fail(
+                    op, f"布局复核不通过：{mismatch}", cancelled=False,
+                    stage="复核布局", error_type="LayoutMismatch",
+                )
 
             chunk = max(1, self.params.chunk_blocks)
             while done < total:
@@ -236,9 +247,14 @@ class NtfsMoveExecutor:
                     )
         except CancelledError:
             return OpResult(op.op_id, done, done * self.cluster_size, ok=False,
-                            cancelled=True, error="已取消")
+                            cancelled=True, error="已取消", stage="搬簇",
+                            error_type="CancelledError")
         except DeviceError as exc:
-            return self._fail(op, str(exc), cancelled=False, blocks_done=done)
+            return self._fail(op, str(exc), cancelled=False, blocks_done=done,
+                              stage="搬簇", exc=exc)
+        except OSError as exc:
+            return self._fail(op, str(exc), cancelled=False, blocks_done=done,
+                              stage="搬簇", exc=exc, error_type=type(exc).__name__)
         finally:
             try:
                 self.mover.close_file(handle)
@@ -297,7 +313,15 @@ class NtfsMoveExecutor:
         return vcn == 0 and lcn == op.dst_start and count == op.blocks
 
     def _fail(
-        self, op: MoveOp, message: str, *, cancelled: bool, blocks_done: int = 0
+        self,
+        op: MoveOp,
+        message: str,
+        *,
+        cancelled: bool,
+        blocks_done: int = 0,
+        stage: str = "",
+        exc: BaseException | None = None,
+        error_type: str = "",
     ) -> OpResult:
         return OpResult(
             op.op_id,
@@ -306,6 +330,12 @@ class NtfsMoveExecutor:
             ok=False,
             cancelled=cancelled,
             error=message,
+            stage=stage,
+            winerror=int(getattr(exc, "winerror", 0) or 0),
+            error_type=error_type or (type(exc).__name__ if exc is not None else ""),
+            error_class=(
+                classify_exception(exc).value if exc is not None else ErrorClass.FATAL.value
+            ),
         )
 
     def close(self) -> None:
