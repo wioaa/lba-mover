@@ -165,7 +165,7 @@ PYTHONPATH=src python -m lbamover ntfs --image .tmp/demo.img --make-demo
 ```
 src/lbamover/{contract,engine,devices,ntfs,platform,ui}/   见 docs/ARCHITECTURE.md
 src/lbamover/ntfs/         NTFS 解析：boot / runlist / record / catalog / synth
-tests/                     323 个用例
+tests/                     404 个用例
 scripts/smoke.py           全链路冒烟
 scripts/shots.py           界面截图（视觉评审用）
 tools/testflow.py          测试入口（零第三方依赖）
