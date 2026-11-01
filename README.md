@@ -125,9 +125,11 @@ python packaging/verify_gui_launch.py   # 5 秒后自动关闭，退出码 0 = �
 | 并发 / 限速 / 暂停 / 停止 / 断点续做 | ✅ |
 | 卷枚举、系统卷识别 | ✅ 普通权限即可 |
 | **权限提权入口** | ✅ 标题栏权限徽标可点：非管理员时直接「以管理员身份重启」（会弹 UAC，不在启动时自动弹） |
+| **未提权扫描（目录遍历 + 逐文件簇映射）** | ✅ 不需要任何权限。C: 卷 126.7 万条目 → 88.2 万文件 / 246s；**只能预览**（拿不到 `$Bitmap`，看不到打不开的文件，界面会锁住「开始整理」） |
 | Windows 原始卷读写（离线镜像用） | ✅ 已实现（页对齐 + 短读补齐 + 锁卷），未在管理员权限下真机验证 |
-| **真机 NTFS 整理全链路** | ⚠ **代码完整，但未在管理员权限的真实卷上验证过**（见下） |
-| exFAT / FAT32 | ❌ 不支持（没有 MFT，本版不做） |
+| **MFT 扫描（真实卷）** | ✅ 已在数据卷上跑通：3937 文件 / 4.2s / 841 段自由区。系统卷的卷句柄被 ACL 拒绝时自动回落到目录遍历 |
+| **真机搬簇执行（`FSCTL_MOVE_FILE`）** | ⚠ 代码完整，**未在真实卷上执行过**（见下） |
+| exFAT / FAT32 | ⚠ 只读预览（走目录遍历），不支持执行 |
 
 **上真机之前请先做这一步**：把目标分区导成镜像（`dd` / Win32DiskImager），
 用 `lbamover ntfs --image dump.img` 确认文件表读得对，再动真卷。
@@ -152,6 +154,9 @@ PYTHONPATH=src python -m lbamover ntfs --image .tmp/demo.img --make-demo
    全程不碰真实磁盘，用于验收与演示。
 6. `verify`（回读校验）默认开启。真机路径下它校验的是"搬完后文件是否真的
    变成一段连续簇"，而不是逐块比对（那需要把数据读一遍）。
+7. **未提权时只能预览**：扫描会回落到目录遍历（拿到的是真实簇映射，但自由
+   空间靠反推、打不开的文件看不到），这种报告带 `restricted` 标记，
+   「开始整理」会被锁住并提示提权。不是限制你，是那种数据不足以决定"哪里安全"。
 
 ---
 
@@ -160,7 +165,7 @@ PYTHONPATH=src python -m lbamover ntfs --image .tmp/demo.img --make-demo
 ```
 src/lbamover/{contract,engine,devices,ntfs,platform,ui}/   见 docs/ARCHITECTURE.md
 src/lbamover/ntfs/         NTFS 解析：boot / runlist / record / catalog / synth
-tests/                     298 个用例
+tests/                     323 个用例
 scripts/smoke.py           全链路冒烟
 scripts/shots.py           界面截图（视觉评审用）
 tools/testflow.py          测试入口（零第三方依赖）

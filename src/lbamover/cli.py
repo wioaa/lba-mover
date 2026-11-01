@@ -234,6 +234,63 @@ def _cmd_ntfs(args: argparse.Namespace) -> int:
         dev.close()
 
 
+def _cmd_scan(args: argparse.Namespace) -> int:
+    """扫描一个真实卷并打印结果。**诊断"扫描不动"的第一站。**
+
+    界面里出问题常常只剩一句"命令执行失败"，看不出卡在哪条路径。这个命令
+    把关键事实直接打出来：走的是 MFT 还是目录遍历、受限与否、文件数、碎片度。
+    """
+    from .contract.models import JobParams
+    from .engine.catalog import CatalogError
+    from .engine.engine import EngineCore
+    from .contract.ports import ListSink
+    from .platform.volumes import enumerate_volumes
+
+    vols = enumerate_volumes()
+    if not vols:
+        print("未发现可整理的本地卷", file=sys.stderr)
+        return 1
+    if args.volume:
+        wanted = args.volume.rstrip("\\").upper()[:2]
+        match = [v for v in vols if v.mount_point.upper().startswith(wanted)]
+        if not match:
+            print(f"找不到卷 {args.volume}", file=sys.stderr)
+            return 1
+        vol = match[0]
+    else:
+        vol = vols[0]
+
+    print(f"卷：{vol.mount_point} {vol.filesystem or '-'} "
+          f"{vol.geometry.total_bytes / 2**30:.1f} GiB，可用 {vol.free_bytes / 2**30:.1f} GiB")
+
+    from .engine.catalog import open_ntfs_catalog
+
+    sink = ListSink()
+    core = EngineCore(sink=sink, catalog_factory=open_ntfs_catalog)
+    core.params = JobParams(block_size=vol.geometry.block_size)
+    core.set_target(vol)
+    try:
+        report = core.scan()
+    except CatalogError as exc:
+        print(f"[FAIL] 扫描失败：{exc}", file=sys.stderr)
+        for ev in sink.events:
+            if getattr(ev, "kind", None) is not None and ev.kind.value == "log":
+                print(f"  · {ev.message}", file=sys.stderr)
+        return 1
+
+    print(f"扫描完成：{report.file_count} 个文件 / "
+          f"{len(report.fragmented_files)} 个碎片文件 / "
+          f"碎片度 {report.file_frag_score:.1%}")
+    print(f"自由空间：{report.free_run_count} 段，最大 {report.largest_free_run} 块"
+          f"（{report.largest_free_run * vol.geometry.block_size / 2**20:.1f} MiB）")
+    print(f"模式：{'受限（未提权，只能预览）' if report.restricted else '完整（MFT + $Bitmap）'}")
+    for f in sorted(report.files, key=lambda f: f.run_count, reverse=True)[: args.top]:
+        print(f"  {f.run_count:>4} 段  {f.total_blocks * vol.geometry.block_size / 2**20:>9.1f} MiB  {f.path}")
+    if report.restricted:
+        print("提示：提权后重扫可改用 $MFT 解析，通常快两个数量级，且能拿到权威自由空间。")
+    return 0
+
+
 def _cmd_smoke(args: argparse.Namespace) -> int:
     """无头冒烟：建窗口 → 载合成卷 → 扫描 → 规划 → 执行 → 逐块校验。
 
@@ -353,6 +410,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     v = sub.add_parser("volumes", help="列出本机可整理的卷")
     v.set_defaults(func=_cmd_volumes)
+
+    s2 = sub.add_parser("scan", help="扫描真实卷并打印分布（诊断「扫描不动」用）")
+    s2.add_argument("--volume", help="盘符，例如 C:（默认第一个卷）")
+    s2.add_argument("--top", type=int, default=5, help="列出最碎的前 N 个文件")
+    s2.set_defaults(func=_cmd_scan)
 
     k = sub.add_parser("smoke", help="无头冒烟：建窗口、跑一次完整搬迁并校验")
     k.set_defaults(func=_cmd_smoke)

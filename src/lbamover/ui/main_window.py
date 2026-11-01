@@ -468,6 +468,8 @@ class MainWindow(QMainWindow):
 
     def _on_report(self, report: FragReport) -> None:
         self._report = report
+        # 受限扫描（未提权）只允许看：把"开始整理"锁掉，并说清原因
+        self.control.set_restricted(report.restricted)
         self.frag_map.set_report(report)
         self.m_file_frag.set_value(fmt_percent(report.file_frag_score))
         self.m_free_frag.set_value(fmt_percent(report.free_frag_score))

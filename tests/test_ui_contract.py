@@ -131,6 +131,26 @@ class TestBridge:
 
 
 class TestControlBar:
+    def test_restricted_scan_blocks_start(self, qapp):
+        """受限扫描（未提权）只能预览：开始按钮必须锁住，并说明原因。"""
+        bar = ControlBar(DARK)
+        bar.set_target_available(True)
+        bar.set_restricted(True)
+        bar.sync_state(JobState.IDLE)
+        assert bar.btn_scan.isEnabled(), "扫描本身还要能重试"
+        assert not bar.btn_start.isEnabled()
+        assert "提权" in bar.btn_start.toolTip()
+        assert "受限模式" in bar.summary.text()
+
+    def test_clearing_restriction_restores_start(self, qapp):
+        bar = ControlBar(DARK)
+        bar.set_target_available(True)
+        bar.set_restricted(True)
+        bar.sync_state(JobState.IDLE)
+        bar.set_restricted(False)
+        assert bar.btn_start.isEnabled()
+        assert bar.btn_start.toolTip() == ""
+
     def test_idle_enables_scan_and_start(self, qapp):
         bar = ControlBar(DARK)
         bar.set_target_available(True)

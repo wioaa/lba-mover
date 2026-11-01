@@ -106,23 +106,39 @@ class JsonCatalog:
         return self._free
 
 
-def open_ntfs_catalog(volume: VolumeInfo, *, min_clusters: int = 1):
-    """为真实 NTFS 卷打开文件目录服务。**这是真机扫描的入口。**
+def open_ntfs_catalog(
+    volume: VolumeInfo,
+    *,
+    min_clusters: int = 1,
+    on_progress=None,
+):
+    r"""为真实卷打开文件目录服务。**这是真机扫描的入口。**
 
-    只读打开卷：扫描阶段一个字节都不写。句柄由调用方在用完后关闭
-    （:meth:`lbamover.ntfs.MftCatalog.close`）。
+    两条路，自动选：
+
+    1. **MFT 解析**（快，一次拿到全卷）——需要读 ``\\.\X:``，也就是管理员权限；
+    2. **目录遍历 + 逐文件簇映射**（慢，不需要任何权限）——普通用户的唯一选择。
+
+    以前只有第 1 条，于是未提权时点"扫描"必然失败；而扫描正是用户第一次点的
+    那颗按钮。第 2 条虽然慢，但**能跑**，且给出的是真实数据（只是自由空间靠
+    反推、打不开的文件看不到），所以它返回的目录服务带 ``restricted=True``，
+    引擎据此只允许预览、不允许执行。
+
+    句柄由调用方在用完后关闭（:meth:`lbamover.ntfs.MftCatalog.close`）。
     """
     if os.name != "nt":
         raise CatalogError("实时文件表解析只在 Windows 上可用")
-    if not volume.filesystem.upper().startswith("NTFS"):
-        raise CatalogError(
-            f"{volume.mount_point} 是 {volume.filesystem or '未知'}，"
-            "本版的文件表解析只支持 NTFS"
-        )
     # 延迟导入：engine 包的其它部分在非 Windows 上也要能 import
     from ..devices import DeviceSpec, open_device
     from ..devices.base import DeviceError
     from ..ntfs import MftCatalog
+    from ..platform.dirscan import DirectoryCatalog
+    from ..platform.errors import DeviceUnavailable
+
+    if not volume.filesystem.upper().startswith("NTFS"):
+        # 非 NTFS 没有 $MFT，但目录遍历照样能拿到簇映射 —— 预览仍然有价值，
+        # 只是执行路径本来就不支持（MOVE_FILE 是 NTFS 的）。
+        return DirectoryCatalog(volume, on_progress=on_progress)
 
     try:
         device = open_device(
@@ -134,17 +150,14 @@ def open_ntfs_catalog(volume: VolumeInfo, *, min_clusters: int = 1):
                 unbuffered=True,
             )
         )
-    except DeviceError as exc:
-        # 最常见的失败就是没管理员权限。原始 Win32 错误串对用户毫无指导意义，
-        # 这里翻译成"该做什么"，并把原始信息留在 detail 里供排查。
+    except (DeviceError, DeviceUnavailable) as exc:
         winerror = getattr(exc, "winerror", 0) or 0
         if winerror in (5, 32) or "拒绝访问" in str(exc) or "Access is denied" in str(exc):
-            raise CatalogError(
-                f"无法读取 {volume.mount_point} 的卷数据：需要管理员权限。"
-                "请点击标题栏的权限徽标提权重启，或右键程序选择「以管理员身份运行」。"
-            ) from exc
+            # 没提权：回落到目录遍历。这不是降级为"假数据"——文件→簇区间
+            # 仍然来自文件系统本身，只是拿不到 $Bitmap、看不到打不开的文件。
+            return DirectoryCatalog(volume, on_progress=on_progress)
         raise CatalogError(f"打开卷 {volume.device_path} 失败：{exc}") from exc
-    return MftCatalog(device, min_clusters=min_clusters)
+    return MftCatalog(device, min_clusters=min_clusters, root=volume.mount_point)
 
 
 class UnsupportedCatalog:

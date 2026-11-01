@@ -28,6 +28,7 @@ class ControlBar(QWidget):
         self._p = palette
         self._state = JobState.IDLE
         self._has_target = False
+        self._restricted = False
 
         self.summary = QLabel("选择目标卷后开始")
         self.summary.setStyleSheet(f"color: {palette.text_faint}; font-size: 12px;")
@@ -64,6 +65,17 @@ class ControlBar(QWidget):
     def set_summary(self, text: str) -> None:
         self.summary.setText(text)
 
+    def set_restricted(self, restricted: bool) -> None:
+        """扫描结果是否来自受限路径（未提权）。受限时**不许开始**。
+
+        这条约束放在这里，而不是让每个面板各自判断：按钮可用性只有这一个
+        出口（旧版"按钮永久禁用"就是多处各自 setEnabled 造成的）。
+        """
+        if self._restricted == restricted:
+            return
+        self._restricted = restricted
+        self.sync_state(self._state)
+
     def sync_state(self, state: JobState) -> None:
         self._state = state
         running = state in (JobState.RUNNING, JobState.PAUSED, JobState.STOPPING)
@@ -71,7 +83,10 @@ class ControlBar(QWidget):
         idle = state in (JobState.IDLE, JobState.DONE, JobState.FAILED, JobState.CANCELLED)
 
         self.btn_scan.setEnabled(self._has_target and not running and not busy)
-        self.btn_start.setEnabled(self._has_target and not running and not busy)
+        # 受限扫描（未提权）只给了预览数据，按它去写盘等于拿别人的簇当空地
+        self.btn_start.setEnabled(
+            self._has_target and not running and not busy and not self._restricted
+        )
         self.btn_pause.setEnabled(state in (JobState.RUNNING, JobState.PAUSED))
         self.btn_stop.setEnabled(running or state is JobState.PAUSED)
         self.btn_pause.setText("继续" if state is JobState.PAUSED else "暂停")
@@ -80,6 +95,11 @@ class ControlBar(QWidget):
             self.btn_scan.setText("扫描中…" if state is JobState.SCANNING else "规划中…")
         else:
             self.btn_scan.setText("扫描 / 预演")
+
+        if self._restricted and idle:
+            self.btn_start.setToolTip("受限扫描（未提权）只能预览：请点标题栏权限徽标提权重启后重新扫描")
+        else:
+            self.btn_start.setToolTip("")
 
         if not self._has_target and idle:
             self.summary.setText("请先选择目标卷")
@@ -95,6 +115,11 @@ class ControlBar(QWidget):
             self.summary.setText("执行失败，详情见日志面板")
         elif state is JobState.CANCELLED:
             self.summary.setText("已停止，断点已保留，可再次开始续做")
+        elif state is JobState.IDLE and self._restricted:
+            # 比"接下来点哪"更重要的信息：现在这套数据不能用来执行
+            self.summary.setText(
+                "受限模式（未提权）：分布可看，执行需点标题栏权限徽标提权重启"
+            )
         elif state is JobState.IDLE:
             # 有目标但还没扫过：给下一步动作，而不是留一句过期的"请先选择目标卷"
             self.summary.setText(

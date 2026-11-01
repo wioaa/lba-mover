@@ -56,13 +56,17 @@ IS_WINDOWS = os.name == "nt"
 
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
+FILE_READ_ATTRIBUTES = 0x00000080
 FILE_SHARE_READ = 0x00000001
 FILE_SHARE_WRITE = 0x00000002
+FILE_SHARE_DELETE = 0x00000004
 OPEN_EXISTING = 3
 
 FILE_FLAG_NO_BUFFERING = 0x20000000
 FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
 FILE_FLAG_WRITE_THROUGH = 0x80000000
+#: 允许 CreateFileW 打开目录与特殊文件（$MFT、页面文件这类也要靠它）
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 
 FILE_BEGIN = 0
 INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
@@ -86,6 +90,8 @@ ERROR_INSUFFICIENT_BUFFER = 122
 ERROR_MORE_DATA = 234
 ERROR_NOT_SUPPORTED = 50
 ERROR_INVALID_FUNCTION = 1
+#: retrieval pointers 在"文件不占任何簇"时返回它（内容常驻 MFT 的小文件）
+ERROR_HANDLE_EOF = 38
 
 
 # --------------------------------------------------------------------------
@@ -433,6 +439,10 @@ class Win32Native:
 
         这是判断"文件现在到底占哪些簇"的唯一可靠来源，也是搬簇之前**必须**
         重新查一次的校验依据——扫描到执行之间文件可能已经变了。
+
+        ``ERROR_HANDLE_EOF``（38）表示**这个文件不占任何簇**（内容全在 MFT
+        记录里的小文件、或零长度分配），返回空元组即可。把它当错误处理会让
+        未提权扫描把小文件全记成"打不开"——实测能占 20% 以上。
         """
         size = 64 * 1024
         for _attempt in range(6):
@@ -440,9 +450,14 @@ class Win32Native:
             try:
                 # 入参是 STARTING_VCN_INPUT_BUFFER，与输出共用同一块缓冲
                 ctypes.memmove(buf.address, struct.pack("<q", 0), 8)
-                got = Win32Native.ioctl_neither(
-                    handle, FSCTL_GET_RETRIEVAL_POINTERS, buf.address, 8, size
-                )
+                try:
+                    got = Win32Native.ioctl_neither(
+                        handle, FSCTL_GET_RETRIEVAL_POINTERS, buf.address, 8, size
+                    )
+                except DeviceError as exc:
+                    if getattr(exc, "winerror", 0) == ERROR_HANDLE_EOF:
+                        return ()
+                    raise
                 raw = buf.to_bytes(got) if got else buf.to_bytes(size)
                 parsed = _parse_retrieval(raw)
                 if parsed is not None:
@@ -453,9 +468,20 @@ class Win32Native:
         raise DeviceError("查询文件簇映射失败：缓冲反复不足", error_class=ErrorClass.FATAL)
 
     @staticmethod
-    def open_file(path: str, writable: bool = True) -> int:
-        """打开文件拿句柄（FSCTL_MOVE_FILE 要的是文件句柄，不是卷句柄）。"""
-        access = GENERIC_READ | (GENERIC_WRITE if writable else 0)
+    def open_file(path: str, writable: bool = True, attributes_only: bool = False) -> int:
+        """打开文件拿句柄。
+
+        * 搬簇（``FSCTL_MOVE_FILE``）需要 ``GENERIC_READ|GENERIC_WRITE``；
+        * 只查簇映射（``FSCTL_GET_RETRIEVAL_POINTERS``）只要 ``FILE_READ_ATTRIBUTES``。
+
+        第二种很关键：页面文件、注册表 hive、别人独占打开的大文件，用
+        ``GENERIC_READ`` 一律被拒，但**属性级打开通常能成功**，而查簇映射
+        正需要它。不区分这两种权限，未提权扫描会漏掉一大批文件。
+        """
+        if attributes_only:
+            access = FILE_READ_ATTRIBUTES
+        else:
+            access = GENERIC_READ | (GENERIC_WRITE if writable else 0)
         handle = _kernel32().CreateFileW(
             long_path(path),
             access,

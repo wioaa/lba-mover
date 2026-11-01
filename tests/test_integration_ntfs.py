@@ -94,15 +94,18 @@ class TestScanFromMft:
         core.scan()
         assert holder["dev"].closed, "扫描结束后设备句柄必须关闭"
 
-    def test_non_ntfs_volume_rejected_with_reason(self, tmp_path):
-        from lbamover.engine.catalog import CatalogError
+    def test_non_ntfs_volume_gets_walk_catalog(self, tmp_path):
+        """exFAT 没有 $MFT，但目录遍历照样能给出簇映射。
 
-        core = EngineCore(sink=ListSink(), catalog_factory=open_ntfs_catalog, state_dir=tmp_path)
-        vol = replace(volume_for(Geometry(4096, 1024)), filesystem="exFAT")
-        core.set_target(vol)
-        with pytest.raises(CatalogError) as exc:
-            core.scan(vol)
-        assert "只支持 NTFS" in str(exc.value)
+        以前这里是"直接拒绝"，结果是 U 盘/移动硬盘完全不可用。现在改成
+        走遍历路径，报告标记 ``restricted``（自由空间靠反推），只允许预览。
+        """
+        from lbamover.platform.dirscan import DirectoryCatalog
+
+        cat = open_ntfs_catalog(replace(volume_for(Geometry(4096, 1024)), filesystem="exFAT"))
+        assert isinstance(cat, DirectoryCatalog)
+        assert cat.restricted is True
+        cat.close()
 
 
 class TestPlanOnRealLayout:

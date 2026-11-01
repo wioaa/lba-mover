@@ -166,6 +166,54 @@ def protection_screens():
     return "元文件/系统目录/页面文件被拦，普通文件放行"
 
 
+def restricted_scan():
+    """未提权扫描：走目录遍历，能出真实分布，但标记为受限。
+
+    这条路径是"没管理员权限时点扫描不至于直接失败"的唯一保障，所以冒烟
+    必须覆盖它；用注入的假遍历器跑，不依赖 Windows 也不需要真盘。
+    """
+    from lbamover.contract.models import Extent, Geometry, VolumeInfo
+    from lbamover.contract.enums import VolumeKind
+    from lbamover.engine.engine import EngineCore
+    from lbamover.engine.errors import PlanRejected
+    from lbamover.platform.dirscan import DirectoryCatalog
+
+    geo = Geometry(4096, 1000)
+    vol = VolumeInfo(
+        r"\\.\Q:", "Q:" + chr(92), "t", "NTFS", VolumeKind.FIXED, geo,
+        free_bytes=500 * 4096, writable=True,
+    )
+    entries = [("Q:" + chr(92) + "a.bin", 0, 8192), ("Q:" + chr(92) + "b.bin", 0, 4096)]
+    runs = {"Q:" + chr(92) + "a.bin": ((0, 100, 2), (2, -1, 3), (5, 40, 1)),
+            "Q:" + chr(92) + "b.bin": ((0, 200, 1),)}
+
+    def factory(_vol, on_progress=None):
+        return DirectoryCatalog(
+            _vol, scanner=lambda _m: iter(entries), query=lambda p: runs.get(p, ())
+        )
+
+    core = EngineCore(catalog_factory=factory)
+    core.set_target(vol)
+    report = core.scan()
+    assert report.restricted is True, "未提权扫描必须标记为受限"
+    assert report.file_count == 2
+    # 稀疏洞被跳过、LCN 乱序被排序
+    assert report.files[0].extents == (Extent(40, 1), Extent(100, 2))
+
+    # 受限报告不许执行
+    from lbamover.contract.enums import Strategy
+    from lbamover.contract.models import MoveOp, Plan
+
+    plan = Plan("j", Strategy.COALESCE, ops=(MoveOp(0, "walk-1", "x", (Extent(0, 1),), 900),))
+    try:
+        core.execute(plan, device=object())
+    except PlanRejected as exc:
+        assert "未提权" in str(exc) or "受限" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("受限报告竟然允许执行")
+    return "目录遍历出分布 + 受限标记 + 拒绝执行"
+
+
 # ----------------------------------------------------------------------
 # 2. UI
 # ----------------------------------------------------------------------
@@ -267,6 +315,7 @@ def main(argv: list[str] | None = None) -> int:
     print("\n[2/4] 真机 NTFS 与保护层")
     check("MFT 解析（合成 NTFS 镜像 → 簇区间）", ntfs_mft_scan)
     check("保护策略拦截", protection_screens)
+    check("未提权扫描（目录遍历 + 受限闸门）", restricted_scan)
 
     if not args.no_gui:
         print("\n[3/4] GUI 装配与驱动")

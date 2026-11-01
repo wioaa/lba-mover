@@ -107,6 +107,8 @@ class EngineCore:
         self.volume: VolumeInfo | None = None
         self.params = JobParams()
         self.report: FragReport | None = None
+        #: 上一次扫描是否走受限路径（未提权）。受限时只允许预览。
+        self.restricted: bool = False
         self.plan: Plan | None = None
         self.job_id = ""
         self.control = RunControl()
@@ -169,12 +171,22 @@ class EngineCore:
         t0 = time.monotonic()
         cat = self.catalog
         owned = None
+        restricted = False
         try:
             if self.catalog_factory is not None:
-                cat = self.catalog_factory(vol)
+                cat = self._open_catalog(vol)
                 owned = cat
+                # 先告知代价再开跑：MFT 是秒级，逐文件查簇映射在百万文件级
+                # 的卷上要几分钟。不说清楚，用户会以为程序卡死。
+                if getattr(cat, "restricted", False):
+                    self._log(
+                        LogLevel.INFO,
+                        f"未提权：改用目录遍历读取 {vol.mount_point}，"
+                        "大卷可能需要几分钟。提权后走 $MFT 解析，通常几秒完成。",
+                    )
             files = tuple(cat.list_files(vol))
             free = tuple(cat.free_extents(vol))
+            restricted = bool(getattr(cat, "restricted", False))
             stats = getattr(cat, "stats", None)
             if stats is not None:
                 self._log(
@@ -208,6 +220,15 @@ class EngineCore:
             bucket_count=bucket_count,
             elapsed_s=time.monotonic() - t0,
         )
+        if restricted:
+            # 受限报告要能被下游认出来，否则"看着能跑" → 真去执行 → 出事。
+            report = replace(report, restricted=True)
+            self._log(
+                LogLevel.WARNING,
+                "未提权，走的是目录遍历：自由空间由已用区间反推，"
+                "打不开的文件不在统计内。可以先看分布，执行需要提权。",
+            )
+        self.restricted = restricted
         self.volume = vol
         self.report = report
         self._emit(FragMapEvent(report, seq=self._next_seq()))
@@ -219,6 +240,39 @@ class EngineCore:
         )
         self._set_state(JobState.IDLE, "扫描完成")
         return report
+
+    # -- 目录服务 ---------------------------------------------------------
+
+    def _open_catalog(self, vol: VolumeInfo):
+        """打开本次扫描用的目录服务，并把进度接出来。
+
+        未提权的目录遍历在百万级文件的卷上要跑几十秒。没有进度的话，界面
+        看起来像卡死——用户会去点第二次、第三次扫描。所以每 N 个文件往日志
+        里丢一行，让他知道还在动。
+        """
+        factory = self.catalog_factory
+        assert factory is not None
+        try:
+            return factory(vol, on_progress=self._scan_progress)
+        except TypeError:
+            # 注入的工厂可能只有 (volume) 一个参数（测试里就是这么写的）
+            return factory(vol)
+
+    def _scan_progress(self, seen: int, current: str) -> None:
+        """按时间节流上报遍历进度。
+
+        按"每 N 个文件"报会在一堆小文件里刷屏、在大文件里长时间沉默。
+        按秒节流才能让用户稳定看到"还在动"。
+        """
+        now = time.monotonic()
+        if now - getattr(self, "_scan_log_at", 0.0) < 2.5:
+            return
+        self._scan_log_at = now
+        self._log(
+            LogLevel.INFO,
+            f"正在遍历：已看 {seen} 个条目",
+            detail=current,
+        )
 
     # -- 保护策略 ---------------------------------------------------------
 
@@ -335,6 +389,15 @@ class EngineCore:
             raise ValueError("没有可执行的计划")
         if self.volume is None:
             raise ValueError("尚未选择目标卷")
+        # 受限扫描（未提权）只能看，不能改：自由空间是反推的、打不开的文件
+        # 不在统计里，按这种报告去挪数据等于拿别人的簇当空地用。
+        if self.report is not None and self.report.restricted:
+            message = (
+                "本次扫描是受限模式（未提权），只能预览。"
+                "执行需要读取卷并搬簇，请点标题栏的权限徽标提权重启后重新扫描。"
+            )
+            self._log(LogLevel.ERROR, message)
+            raise PlanRejected([message])
         # 顺序要紧：先判"计划本身是否允许执行"，再判"有没有活可干"。
         # 反过来写的话，一份明确标记为不可行的空计划会被当成"没事可做"
         # 静默通过 —— 用户以为跑完了，实际上什么都没做。

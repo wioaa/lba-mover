@@ -26,7 +26,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from ..contract.models import Extent, FileFrag, Geometry, VolumeInfo
+from ..contract.models import Extent, FileFrag, Geometry, VolumeInfo, normalize_extents
 from ..devices.base import DeviceError
 from .boot import NtfsBoot, NotNtfsError
 from .record import FileRecord, parse_record
@@ -48,6 +48,8 @@ class NtfsScanError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class CatalogStats:
+    #: 数据来源，只用于展示：``MFT``（$MFT 解析）/ ``遍历``（目录 + 簇映射）
+    kind: str = "MFT"
     records_read: int = 0
     records_bad: int = 0
     records_skipped: int = 0
@@ -61,7 +63,7 @@ class CatalogStats:
     def summary(self, cluster_size: int) -> str:
         mb = self.free_clusters * cluster_size / 1048576
         return (
-            f"MFT {self.records_read} 条记录（坏 {self.records_bad}），"
+            f"{self.kind} {self.records_read} 条（异常 {self.records_bad}），"
             f"可用文件 {self.files}，自由 {mb:.1f} MiB（来源 {self.free_source}）"
         )
 
@@ -76,9 +78,13 @@ class MftCatalog:
         *,
         min_clusters: int = 1,
         max_records: int | None = None,
+        root: str = "",
     ) -> None:
         self.device = device
         self._boot = boot
+        #: 路径前缀（``R:\``）。MFT 里存的是相对卷根的路径，界面上直接显示
+        #: "下载中转.zip" 会让人分不清是哪个盘。
+        self._root = root
         self._min_clusters = max(1, min_clusters)
         self._max_records = max_records
         self._files: tuple[FileFrag, ...] | None = None
@@ -329,17 +335,22 @@ class MftCatalog:
                 skip("路径无法还原")
                 continue
 
-            block_extents = tuple(
+            block_extents = normalize_extents(
                 Extent(e.start * scale, e.length * scale) for e in extents
             )
-            files.append(
-                FileFrag(
+            try:
+                frag = FileFrag(
                     file_id=str(number),
-                    path=rel,
+                    path=self._root + rel,
                     extents=block_extents,
                     attributes=rec.si_flags,
                 )
-            )
+            except ValueError:
+                # 单个文件的 runlist 异常（重叠/乱序，多见于事务日志这类特殊
+                # 文件）不能把整卷扫描带崩：跳过它并计数，报告里会有体现。
+                skip("簇区间异常")
+                continue
+            files.append(frag)
 
         notes = []
         for reason, count in sorted(reasons.items(), key=lambda kv: -kv[1]):
