@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 from ..contract.models import Extent, FileFrag, Geometry, VolumeInfo, normalize_extents
 from ..devices.base import DeviceError
+from .bitmap import free_runs
 from .boot import NtfsBoot, NotNtfsError
 from .record import FileRecord, parse_record
 
@@ -387,19 +388,12 @@ class MftCatalog:
         scale = self._blocks_per_cluster
         if bitmap is not None:
             total = boot.cluster_count
-            out: list[Extent] = []
-            run_start = None
-            for c in range(total):
-                byte = bitmap[c >> 3] if (c >> 3) < len(bitmap) else 0xFF
-                used = (byte >> (c & 7)) & 1
-                if not used:
-                    if run_start is None:
-                        run_start = c
-                elif run_start is not None:
-                    out.append(Extent(run_start * scale, (c - run_start) * scale))
-                    run_start = None
-            if run_start is not None:
-                out.append(Extent(run_start * scale, (total - run_start) * scale))
+            # 位图遍历是整个扫描里最容易变成瓶颈的一步：1 TiB / 4 KiB 簇的卷
+            # 有 2.6 亿位，逐位循环要几十秒。free_runs 按字节跳跃，只碰段边界。
+            out = [
+                Extent(start * scale, length * scale)
+                for start, length in free_runs(bitmap, total)
+            ]
             return tuple(out), "bitmap"
 
         from ..engine.frag import free_extents_from_files

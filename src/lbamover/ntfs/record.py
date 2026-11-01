@@ -209,31 +209,64 @@ def apply_fixups(raw: bytearray, bytes_per_sector: int) -> bool:
 # --------------------------------------------------------------------------
 
 
-def _parse_attribute(raw: bytes, pos: int) -> tuple[NtfsAttribute, int] | None:
-    if pos + 16 > len(raw):
+#: 属性头通用部分（0x00~0x10）：type / length / non_resident / name_len /
+#: name_off / flags / attr_id。一次 unpack 取全，别为 1~2 字节的字段反复调用。
+_ATTR_HEADER = struct.Struct("<IIBBHHH")
+#: non-resident 头：start_vcn(0x10) / last_vcn(0x18) / runlist_off(0x20)，
+#: 中间 14 字节是压缩/分配尺寸，跳到 real_size(0x30)。一次取全。
+_ATTR_NONRES = struct.Struct("<qqH14xq")
+#: resident 头：value_len(0x10) / value_off(0x14)
+_ATTR_RES = struct.Struct("<IH")
+#: FILE 记录头（0x10~0x28）：sequence / link / attrs_off / flags / used /
+#: allocated / base_ref
+_RECORD_HEADER = struct.Struct("<HHHHIIQ")
+_U32 = struct.Struct("<I")
+#: FILE_NAME 值头：parent_ref(0x00) / flags(0x38) / name_len(0x40) / ns(0x41)
+_FILE_NAME_HEAD = struct.Struct("<Q48xI4xBB")
+
+#: 真正需要解析的属性类型。其余类型只看 type/length 就跳过 —— 它们的 value
+#: 对"这个文件能不能整理"没有任何影响（见 catalog 的跳过策略）。
+_WANTED = frozenset(
+    {
+        _Attr.STANDARD_INFORMATION,
+        _Attr.ATTRIBUTE_LIST,
+        _Attr.FILE_NAME,
+        _Attr.DATA,
+        _Attr.REPARSE_POINT,
+    }
+)
+
+
+def _parse_attribute(raw: bytes | bytearray, pos: int, limit: int | None = None) -> tuple[NtfsAttribute, int] | None:
+    """解析一条属性。
+
+    ``raw`` 故意允许 ``bytearray``：调用方传的是**同一条记录的可变副本**。
+    这里只把真正要留下的 value 片段转成 ``bytes``（几十到一两百字节），
+    不能反过来要求调用方先 ``bytes(buf)`` —— 那是每条属性复制一整块 1 KiB
+    记录，一个典型记录有 4~6 条属性，等于每次解析多拷 5 份。
+    """
+    n = len(raw) if limit is None else limit
+    if pos + 16 > n:
         return None
-    attr_type, length = struct.unpack_from("<II", raw, pos)
-    if attr_type == ATTR_END or length < 16 or pos + length > len(raw):
+    attr_type, length, non_resident, name_len, name_off, flags, _attr_id = (
+        _ATTR_HEADER.unpack_from(raw, pos)
+    )
+    if attr_type == ATTR_END or length < 16 or pos + length > n:
         return None
 
-    non_resident = raw[pos + 8]
-    name_len = raw[pos + 9]
-    name_off = struct.unpack_from("<H", raw, pos + 0x0A)[0]
-    flags = struct.unpack_from("<H", raw, pos + 0x0C)[0]
     name = ""
-    if name_len and 0 < name_off and pos + name_off + name_len * 2 <= len(raw):
+    if name_len and 0 < name_off and pos + name_off + name_len * 2 <= n:
         name = raw[pos + name_off : pos + name_off + name_len * 2].decode(
             "utf-16-le", errors="replace"
         )
 
     if non_resident == 0:
-        if pos + 0x16 > len(raw):
+        if pos + 0x16 > n:
             return None
-        value_len = struct.unpack_from("<I", raw, pos + 0x10)[0]
-        value_off = struct.unpack_from("<H", raw, pos + 0x14)[0]
+        value_len, value_off = _ATTR_RES.unpack_from(raw, pos + 0x10)
         start = pos + value_off
-        end = min(len(raw), start + value_len)
-        value = raw[start:end] if 0 < value_off and start < len(raw) else b""
+        end = min(n, start + value_len)
+        value = bytes(raw[start:end]) if 0 < value_off and start < n else b""
         return (
             NtfsAttribute(
                 type=attr_type,
@@ -247,15 +280,13 @@ def _parse_attribute(raw: bytes, pos: int) -> tuple[NtfsAttribute, int] | None:
         )
 
     # non-resident
-    if pos + 0x40 > len(raw):
+    if pos + 0x40 > n:
         return None
-    start_vcn, last_vcn = struct.unpack_from("<qq", raw, pos + 0x10)
-    run_off = struct.unpack_from("<H", raw, pos + 0x20)[0]
-    real_size = struct.unpack_from("<q", raw, pos + 0x30)[0]
+    start_vcn, last_vcn, run_off, real_size = _ATTR_NONRES.unpack_from(raw, pos + 0x10)
 
     runlist: Runlist | None = None
     run_start = pos + run_off
-    if 0 < run_off and run_start < pos + length and run_start < len(raw):
+    if 0 < run_off and run_start < pos + length and run_start < n:
         blob = raw[run_start : pos + length]
         try:
             runlist = decode_runs(blob)
@@ -280,10 +311,7 @@ def _parse_attribute(raw: bytes, pos: int) -> tuple[NtfsAttribute, int] | None:
 def _parse_file_name(value: bytes) -> FileNameAttr | None:
     if len(value) < 0x42:
         return None
-    parent_ref = struct.unpack_from("<Q", value, 0x00)[0]
-    flags = struct.unpack_from("<I", value, 0x38)[0]
-    name_len = value[0x40]
-    namespace = value[0x41]
+    parent_ref, flags, name_len, namespace = _FILE_NAME_HEAD.unpack_from(value, 0)
     if 0x42 + name_len * 2 > len(value):
         return None
     name = value[0x42 : 0x42 + name_len * 2].decode("utf-16-le", errors="replace")
@@ -306,14 +334,28 @@ def parse_record(
     if not apply_fixups(buf, bytes_per_sector):
         return None
 
-    sequence = struct.unpack_from("<H", buf, 0x10)[0]
-    flags = struct.unpack_from("<H", buf, 0x16)[0]
-    attrs_offset = struct.unpack_from("<H", buf, 0x14)[0]
-    used_size = struct.unpack_from("<I", buf, 0x18)[0]
-    base_ref = struct.unpack_from("<Q", buf, 0x20)[0] & 0x0000FFFFFFFFFFFF
+    if len(buf) < 0x28:
+        return None
+    sequence, _links, attrs_offset, flags, used_size, _allocated, base_ref = (
+        _RECORD_HEADER.unpack_from(buf, 0x10)
+    )
+    base_ref &= 0x0000FFFFFFFFFFFF
 
     in_use = bool(flags & 0x01)
     is_dir = bool(flags & 0x02)
+
+    if not in_use:
+        # 已删除的记录槽：属性区是上一次使用的残留，随时可能被复用或覆盖，
+        # 读它没有任何意义。目录服务本来也会丢掉这些记录（见 catalog），
+        # 所以这里只把头部交出去 —— 在 R: 这种"删得多"的卷上，这一步能省掉
+        # 八成记录的属性遍历。
+        return FileRecord(
+            number=number,
+            sequence=sequence,
+            in_use=False,
+            is_dir=is_dir,
+            base_ref=base_ref,
+        )
 
     limit = min(len(buf), used_size if used_size > attrs_offset else len(buf))
     names: list[FileNameAttr] = []
@@ -324,21 +366,28 @@ def parse_record(
     seen: list[int] = []
 
     pos = attrs_offset
-    while pos + 4 <= limit:
-        try:
-            attr_type = struct.unpack_from("<I", buf, pos)[0]
-        except struct.error:
-            break
+    while pos + 16 <= limit:
+        attr_type = _U32.unpack_from(buf, pos)[0]
         if attr_type == ATTR_END:
             break
-        parsed = _parse_attribute(bytes(buf), pos)
-        if parsed is None:
+        length = _U32.unpack_from(buf, pos + 4)[0]
+        if length < 16 or pos + length > limit:
             break
-        attr, next_pos = parsed
-        if next_pos <= pos:
-            break
-        pos = next_pos
-        seen.append(attr.type)
+        seen.append(attr_type)
+        # 只有这五种属性会影响"能不能整理"；其余（索引、安全描述符、EA、
+        # 对象 ID…）连 value 都不用拷。目录记录的 INDEX_ROOT 常有几 KB，
+        # 每个都复制一遍是纯浪费 —— 而目录在 MFT 里占很大比例。
+        if attr_type in _WANTED:
+            parsed = _parse_attribute(buf, pos, limit)
+            if parsed is None:
+                break
+            attr, next_pos = parsed
+            if next_pos <= pos:
+                break
+            pos = next_pos
+        else:
+            pos += length
+            continue
 
         if attr.type == ATTR.STANDARD_INFORMATION and not attr.non_resident:
             if len(attr.value) >= 0x24:

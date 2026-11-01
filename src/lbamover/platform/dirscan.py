@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import os
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from typing import Callable, Iterable, Iterator
 
 from ..contract.models import Extent, FileFrag, Geometry, VolumeInfo, normalize_extents
@@ -36,6 +37,23 @@ FILE_ATTRIBUTE_DIRECTORY = 0x10
 #: 这些目录里的文件由保护层统一排除，但**遍历仍要进去**：
 #: 少了它们的占用，占用带会把 Windows 目录画成"空闲"。
 _WALK_MAX_DEPTH = 64
+
+#: 并发查询的默认线程数上限。
+#:
+#: 每个文件要跑一次 ``CreateFileW`` + ``DeviceIoControl``，都是**同步系统调用**，
+#: ctypes 在调用期间释放 GIL，所以多线程能重叠等待。实测（88 万文件的 C: 卷）
+#: 单文件约 0.28 ms，串行 4 分钟；8 路能到 1.6~1.8 倍。
+#:
+#: **加速比不高不是线程池的问题，是内核的问题**：同一卷上的这些调用最终都在
+#: NTFS 的目录/记录锁上排队，进程级并发（多进程实测）也只到 1.3~1.6 倍。
+#: 真正的量级差异来自"提权后用 $MFT 一次读完"，而不是这里的并发度。
+_MAX_WORKERS = 8
+#: 在飞任务上限 = 线程数 × 该系数。太小喂不饱线程，太大则内存与"取消滞后"变差。
+_INFLIGHT_FACTOR = 8
+
+
+def _default_workers() -> int:
+    return min(_MAX_WORKERS, max(2, (os.cpu_count() or 4) // 2))
 
 
 class DirectoryCatalog:
@@ -54,6 +72,7 @@ class DirectoryCatalog:
         on_progress: Callable[[int, str], None] | None = None,
         max_files: int | None = None,
         progress_every: int = 2000,
+        workers: int | None = None,
     ) -> None:
         self.volume = volume
         self._scanner = scanner or _walk
@@ -61,6 +80,8 @@ class DirectoryCatalog:
         self._on_progress = on_progress
         self._max_files = max_files
         self._progress_every = max(1, progress_every)
+        #: 并发查询线程数。``1`` 表示完全串行——测试与排障时用它拿到确定顺序。
+        self._workers = _default_workers() if workers is None else max(1, workers)
         self._files: tuple[FileFrag, ...] = ()
         self._free: tuple[Extent, ...] = ()
         self._stats = CatalogStats()
@@ -112,47 +133,116 @@ class DirectoryCatalog:
         failed = 0
         truncated = False
         last_report = 0
+        order = 0
         geometry = self.volume.geometry
 
-        try:
-            for path, attributes, size in self._scanner(self.volume.mount_point):
-                seen += 1
-                if attributes & FILE_ATTRIBUTE_DIRECTORY:
-                    skipped_dir += 1
-                    continue
-                if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
-                    skipped_link += 1
-                    continue
-                if size <= 0:
-                    continue  # 空文件 / 无独立簇，问了也是空
-                try:
-                    runs = self._query(path)
-                except (OSError, DeviceUnavailable):
-                    # 独占打开（页面文件、注册表 hive、正在写的日志）很常见，
-                    # 不能因为一个文件失败就放弃整卷。
-                    failed += 1
-                    continue
-                extents = _runs_to_extents(runs, geometry)
-                if not extents:
-                    continue
-                try:
-                    frag = FileFrag(
-                        file_id=f"walk-{len(files)}",
+        def accept(runs, path: str, attributes: int, idx: int) -> None:
+            """收下一次查询结果。异常只计数，绝不打断整卷。"""
+            nonlocal failed
+            if self._max_files is not None and len(files) >= self._max_files:
+                # 并发时会有多个结果同时回来，上限必须在这里再挡一道，
+                # 否则一次收割就能把结果数顶过 max_files。
+                return
+            extents = _runs_to_extents(runs, geometry)
+            if not extents:
+                return
+            try:
+                files.append(
+                    FileFrag(
+                        file_id=f"walk-{idx}",
                         path=path,
                         extents=extents,
                         attributes=attributes,
                     )
-                except ValueError:
-                    # 单文件数据异常（极端稀疏/损坏）不能打断整卷扫描
-                    failed += 1
-                    continue
-                files.append(frag)
-                if self._max_files is not None and len(files) >= self._max_files:
-                    truncated = True
-                    break
-                if self._on_progress is not None and seen - last_report >= self._progress_every:
-                    last_report = seen
-                    self._on_progress(seen, path)
+                )
+            except ValueError:
+                # 单文件数据异常（极端稀疏/损坏）不能打断整卷扫描
+                failed += 1
+
+        def reached_limit() -> bool:
+            return self._max_files is not None and len(files) >= self._max_files
+
+        def report(path: str) -> None:
+            nonlocal last_report
+            if self._on_progress is None or seen - last_report < self._progress_every:
+                return
+            last_report = seen
+            self._on_progress(seen, path)
+
+        source = self._scanner(self.volume.mount_point)
+        try:
+            if self._workers <= 1:
+                for path, attributes, size in source:
+                    seen += 1
+                    if attributes & FILE_ATTRIBUTE_DIRECTORY:
+                        skipped_dir += 1
+                        continue
+                    if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+                        skipped_link += 1
+                        continue
+                    if size <= 0:
+                        continue  # 空文件 / 无独立簇，问了也是空
+                    order += 1
+                    try:
+                        runs = self._query(path)
+                    except (OSError, DeviceUnavailable):
+                        # 独占打开（页面文件、注册表 hive、正在写的日志）很常见，
+                        # 不能因为一个文件失败就放弃整卷。
+                        failed += 1
+                        continue
+                    accept(runs, path, attributes, order)
+                    if reached_limit():
+                        truncated = True
+                        break
+                    report(path)
+            else:
+                window = max(1, self._workers * _INFLIGHT_FACTOR)
+                pending: dict[Future, tuple[int, str, int]] = {}
+
+                def collect(fut: Future, meta: tuple[int, str, int]) -> None:
+                    nonlocal failed
+                    idx, path, attributes = meta
+                    try:
+                        runs = fut.result()
+                    except (OSError, DeviceUnavailable):
+                        failed += 1
+                        return
+                    accept(runs, path, attributes, idx)
+
+                with ThreadPoolExecutor(
+                    max_workers=self._workers, thread_name_prefix="lbamover-scan"
+                ) as pool:
+                    for path, attributes, size in source:
+                        seen += 1
+                        if attributes & FILE_ATTRIBUTE_DIRECTORY:
+                            skipped_dir += 1
+                            report(path)
+                            continue
+                        if attributes & FILE_ATTRIBUTE_REPARSE_POINT:
+                            skipped_link += 1
+                            report(path)
+                            continue
+                        if size <= 0:
+                            report(path)
+                            continue
+                        order += 1
+                        pending[pool.submit(self._query, path)] = (order, path, attributes)
+                        if len(pending) >= window:
+                            # 在飞任务满了才回收：这样遍历与查询真正重叠，
+                            # 内存占用恒为 window 条，与卷的文件数无关。
+                            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                            for fut in done:
+                                collect(fut, pending.pop(fut))
+                            if reached_limit():
+                                truncated = True
+                                break
+                        report(path)
+                    if pending and not truncated:
+                        done, _ = wait(pending)
+                        for fut in done:
+                            collect(fut, pending.pop(fut))
+                        if reached_limit():
+                            truncated = True
         except OSError as exc:
             raise DeviceUnavailable(f"遍历 {self.volume.mount_point} 失败：{exc}") from exc
 

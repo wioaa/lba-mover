@@ -182,3 +182,49 @@ class TestFactory:
     def test_unknown_kind(self):
         with pytest.raises(DeviceError):
             open_device(DeviceSpec(kind="magic"))
+
+
+class TestRetrievalTruncation:
+    """缓冲被截断的判定。
+
+    驱动在缓冲不足时**不报错**，只把填好的部分写回来。若就此把结果当成完整
+    runlist，文件后半段的簇会被当成"空闲"—— 规划器随后会往那里写别人的数据。
+    所以这一段判定必须单独测。
+    """
+
+    def _buf(self, extent_count: int, extents: int = 1) -> bytes:
+        import struct
+
+        # 结构是 DWORD ExtentCount + (4 字节对齐填充) + LARGE_INTEGER StartingVcn
+        head = struct.pack("<I4xq", extent_count, 0)
+        body = b"".join(struct.pack("<qq", i + 1, 100 + i) for i in range(extents))
+        return head + body
+
+    def test_exact_fit_is_not_truncated(self):
+        from lbamover.devices.win32 import _retrieval_is_truncated
+
+        raw = self._buf(1)
+        assert _retrieval_is_truncated(raw, len(raw)) is False
+
+    def test_short_buffer_is_truncated(self):
+        from lbamover.devices.win32 import _retrieval_is_truncated
+
+        raw = self._buf(4, extents=4)  # 声称 4 段
+        assert _retrieval_is_truncated(raw, 16 + 2 * 16) is True
+
+    def test_too_small_for_header_is_truncated(self):
+        from lbamover.devices.win32 import _retrieval_is_truncated
+
+        assert _retrieval_is_truncated(b"\x00" * 8, 8) is True
+
+    def test_query_buffer_is_reused_per_thread(self):
+        from lbamover.devices.win32 import IS_WINDOWS, _RETRIEVAL_INITIAL_BYTES, _query_buffer
+
+        if not IS_WINDOWS:
+            pytest.skip("Windows 专有路径")
+        first = _query_buffer(_RETRIEVAL_INITIAL_BYTES)
+        again = _query_buffer(16)
+        assert first is again, "同一个线程应当复用同一块缓冲"
+        bigger = _query_buffer(_RETRIEVAL_INITIAL_BYTES * 4)
+        assert bigger is not first and bigger.size >= _RETRIEVAL_INITIAL_BYTES * 4
+        assert _query_buffer(16) is bigger, "扩容后必须留着用"

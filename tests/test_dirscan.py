@@ -202,3 +202,64 @@ class TestDirectoryCatalog:
         )
         files = cat.list_files()
         assert [f.path for f in files] == ["Q:\\early", "Q:\\late"]
+
+
+class TestParallelQuery:
+    """并发查询路径。
+
+    这条路径只是"同一个查询跑在多条线程上"，所以判定标准很硬：**结果必须与
+    串行完全一致**。一旦不一致，说明有共享状态被踩了，而症状会是"某些文件
+    的簇区间乱掉"—— 这种错误如果漏出去，执行阶段就是在覆盖别人家的数据。
+    """
+
+    ENTRIES = [(f"Q:\f{i:03d}", 0, 4096) for i in range(120)]
+    RUNS = {f"Q:\f{i:03d}": ((0, (i * 7) % 400, 1 + i % 5),) for i in range(120)}
+
+    def _run(self, workers: int, **kw):
+        return DirectoryCatalog(
+            volume(),
+            scanner=fake_scanner(self.ENTRIES),
+            query=lambda p: self.RUNS.get(p, ()),
+            workers=workers,
+            **kw,
+        )
+
+    def test_parallel_matches_serial(self):
+        serial = self._run(1).list_files()
+        for workers in (2, 4, 9):
+            parallel = self._run(workers).list_files()
+            assert [(f.path, f.extents) for f in parallel] == [
+                (f.path, f.extents) for f in serial
+            ], f"workers={workers} 与串行结果不一致"
+
+    def test_parallel_counts_failures_without_corrupting_others(self):
+        def query(path):
+            if path.endswith("7"):
+                raise OSError("拒绝访问")
+            return ((0, 30, 4),)
+
+        cat = DirectoryCatalog(
+            volume(),
+            scanner=fake_scanner(self.ENTRIES),
+            query=query,
+            workers=4,
+        )
+        files = cat.list_files()
+        assert len(files) == len([p for p in (e[0] for e in self.ENTRIES) if not p.endswith("7")])
+        assert cat.stats.records_bad == len([e for e in self.ENTRIES if e[0].endswith("7")])
+
+    def test_parallel_respects_max_files(self):
+        cat = self._run(4, max_files=5)
+        assert len(cat.list_files()) == 5
+        assert any("上限" in n for n in cat.stats.notes)
+
+    def test_parallel_reports_progress(self):
+        seen: list[int] = []
+        cat = self._run(4, progress_every=10)
+        cat._on_progress = lambda n, p: seen.append(n)
+        cat.list_files()
+        assert seen and seen[-1] >= 100
+
+    def test_zero_workers_is_treated_as_serial(self):
+        cat = self._run(0)
+        assert cat._workers == 1

@@ -443,28 +443,39 @@ class Win32Native:
         ``ERROR_HANDLE_EOF``（38）表示**这个文件不占任何簇**（内容全在 MFT
         记录里的小文件、或零长度分配），返回空元组即可。把它当错误处理会让
         未提权扫描把小文件全记成"打不开"——实测能占 20% 以上。
+
+        两个容易踩的点：
+
+        * 缓冲**按线程复用**。每个文件都 ``VirtualAlloc``/``VirtualFree`` 一块
+          64 KiB，在百万文件的卷上就是两百万次内核调用；而绝大多数文件只需要
+          几百字节。改成从 8 KiB 起、按需增长、每条线程留一块。
+        * 缓冲不足时驱动**不报错**，只是把填好的部分写回来（``ERROR_MORE_DATA``
+          在 :meth:`ioctl_neither` 里被吞掉了）。必须自己按
+          ``16 + 段数 × 16 > 实际字节数`` 判断是否被截断，否则碎片极多的文件
+          会静默丢掉后半段的簇 —— 那些簇随后会被当成"空闲"。
         """
-        size = 64 * 1024
+        buf = _query_buffer(_RETRIEVAL_INITIAL_BYTES)
         for _attempt in range(6):
-            buf = AlignedBuffer(size)
+            size = buf.size
+            # 入参是 STARTING_VCN_INPUT_BUFFER，与输出共用同一块缓冲
+            ctypes.memmove(buf.address, struct.pack("<q", 0), 8)
             try:
-                # 入参是 STARTING_VCN_INPUT_BUFFER，与输出共用同一块缓冲
-                ctypes.memmove(buf.address, struct.pack("<q", 0), 8)
-                try:
-                    got = Win32Native.ioctl_neither(
-                        handle, FSCTL_GET_RETRIEVAL_POINTERS, buf.address, 8, size
-                    )
-                except DeviceError as exc:
-                    if getattr(exc, "winerror", 0) == ERROR_HANDLE_EOF:
-                        return ()
-                    raise
-                raw = buf.to_bytes(got) if got else buf.to_bytes(size)
-                parsed = _parse_retrieval(raw)
-                if parsed is not None:
-                    return parsed
-            finally:
-                buf.free()
-            size *= 4  # 碎片极多的文件需要更大缓冲，重试一次就够
+                got = Win32Native.ioctl_neither(
+                    handle, FSCTL_GET_RETRIEVAL_POINTERS, buf.address, 8, size
+                )
+            except DeviceError as exc:
+                if getattr(exc, "winerror", 0) == ERROR_HANDLE_EOF:
+                    return ()
+                raise
+            filled = got if got else size
+            raw = buf.to_bytes(filled)
+            if _retrieval_is_truncated(raw, filled):
+                buf = _query_buffer(size * 4)
+                continue
+            parsed = _parse_retrieval(raw)
+            if parsed is not None:
+                return parsed
+            buf = _query_buffer(size * 4)
         raise DeviceError("查询文件簇映射失败：缓冲反复不足", error_class=ErrorClass.FATAL)
 
     @staticmethod
@@ -523,6 +534,41 @@ def long_path(path: str) -> str:
     if len(p) >= 248:
         return prefix + p
     return p
+
+
+#: 查簇映射的起始缓冲：8 KiB 够放 510 段 run。真实卷上超过这个段数的文件
+#: 极少，多数只需要几百字节，所以不必一上来就要 64 KiB。
+_RETRIEVAL_INITIAL_BYTES = 8 * 1024
+#: 上限：再碎的文件也不至于要几兆的 runlist，超过它说明数据本身不可信。
+_MAX_RETRIEVAL_BYTES = 4 * 1024 * 1024
+
+_query_local = threading.local()
+
+
+def _query_buffer(size: int) -> AlignedBuffer:
+    """取**本线程**的查询缓冲，按需增长后留在原地复用。
+
+    串行扫 88 万个文件时，每次 ``VirtualAlloc`` + ``VirtualFree`` 是两百多万次
+    内核调用；并发扫描时多个线程共用一块缓冲又会互相踩数据。按线程各留一块，
+    两个问题一起解决。
+    """
+    buf: AlignedBuffer | None = getattr(_query_local, "buf", None)
+    if buf is not None and buf.size >= size:
+        return buf
+    if buf is not None:
+        buf.free()
+    size = min(max(size, _RETRIEVAL_INITIAL_BYTES), _MAX_RETRIEVAL_BYTES)
+    buf = AlignedBuffer(size)
+    _query_local.buf = buf
+    return buf
+
+
+def _retrieval_is_truncated(raw: bytes, filled: int) -> bool:
+    """驱动写回的字节数不够装下它声称的段数 —— 说明缓冲被截断了。"""
+    if len(raw) < 16:
+        return True
+    extent_count = struct.unpack_from("<I", raw, 0)[0]
+    return 16 + extent_count * 16 > filled
 
 
 def _parse_retrieval(raw: bytes) -> tuple[tuple[int, int, int], ...] | None:

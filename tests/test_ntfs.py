@@ -157,6 +157,22 @@ class TestRecord:
         assert parse_record(b"\x00" * 1024, 0, 512) is None
         assert parse_record(b"MFT!" + b"\x00" * 1020, 0, 512) is None
 
+    def test_deleted_slot_returns_header_only(self):
+        """已删除的记录槽只给头部。
+
+        属性区是上一次使用的残留，随时会被复用覆盖，解析它没有意义 ——
+        但**必须仍然把 in_use 如实报 False**，否则目录服务会把已删除文件
+        当成活的搬走。
+        """
+        dev, info = self._image()
+        raw = bytearray(dev.read_blocks(info.mft_lcn, 8)[16 * 1024 : 17 * 1024])
+        raw[0x16] &= 0xFE  # 清掉 IN_USE 位（0x16 不在扇区边界，fixup 不受影响）
+        rec = parse_record(bytes(raw), 16, 512)
+        assert rec is not None
+        assert rec.in_use is False
+        assert rec.data is None and rec.names == ()
+        assert rec.extents == ()
+
 
 # ----------------------------------------------------------------------
 # 目录服务
@@ -228,3 +244,64 @@ class TestCatalog:
         assert stats.records_read <= 20
 
 
+
+
+# ----------------------------------------------------------------------
+# $Bitmap → 自由区间
+# ----------------------------------------------------------------------
+
+
+class TestBitmap:
+    """位图解析的对拍：**以逐位朴素实现为基准**。
+
+    这段代码被换掉过一次（从逐簇循环换成按字节跳跃），提速了几个数量级。
+    提速本身没意义，正确才算数：自由区间错一位，规划器就会把别人的文件
+    覆盖掉。所以这里随机造各种位图，与朴素实现逐段比对。
+    """
+
+    SIZES = [1, 2, 7, 8, 9, 63, 64, 65, 1000, 4096, 4097, 65535]
+
+    def test_matches_naive_on_random_patterns(self):
+        import random
+
+        from lbamover.ntfs.bitmap import free_runs, free_runs_naive
+
+        rng = random.Random(20261101)
+        for trial in range(60):
+            total = self.SIZES[trial % len(self.SIZES)]
+            nb = (total + 7) // 8
+            mode = trial % 4
+            if mode == 0:
+                bm = bytes(rng.getrandbits(8) for _ in range(nb))
+            elif mode == 1:
+                bm = b"\xff" * nb
+            elif mode == 2:
+                bm = b"\x00" * nb
+            else:
+                bm = bytes(rng.choice((0x00, 0xFF, 0x0F, 0xF0)) for _ in range(nb))
+            assert free_runs(bm, total) == free_runs_naive(bm, total), (
+                f"total={total} mode={mode}"
+            )
+
+    def test_short_bitmap_treats_missing_as_used(self):
+        from lbamover.ntfs.bitmap import free_runs, free_runs_naive
+
+        # 位图短于卷：缺失部分必须按"已用"算，不能猜成空闲
+        for total, short in ((100, 3), (65536, 10), (9, 1)):
+            bm = b"\x00" * short
+            assert free_runs(bm, total) == free_runs_naive(bm, total)
+
+    def test_run_spanning_internal_window(self):
+        from lbamover.ntfs.bitmap import _WINDOW_BYTES, free_runs
+
+        edge = _WINDOW_BYTES * 8  # 窗口边界对应的簇号
+        total = edge * 2
+        bm = bytearray(b"\xff" * ((total + 7) // 8))
+        for c in range(edge - 6, edge + 8):
+            bm[c >> 3] &= ~(1 << (c & 7)) & 0xFF
+        assert free_runs(bytes(bm), total) == [(edge - 6, 14)]
+
+    def test_zero_clusters(self):
+        from lbamover.ntfs.bitmap import free_runs
+
+        assert free_runs(b"", 0) == []
