@@ -177,5 +177,5 @@ docs/ARCHITECTURE.md       目录职责、数据流、算法、取舍记录、�
 ## 版本号约定
 
 `pyproject.toml` 的 `version` 永远只写三段（PEP 440 合法），小版本字母放在
-`[tool.lbamover].revision`，由 `lbamover/__init__.py` 拼成 `2.0.0B` 展示。
-`2.0.0B` 不是合法 PEP 440，pip 会直接拒绝——所以字母不能进 version 字段。
+`[tool.lbamover].revision`，由 `lbamover/__init__.py` 拼成 `2.0.0C` 展示。
+`2.0.0C` 不是合法 PEP 440，pip 会直接拒绝——所以字母不能进 version 字段。

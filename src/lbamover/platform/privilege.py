@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import subprocess
 import sys
 from ctypes import wintypes
 
@@ -93,17 +94,63 @@ def enable_privilege(name: str) -> bool:
         kernel32.CloseHandle(token)
 
 
-def relaunch_as_admin(argv: list[str] | None = None) -> bool:
-    """用 ``runas`` 重新拉起自己。返回是否成功发起。
+ERROR_CANCELLED = 1223
+
+
+def _relaunch_params(argv: list[str] | None) -> str:
+    """拼出重新启动时要传给自己的参数串。
+
+    开发态与打包态**不是一回事**，这里踩过一次：
+
+    * 打包后 ``sys.executable`` 就是 ``LBAMover.exe``，参数原样传；
+    * 开发态 ``sys.executable`` 是 ``python.exe``，只传 ``gui`` 之类的参数等于
+      让 python 去执行一个叫 ``gui`` 的文件 —— 立刻失败，而 ``ShellExecuteW``
+      只回一个笼统的错误码，看起来就像"提权没反应"。
+
+    所以开发态必须把 ``sys.argv[0]``（脚本路径）一起带上。路径含空格时要用
+    Windows 的引用规则，``list2cmdline`` 就是这件事的标准实现。
+    """
+    extra = list(sys.argv[1:] if argv is None else argv)
+    if getattr(sys, "frozen", False):
+        return subprocess.list2cmdline(extra)
+    return subprocess.list2cmdline([sys.argv[0], *extra])
+
+
+def _launch_error(code: int) -> str:
+    """把 ``ShellExecuteW`` 的错误码翻译成人能照着处理的说明。"""
+    if code == ERROR_CANCELLED:
+        return "UAC 授权被取消（或系统策略不允许提权）"
+    text = ctypes.FormatError(code).strip()
+    return f"启动失败：{text or f'错误码 {code}'}"
+
+
+def relaunch_as_admin(argv: list[str] | None = None) -> tuple[bool, str]:
+    """用 ``runas`` 重新拉起自己。返回 ``(是否已发起, 失败说明)``。
 
     这是**显式动作**，只在用户点了按钮时调用，绝不在启动流程里自动执行。
+    失败原因要能被人读懂：UAC 被取消、程序找不到、系统策略禁止，处理方式
+    完全不同，笼统地说"提权失败"只会让人去猜。
     """
     if not IS_WINDOWS:
-        return False
+        return False, "只有 Windows 需要提权"
     try:
         shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-        params = " ".join(argv if argv is not None else sys.argv[1:])
+        # 不声明 restype 的话 HINSTANCE 会被当成 int 截断，返回值判断跟着失真
+        shell32.ShellExecuteW.restype = ctypes.c_void_p
+        shell32.ShellExecuteW.argtypes = [
+            wintypes.HWND,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            wintypes.LPCWSTR,
+            ctypes.c_int,
+        ]
+        params = _relaunch_params(argv)
         rc = shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
-        return int(rc) > 32
-    except OSError:
-        return False
+    except OSError as exc:
+        return False, f"无法调用 ShellExecuteW：{exc}"
+
+    code = int(rc or 0)
+    if code > 32:  # >32 才是"已发起"，其余是错误码
+        return True, ""
+    return False, _launch_error(code)

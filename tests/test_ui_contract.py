@@ -15,7 +15,7 @@ pytest.importorskip("PySide6", reason="未安装 PySide6，跳过 GUI 测试")
 
 from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtTest import QSignalSpy, QTest  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
 from lbamover.contract.enums import JobState, LogLevel, Strategy, VolumeKind  # noqa: E402
 from lbamover.contract.events import (  # noqa: E402
@@ -484,3 +484,163 @@ class TestMainWindowSmoke:
             assert not w.left_panel.isVisible()
         finally:
             w.close()
+
+
+class _StubBox:
+    """替换 ``QMessageBox`` 的静态方法，用来断言"用户点了是/否"的分支。
+
+    **不要 monkeypatch Qt 类本身**：shiboken 类型基本不让改属性，而且真正要
+    测的是"我们把返回值怎么判"，不是 Qt 怎么弹框。这里保留 ``StandardButton``
+    让 ``confirmed()`` 走真实代码路径。
+    """
+
+    StandardButton = QMessageBox.StandardButton
+    Icon = QMessageBox.Icon
+
+    answer: object = 0
+    asked: list[str] = []
+
+    @classmethod
+    def question(cls, *args, **kwargs):
+        cls.asked.append(str(args[1]) if len(args) > 1 else "")
+        return cls.answer
+
+    @classmethod
+    def information(cls, *args, **kwargs):
+        cls.asked.append(str(args[1]) if len(args) > 1 else "")
+        return cls.StandardButton.Ok
+
+
+class TestConfirmDialogs:
+    """「点了是却什么都没发生」的回归测试。
+
+    2026-11 的真实故障：``QMessageBox.question()`` 在 PySide6 里返回**普通
+    int**（16384），而代码写的是 ``ret is QMessageBox.StandardButton.Yes``，
+    身份比较恒为 False。后果是两个功能同时"坏掉"且不报错：
+
+    * 提权确认永远被当成取消 → 点提权没反应；
+    * 写盘确认永远被当成取消 → 点开始整理没反应。
+
+    当时的冒烟脚本刻意"绕过 _on_start 的确认闸门"，所以这条链路没有任何
+    用例覆盖。这里把闸门本身测起来。
+    """
+
+    def test_confirmed_accepts_pyside_int_return(self):
+        from lbamover.ui.main_window import confirmed
+
+        # 实测的 question() 返回值就是这个整数
+        assert confirmed(int(QMessageBox.StandardButton.Yes)) is True
+        assert confirmed(int(QMessageBox.StandardButton.No)) is False
+        # 枚举成员同样要认（不同 PySide 版本返回类型不一致）
+        assert confirmed(QMessageBox.StandardButton.Yes) is True
+        assert confirmed(QMessageBox.StandardButton.No) is False
+        # 意外输入不能当成"是"
+        assert confirmed(None) is False
+        assert confirmed("yes") is False
+
+    def _window(self, monkeypatch, answer):
+        from lbamover.ui import main_window as mw
+
+        _StubBox.answer = answer
+        _StubBox.asked = []
+        monkeypatch.setattr(mw, "QMessageBox", _StubBox)
+        w = mw.MainWindow(palette=DARK)
+        w.load_demo()
+        return w
+
+    def test_confirm_write_returns_true_on_yes(self, qapp, monkeypatch):
+        w = self._window(monkeypatch, int(QMessageBox.StandardButton.Yes))
+        try:
+            assert w._volume is not None
+            assert w._confirm_write(w._volume) is True
+        finally:
+            w.close()
+
+    def test_confirm_write_returns_false_on_no(self, qapp, monkeypatch):
+        w = self._window(monkeypatch, int(QMessageBox.StandardButton.No))
+        try:
+            assert w._confirm_write(w._volume) is False
+        finally:
+            w.close()
+
+    def test_start_submits_job_when_confirmed(self, qapp, monkeypatch):
+        from lbamover.contract.commands import StartJob
+
+        w = self._window(monkeypatch, int(QMessageBox.StandardButton.Yes))
+        sent: list = []
+        monkeypatch.setattr(w.service, "submit", sent.append)
+        try:
+            from lbamover.contract.enums import Strategy
+
+            w._strategy = Strategy.COALESCE
+            w._on_start()
+            assert sent, "确认后没有提交 StartJob —— 「开始整理」等于没反应"
+            assert isinstance(sent[0], StartJob)
+        finally:
+            w.close()
+
+    def test_start_does_nothing_when_cancelled(self, qapp, monkeypatch):
+        w = self._window(monkeypatch, int(QMessageBox.StandardButton.No))
+        sent: list = []
+        monkeypatch.setattr(w.service, "submit", sent.append)
+        try:
+            w._on_start()
+            assert not sent, "用户点了否，却仍然提交了任务"
+        finally:
+            w.close()
+
+    def test_elevate_reports_reason_when_launch_fails(self, qapp, monkeypatch):
+        from lbamover.platform import privilege
+
+        w = self._window(monkeypatch, int(QMessageBox.StandardButton.Yes))
+        monkeypatch.setattr(
+            privilege, "relaunch_as_admin", lambda argv=None: (False, "UAC 授权被取消")
+        )
+        lines: list[str] = []
+        monkeypatch.setattr(
+            w.log_view, "append", lambda level, msg, *a, **k: lines.append(str(msg))
+        )
+        try:
+            w._elevate()
+            assert any("UAC 授权被取消" in line for line in lines), (
+                "提权失败必须把原因写进日志，否则用户只知道「没反应」"
+            )
+        finally:
+            w.close()
+
+    def test_elevate_closes_window_when_launch_succeeds(self, qapp, monkeypatch):
+        from lbamover.platform import privilege
+
+        w = self._window(monkeypatch, int(QMessageBox.StandardButton.Yes))
+        calls: list = []
+        monkeypatch.setattr(
+            privilege,
+            "relaunch_as_admin",
+            lambda argv=None: (calls.append(argv) or (True, "")),
+        )
+        closed: list[bool] = []
+        monkeypatch.setattr(w, "close", lambda: closed.append(True))
+        try:
+            w._elevate()
+            assert calls, "确认后没有调用 relaunch_as_admin"
+            assert closed, "提权已发起却没有关闭旧窗口"
+        finally:
+            w.deleteLater()
+
+    def test_relaunch_params_include_script_when_not_frozen(self, monkeypatch):
+        import sys as _sys
+
+        from lbamover.platform import privilege
+
+        monkeypatch.delattr(_sys, "frozen", raising=False)
+        params = privilege._relaunch_params(["--demo"])
+        assert _sys.argv[0] in params, "开发态重启必须带上脚本路径，否则 python 会去执行 --demo"
+        assert "--demo" in params
+
+    def test_relaunch_params_omit_script_when_frozen(self, monkeypatch):
+        import sys as _sys
+
+        from lbamover.platform import privilege
+
+        monkeypatch.setattr(_sys, "frozen", True, raising=False)
+        assert privilege._relaunch_params(["--demo"]) == "--demo"

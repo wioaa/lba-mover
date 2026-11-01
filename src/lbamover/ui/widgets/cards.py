@@ -127,8 +127,9 @@ class Badge(QLabel):
         )
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        # 用 release 而不是 press：按下后拖开再松手应当是"取消"，与按钮一致
-        if self._clickable and event.button() is Qt.MouseButton.LeftButton:
+        # 用 release 而不是 press：按下后拖开再松手应当是"取消"，与按钮一致。
+        # 比数值不比身份：Qt 若有枚举返回 int，`is` 会静默变 False（见 main_window.confirmed）。
+        if self._clickable and event.button() == Qt.MouseButton.LeftButton:
             if self.rect().contains(event.position().toPoint()):
                 self.clicked.emit()
                 event.accept()

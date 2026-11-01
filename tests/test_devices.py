@@ -228,3 +228,29 @@ class TestRetrievalTruncation:
         bigger = _query_buffer(_RETRIEVAL_INITIAL_BYTES * 4)
         assert bigger is not first and bigger.size >= _RETRIEVAL_INITIAL_BYTES * 4
         assert _query_buffer(16) is bigger, "扩容后必须留着用"
+
+
+class TestElevation:
+    """提权重启的参数与失败说明。
+
+    打包态与开发态的启动参数**不一样**：开发态 ``sys.executable`` 是 python.exe，
+    少了脚本路径就等于让 python 去执行一个叫 ``gui`` 的文件 —— 提权"没反应"。
+    """
+
+    def test_launch_error_maps_cancelled(self):
+        from lbamover.platform.privilege import _launch_error
+
+        assert "取消" in _launch_error(1223)
+
+    def test_launch_error_falls_back_to_system_text(self):
+        from lbamover.platform.privilege import _launch_error
+
+        msg = _launch_error(2)  # ERROR_FILE_NOT_FOUND
+        assert msg and "2" not in msg.replace("启动失败", ""), msg
+        assert "启动失败" in msg
+
+    def test_params_quote_paths_with_spaces(self):
+        from lbamover.platform import privilege
+
+        path = "C:\\Program Files\\LBAMover\\x.exe"
+        assert f'"{path}"' in privilege._relaunch_params([path])

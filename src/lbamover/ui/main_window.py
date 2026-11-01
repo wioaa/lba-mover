@@ -58,6 +58,25 @@ from .widgets.volume_picker import VolumePicker
 
 __all__ = ["MainWindow"]
 
+
+def confirmed(ret) -> bool:
+    """``QMessageBox.question()`` / ``QDialog.exec()`` 的返回值判「是」。
+
+    **不能写 ``ret is QMessageBox.StandardButton.Yes``。** PySide6（实测 6.12）
+    的静态方法 ``question()`` 返回的是**普通 int**（``16384``），不是
+    ``StandardButton`` 枚举成员，身份比较恒为 False —— 表现就是"点了『是』，
+    界面什么也没发生"，而且不报错、不进日志。
+
+    这一处写错曾同时造成两个"功能坏了"的假象：提权对话框永远被当成取消
+    （点了提权没反应），写盘确认永远被当成取消（点开始整理没反应）。
+    比数值，不比身份。
+    """
+    try:
+        return QMessageBox.StandardButton(ret) == QMessageBox.StandardButton.Yes
+    except (TypeError, ValueError):  # 非枚举/非整数的意外返回值：一律当"否"
+        return False
+
+
 DEMO_DEVICE_PATH = "memory://lbamover-demo"
 DEMO_BLOCK_BUDGET = 8192  # 32 MiB @ 4 KiB，足够排出十几段碎片
 
@@ -430,7 +449,7 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-        return ret is QMessageBox.StandardButton.Yes
+        return confirmed(ret)
 
     def _on_stop(self) -> None:
         ret = QMessageBox.question(
@@ -440,7 +459,7 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-        if ret is QMessageBox.StandardButton.Yes:
+        if confirmed(ret):
             self.service.submit(CancelJob(keep_checkpoint=True))
 
     # ------------------------------------------------------------------
@@ -676,15 +695,18 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
-        if ret is not QMessageBox.StandardButton.Yes:
+        if not confirmed(ret):
             return
         from ..platform.privilege import relaunch_as_admin
 
-        if not relaunch_as_admin(list(sys.argv[1:])):
+        ok, why = relaunch_as_admin(list(sys.argv[1:]))
+        if not ok:
             self.log_view.append(
-                LogLevel.ERROR, "提权启动失败，请手动右键程序并选择「以管理员身份运行」"
+                LogLevel.ERROR,
+                f"提权启动未成功：{why}。也可以手动关闭程序，右键选择「以管理员身份运行」。",
             )
             return
+        self.log_view.append(LogLevel.INFO, "已发起提权重启，确认 UAC 后本窗口会自动关闭")
         self.close()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
@@ -706,7 +728,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
-            if ret is not QMessageBox.StandardButton.Yes:
+            if not confirmed(ret):
                 event.ignore()
                 return
         try:

@@ -266,14 +266,34 @@ def ui_roundtrip(app):
     pump(app2, lambda: w._plan is not None, label="规划完成")
     assert w._plan.op_count > 0, "预演没有产生操作"
 
-    # 执行：直接提交 StartJob（确认对话框在无头环境下无法交互，
-    # 因此这里绕过 _on_start 的确认闸门，其余链路完全走引擎线程）
-    from lbamover.contract.commands import StartJob
-    from lbamover.contract.enums import JobState
-    from lbamover.contract.models import JobSpec
+    # 执行：**走真实的「开始整理」按钮路径**，只把确认对话框换成"用户点了是"。
+    #
+    # 这里曾经是"直接 submit(StartJob)"并注释说明"确认框在无头环境没法交互，
+    # 所以绕过闸门"—— 结果 2.0.0A 里 `_confirm_write` 用身份比较判返回值
+    # （PySide6 的 question() 返回 int），永远返回 False，用户点「开始整理」
+    # 什么都不会发生，而冒烟全绿。**闸门本身必须被跑到**，不能绕过。
+    import lbamover.ui.main_window as mw_mod
 
-    spec = JobSpec(volume=w._volume, strategy=w._strategy, params=w._params)
-    w.service.submit(StartJob(spec))
+    class _YesBox:
+        StandardButton = mw_mod.QMessageBox.StandardButton
+        Icon = mw_mod.QMessageBox.Icon
+
+        @staticmethod
+        def question(*_a, **_k):
+            return int(mw_mod.QMessageBox.StandardButton.Yes)
+
+        @staticmethod
+        def information(*_a, **_k):
+            return int(mw_mod.QMessageBox.StandardButton.Ok)
+
+    original_box = mw_mod.QMessageBox
+    mw_mod.QMessageBox = _YesBox
+    from lbamover.contract.enums import JobState
+
+    try:
+        w._on_start()
+    finally:
+        mw_mod.QMessageBox = original_box
     pump(app2, lambda: w.core.state in (JobState.DONE, JobState.FAILED, JobState.CANCELLED),
          timeout=40, label="执行完成")
     assert w.core.state is JobState.DONE, f"执行结束状态为 {w.core.state}"
