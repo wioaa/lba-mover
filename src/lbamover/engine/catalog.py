@@ -1,16 +1,16 @@
 """文件目录服务：告诉引擎「卷上有哪些文件、各占哪些 LBA」。
 
-这是本版**已知的能力缺口**，必须讲清楚而不是藏着：
+三种实现，按场景选：
 
 * :class:`StaticCatalog` —— 内存里的表。测试、冒烟、演示、以及"从 JSON
   布局文件驱动一次离线整理"都用它。
 * :class:`JsonCatalog` —— 从磁盘上的 JSON 读布局，便于对卷镜像做离线演练。
-* **实时 NTFS 枚举（MFT / ``FSCTL_GET_RETRIEVAL_POINTERS``）尚未实现**。
-  真机上点"扫描"会得到明确的能力不足提示，而不是一个空报告——空报告最
-  危险，用户会以为"我的盘很干净"。
+* :func:`open_ntfs_catalog` —— **真机 NTFS 卷的入口**。只读打开卷，交给
+  :class:`lbamover.ntfs.MftCatalog` 解析 ``$MFT``，得到「文件 → 簇区间」。
+  每次扫描临时打开、用完即关：长期持有卷句柄会挡住别人。
 
-补上它需要的活：读 ``$MFT`` 或用 ``FSCTL_ENUM_USN_DATA`` + 每文件的
-retrieval pointers，然后把 runlist 转成 ``Extent``。接口已经在这里等它。
+拿不到文件表时**一律抛错**，绝不返回空报告。空报告在界面上会显示成
+"0 个碎片文件，卷很健康"，而事实是根本没看过——这类假象比报错危险得多。
 """
 
 from __future__ import annotations
@@ -121,17 +121,29 @@ def open_ntfs_catalog(volume: VolumeInfo, *, min_clusters: int = 1):
         )
     # 延迟导入：engine 包的其它部分在非 Windows 上也要能 import
     from ..devices import DeviceSpec, open_device
+    from ..devices.base import DeviceError
     from ..ntfs import MftCatalog
 
-    device = open_device(
-        DeviceSpec(
-            kind="win32",
-            path=volume.device_path,
-            block_size=volume.geometry.block_size,
-            writable=False,
-            unbuffered=True,
+    try:
+        device = open_device(
+            DeviceSpec(
+                kind="win32",
+                path=volume.device_path,
+                block_size=volume.geometry.block_size,
+                writable=False,
+                unbuffered=True,
+            )
         )
-    )
+    except DeviceError as exc:
+        # 最常见的失败就是没管理员权限。原始 Win32 错误串对用户毫无指导意义，
+        # 这里翻译成"该做什么"，并把原始信息留在 detail 里供排查。
+        winerror = getattr(exc, "winerror", 0) or 0
+        if winerror in (5, 32) or "拒绝访问" in str(exc) or "Access is denied" in str(exc):
+            raise CatalogError(
+                f"无法读取 {volume.mount_point} 的卷数据：需要管理员权限。"
+                "请点击标题栏的权限徽标提权重启，或右键程序选择「以管理员身份运行」。"
+            ) from exc
+        raise CatalogError(f"打开卷 {volume.device_path} 失败：{exc}") from exc
     return MftCatalog(device, min_clusters=min_clusters)
 
 

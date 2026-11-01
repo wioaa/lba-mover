@@ -46,7 +46,7 @@ def main() -> int:
 
     os.makedirs(OUT, exist_ok=True)
     app, w = build_app(["--demo"])
-    w.resize(1360, 860)
+    w.resize(1360, 940)
     w.show()
     pump(app, lambda: w._volume is not None)
 

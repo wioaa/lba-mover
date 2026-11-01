@@ -25,8 +25,12 @@ where = ["src"]
 
 # 版本号约定：三段写在 [project].version（PEP 440 合法），
 # 小版本字母放这里，由 lbamover/__init__.py 拼接成 2.0.0A 形式对外展示。
+#
+# 运行时用的是 lbamover/__init__.py 里的常量（冻结产物读不到本文件），
+# 这里是**声明**。两者必须一致，tests/test_version.py 会盯着——
+# 只写一处而另一处忘了改，是"发布了 2.0.0A 但 pip 装出来是 2.0.0"的成因。
 [tool.lbamover]
-revision = ""
+revision = "A"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

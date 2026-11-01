@@ -124,6 +124,7 @@ python packaging/verify_gui_launch.py   # 5 秒后自动关闭，退出码 0 = �
 | 三种整理策略 + 规划静态自检 | ✅ |
 | 并发 / 限速 / 暂停 / 停止 / 断点续做 | ✅ |
 | 卷枚举、系统卷识别 | ✅ 普通权限即可 |
+| **权限提权入口** | ✅ 标题栏权限徽标可点：非管理员时直接「以管理员身份重启」（会弹 UAC，不在启动时自动弹） |
 | Windows 原始卷读写（离线镜像用） | ✅ 已实现（页对齐 + 短读补齐 + 锁卷），未在管理员权限下真机验证 |
 | **真机 NTFS 整理全链路** | ⚠ **代码完整，但未在管理员权限的真实卷上验证过**（见下） |
 | exFAT / FAT32 | ❌ 不支持（没有 MFT，本版不做） |
@@ -159,7 +160,7 @@ PYTHONPATH=src python -m lbamover ntfs --image .tmp/demo.img --make-demo
 ```
 src/lbamover/{contract,engine,devices,ntfs,platform,ui}/   见 docs/ARCHITECTURE.md
 src/lbamover/ntfs/         NTFS 解析：boot / runlist / record / catalog / synth
-tests/                     290 个用例
+tests/                     298 个用例
 scripts/smoke.py           全链路冒烟
 scripts/shots.py           界面截图（视觉评审用）
 tools/testflow.py          测试入口（零第三方依赖）

@@ -14,7 +14,7 @@ import pytest
 pytest.importorskip("PySide6", reason="未安装 PySide6，跳过 GUI 测试")
 
 from PySide6.QtCore import Qt  # noqa: E402
-from PySide6.QtTest import QSignalSpy  # noqa: E402
+from PySide6.QtTest import QSignalSpy, QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from lbamover.contract.enums import JobState, LogLevel, Strategy, VolumeKind  # noqa: E402
@@ -38,6 +38,7 @@ from lbamover.contract.models import (  # noqa: E402
 from lbamover.engine.frag import analyze, free_extents_from_files  # noqa: E402
 from lbamover.ui.bridge import EngineBridge  # noqa: E402
 from lbamover.ui.theme import DARK, apply_theme  # noqa: E402
+from lbamover.ui.widgets.cards import Badge  # noqa: E402
 from lbamover.ui.widgets.control_bar import ControlBar  # noqa: E402
 from lbamover.ui.widgets.frag_map import FragMap  # noqa: E402
 from lbamover.ui.widgets.log_view import LogView  # noqa: E402
@@ -189,6 +190,33 @@ class TestControlBar:
         bar.sync_state(JobState.PAUSED)
         bar._on_pause()
         assert spy_count(resume) == 1
+
+
+class TestBadge:
+    """徽标不只是状态显示，也可能是一个动作入口（例如"点此提权"）。"""
+
+    def test_not_clickable_by_default(self, qapp):
+        b = Badge("权限：管理员")
+        spy = QSignalSpy(b.clicked)
+        b.resize(120, 22)
+        QTest.mouseClick(b, Qt.MouseButton.LeftButton)
+        assert spy_count(spy) == 0
+
+    def test_clickable_emits_once_per_click(self, qapp):
+        b = Badge("权限：普通用户 · 点此提权")
+        b.set_clickable(True)
+        spy = QSignalSpy(b.clicked)
+        b.resize(160, 22)
+        QTest.mouseClick(b, Qt.MouseButton.LeftButton)
+        assert spy_count(spy) == 1
+
+    def test_cursor_follows_clickable(self, qapp):
+        b = Badge("x")
+        assert b.cursor().shape() is Qt.CursorShape.ArrowCursor
+        b.set_clickable(True)
+        assert b.cursor().shape() is Qt.CursorShape.PointingHandCursor
+        b.set_clickable(False)
+        assert b.cursor().shape() is Qt.CursorShape.ArrowCursor
 
 
 class TestFragMap:

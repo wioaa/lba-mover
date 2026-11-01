@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -103,10 +103,37 @@ class MetricTile(QFrame):
 
 
 class Badge(QLabel):
+    """状态徽标。``set_clickable(True)`` 后变成可点的动作入口。
+
+    需要做成可点，是因为「权限：普通用户」这种状态光写着没用——用户看到
+    之后唯一的动作是去关掉程序、右键、选管理员身份。把这一步直接放在徽标上，
+    比在日志里写一句"请以管理员身份运行"有用得多。
+    """
+
+    clicked = Signal()
+
     def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
         self.setObjectName("badge")
         self.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        self._clickable = False
+
+    def set_clickable(self, clickable: bool) -> None:
+        if self._clickable == clickable:
+            return
+        self._clickable = clickable
+        self.setCursor(
+            Qt.CursorShape.PointingHandCursor if clickable else Qt.CursorShape.ArrowCursor
+        )
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        # 用 release 而不是 press：按下后拖开再松手应当是"取消"，与按钮一致
+        if self._clickable and event.button() is Qt.MouseButton.LeftButton:
+            if self.rect().contains(event.position().toPoint()):
+                self.clicked.emit()
+                event.accept()
+                return
+        super().mouseReleaseEvent(event)
 
 
 class Divider(QFrame):

@@ -29,6 +29,16 @@ class FragMap(QWidget):
     bucketHovered = Signal(int)
     bucketClicked = Signal(int)
 
+    #: 左侧标签槽宽度。标签放在带子左边而不是上边：
+    #: 放在上边时，第二条带的标题会压在上一条带的下缘上——深灰字压在蓝色
+    #: 色块上几乎看不见，用户只能看到半截英文。放进独立槽位既不会重叠，
+    #: 也省下两条标题行的高度，带子本身反而更高、更好读。
+    GUTTER = 78
+    MARGIN_TOP = 20
+    #: 底部留给刻度行。刻度紧贴指标行的话，小字数字和大字指标挤在一起，
+    #: 读数时眼睛要在两种字号之间跳，很容易把"25%"看成指标的一部分。
+    MARGIN_BOTTOM = 30
+
     def __init__(self, palette: Palette = DARK, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._p = palette
@@ -58,12 +68,17 @@ class FragMap(QWidget):
     # -- 几何 -------------------------------------------------------------
 
     def _plot_rect(self) -> QRect:
-        m = 2
-        return QRect(m, 26, max(1, self.width() - 2 * m), max(1, self.height() - 26 - 26))
+        x = 2 + self.GUTTER
+        return QRect(
+            x,
+            self.MARGIN_TOP,
+            max(1, self.width() - x - 2),
+            max(1, self.height() - self.MARGIN_TOP - self.MARGIN_BOTTOM),
+        )
 
     def _split(self, plot: QRect) -> tuple[QRect, QRect]:
         gap = 8
-        used_h = int((plot.height() - gap) * 0.64)
+        used_h = int((plot.height() - gap) * 0.62)
         top = QRect(plot.x(), plot.y(), plot.width(), used_h)
         bottom = QRect(plot.x(), plot.y() + used_h + gap, plot.width(), plot.height() - used_h - gap)
         return top, bottom
@@ -92,7 +107,7 @@ class FragMap(QWidget):
         if self._report is None or not self._report.buckets:
             p.setPen(QColor(pal.text_faint))
             p.setFont(mono_font(9))
-            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "尚未扫描 · 选择目标卷后点击「扫描」")
+            p.drawText(plot, Qt.AlignmentFlag.AlignCenter, "尚未扫描 · 选择目标卷后点击「扫描」")
             # 空态也要有个"这里将出现图表"的边界，否则整张卡片看起来是坏了
             pen = QPen(QColor(pal.border))
             pen.setStyle(Qt.PenStyle.DashLine)
@@ -103,6 +118,7 @@ class FragMap(QWidget):
         report = self._report
         buckets = report.buckets
         n = len(buckets)
+        total_bytes = report.geometry.total_bytes
         usable_w = plot.width()
         # 桶数多于像素时按列聚合，避免画几万个 1px 矩形拖垮重绘
         col_w = max(1.0, usable_w / n)
@@ -135,23 +151,24 @@ class FragMap(QWidget):
         p.setPen(pen)
         p.drawRect(QRect(top.x(), top.y(), top.width() - 1, bottom.bottom() - top.y()))
 
-        # 行标题
+        # 行标题：放在左侧标签槽里，与各自的带子垂直居中对齐
         p.setFont(mono_font(8))
         p.setPen(QColor(pal.text_faint))
-        p.drawText(QRect(plot.x(), plot.y() - 18, 200, 14),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "占用 / OCCUPANCY")
-        p.drawText(QRect(plot.x(), bottom.y() - 15, 220, 13),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, "碎片热力 / FRAGMENTATION")
+        for band, label in ((top, "占用"), (bottom, "碎片热力")):
+            p.drawText(
+                QRect(2, band.y(), self.GUTTER - 10, band.height()),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                label,
+            )
 
         # 右侧刻度：Max
-        total_bytes = report.geometry.total_bytes
         p.setPen(QColor(pal.text_faint))
-        p.drawText(QRect(plot.right() - 160, plot.y() - 18, 160, 14),
+        p.drawText(QRect(plot.right() - 200, 2, 200, 16),
                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
                    f"{fmt_bytes(total_bytes)} · {fmt_count(report.geometry.block_count)} 块")
 
         # 底部轴标签
-        axis_y = plot.bottom() + 6
+        axis_y = plot.bottom() + 5
         p.setFont(mono_font(8))
         for frac, text in ((0.0, "0"), (0.25, "25%"), (0.5, "50%"), (0.75, "75%"), (1.0, "100%")):
             tx = plot.x() + int(usable_w * frac)

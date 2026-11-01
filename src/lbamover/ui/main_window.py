@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import sys
 import traceback
 
 from PySide6.QtCore import Qt, QTimer
@@ -44,7 +45,7 @@ from ..platform.volumes import enumerate_volumes
 from .bridge import EngineBridge
 from .format import fmt_bytes, fmt_count, fmt_percent
 from .theme import DARK, LIGHT, Palette, apply_theme
-from .widgets.cards import Card, MetricTile, hint_label
+from .widgets.cards import Badge, Card, MetricTile, hint_label
 from .widgets.control_bar import ControlBar
 from .widgets.flow import FlowContainer
 from .widgets.frag_map import FragMap
@@ -67,7 +68,9 @@ class MainWindow(QMainWindow):
         self._p = palette
         self.setWindowTitle(f"LBAMover {VERSION_DISPLAY} — LBA 块级流式整理")
         self.setMinimumSize(840, 600)
-        self.resize(1360, 900)
+        # 940 是"所有卡片都不必滚动"的最小高度（实测 900 时进度卡底部会被
+        # 截掉 33px）。1080p 屏放得下；更矮的屏按设计出滚动条。
+        self.resize(1360, 940)
 
         # -- 状态 --
         self._volumes: list[VolumeInfo] = []
@@ -138,8 +141,8 @@ class MainWindow(QMainWindow):
         ver.setObjectName("badge")
         self.badge_engine = QLabel("引擎：未探测")
         self.badge_engine.setObjectName("badge")
-        self.badge_perm = QLabel("权限：未知")
-        self.badge_perm.setObjectName("badge")
+        self.badge_perm = Badge("权限：未知")
+        self.badge_perm.clicked.connect(self._elevate)
 
         lay.addWidget(brand)
         lay.addWidget(ver)
@@ -632,11 +635,46 @@ class MainWindow(QMainWindow):
             self.badge_engine.setText("引擎：真机只读")
         else:
             self.badge_engine.setText("引擎：受限")
-        self.badge_perm.setText("权限：管理员" if caps.is_admin else "权限：普通用户")
-        if not caps.is_admin:
-            self.badge_perm.setToolTip("原始卷写入需要管理员权限与 SeManageVolumePrivilege")
+        if caps.is_admin:
+            self.badge_perm.setText("权限：管理员")
+            self.badge_perm.set_clickable(False)
+            self.badge_perm.setToolTip("已具备读取原始卷与搬簇所需的权限")
+        else:
+            # 状态 + 出口。只写"普通用户"等于把修复办法留给用户自己猜，
+            # 而他猜的结果通常是"这软件不能用在真盘上"。
+            self.badge_perm.setText("权限：普通用户 · 点此提权")
+            self.badge_perm.set_clickable(True)
+            self.badge_perm.setToolTip(
+                "读取/整理真实卷需要管理员权限与 SeManageVolumePrivilege。\n"
+                "点击后用「以管理员身份运行」重启本程序（会弹 UAC）。\n"
+                "演示模式不受影响。"
+            )
         if caps.reason:
             self.badge_engine.setToolTip(caps.reason)
+
+    def _elevate(self) -> None:
+        """以管理员身份重启。**只在用户点击时执行**，不在启动流程里自动弹 UAC。"""
+        if self.core.state in (JobState.RUNNING, JobState.PAUSED):
+            self.log_view.append(LogLevel.WARNING, "任务运行中，先停止再提权重启")
+            return
+        ret = QMessageBox.question(
+            self,
+            "以管理员身份重启",
+            "将关闭当前窗口并以管理员身份重新启动 LBAMover。\n"
+            "Windows 会弹出 UAC 授权框。继续？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if ret is not QMessageBox.StandardButton.Yes:
+            return
+        from ..platform.privilege import relaunch_as_admin
+
+        if not relaunch_as_admin(list(sys.argv[1:])):
+            self.log_view.append(
+                LogLevel.ERROR, "提权启动失败，请手动右键程序并选择「以管理员身份运行」"
+            )
+            return
+        self.close()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
