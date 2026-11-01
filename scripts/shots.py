@@ -72,10 +72,33 @@ def main() -> int:
     pump(app, lambda: w.core.state in (JobState.DONE, JobState.FAILED), timeout=60)
     shot("04-done")
 
+    # 手动选择文件：范围卡 + 选择对话框
+    w.scope_panel.set_manual(True)
+    w._selection = tuple(f.file_id for f in w._report.fragmented_files[:3])
+    w._refresh_scope_summary()
+    app.processEvents()
+    shot("05-manual-scope")
+
+    from lbamover.ui.widgets.file_select import FileSelectDialog
+
+    dlg = FileSelectDialog(
+        w._report.files, w._volume.geometry.block_size, w._p,
+        preselect=w._selection, parent=w,
+    )
+    dlg.resize(980, 640)
+    dlg.show()
+    for _ in range(3):
+        app.processEvents()
+        time.sleep(0.05)
+    dlg.grab().save(os.path.join(OUT, "06-file-picker.png"))
+    print("saved", os.path.join(OUT, "06-file-picker.png"))
+    dlg.close()
+    w.scope_panel.set_manual(False)
+
     # 窄窗口：左栏应自动收起
     w.resize(900, 720)
     app.processEvents()
-    shot("05-narrow")
+    shot("07-narrow")
 
     w.close()
     QApplication.quit()

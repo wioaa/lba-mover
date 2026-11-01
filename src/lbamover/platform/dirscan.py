@@ -133,10 +133,9 @@ class DirectoryCatalog:
         failed = 0
         truncated = False
         last_report = 0
-        order = 0
         geometry = self.volume.geometry
 
-        def accept(runs, path: str, attributes: int, idx: int) -> None:
+        def accept(runs, path: str, attributes: int) -> None:
             """收下一次查询结果。异常只计数，绝不打断整卷。"""
             nonlocal failed
             if self._max_files is not None and len(files) >= self._max_files:
@@ -149,7 +148,13 @@ class DirectoryCatalog:
             try:
                 files.append(
                     FileFrag(
-                        file_id=f"walk-{idx}",
+                        # **file_id 用路径，不用遍历序号。**
+                        # 序号在两次扫描之间会漂移（遍历顺序、并发完成顺序都
+                        # 会变），而 file_id 要跨扫描使用：手动选择文件后点
+                        # 「开始整理」会重新扫描一次，计划指纹、断点续做也都
+                        # 按 file_id 对齐。用序号意味着"用户选的 12 个文件"
+                        # 在重新扫描后指向了别的文件 —— 这是最不能接受的一类错。
+                        file_id=path,
                         path=path,
                         extents=extents,
                         attributes=attributes,
@@ -182,7 +187,6 @@ class DirectoryCatalog:
                         continue
                     if size <= 0:
                         continue  # 空文件 / 无独立簇，问了也是空
-                    order += 1
                     try:
                         runs = self._query(path)
                     except (OSError, DeviceUnavailable):
@@ -190,24 +194,24 @@ class DirectoryCatalog:
                         # 不能因为一个文件失败就放弃整卷。
                         failed += 1
                         continue
-                    accept(runs, path, attributes, order)
+                    accept(runs, path, attributes)
                     if reached_limit():
                         truncated = True
                         break
                     report(path)
             else:
                 window = max(1, self._workers * _INFLIGHT_FACTOR)
-                pending: dict[Future, tuple[int, str, int]] = {}
+                pending: dict[Future, tuple[str, int]] = {}
 
-                def collect(fut: Future, meta: tuple[int, str, int]) -> None:
+                def collect(fut: Future, meta: tuple[str, int]) -> None:
                     nonlocal failed
-                    idx, path, attributes = meta
+                    path, attributes = meta
                     try:
                         runs = fut.result()
                     except (OSError, DeviceUnavailable):
                         failed += 1
                         return
-                    accept(runs, path, attributes, idx)
+                    accept(runs, path, attributes)
 
                 with ThreadPoolExecutor(
                     max_workers=self._workers, thread_name_prefix="lbamover-scan"
@@ -225,8 +229,7 @@ class DirectoryCatalog:
                         if size <= 0:
                             report(path)
                             continue
-                        order += 1
-                        pending[pool.submit(self._query, path)] = (order, path, attributes)
+                        pending[pool.submit(self._query, path)] = (path, attributes)
                         if len(pending) >= window:
                             # 在飞任务满了才回收：这样遍历与查询真正重叠，
                             # 内存占用恒为 window 条，与卷的文件数无关。

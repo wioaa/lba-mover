@@ -318,6 +318,107 @@ def ui_roundtrip(app):
     )
 
 
+def ui_manual_scope(app):
+    """手动选择文件：只搬选中的，其余文件一个块都不许动。
+
+    这是"手动模式"唯一有意义的验收标准：**没被选中的文件在执行后必须
+    逐块完全一致**。只断言"选中的搬了"是不够的 —— 那样整卷模式也能通过。
+    """
+    from PySide6.QtWidgets import QApplication
+
+    from lbamover.contract.enums import JobState, Strategy
+    from lbamover.engine.synth import apply_plan, verify
+    from lbamover.ui.app import build_app
+
+    a, w = build_app(["--demo"])
+    w.show()
+    a.processEvents()
+    pump(a, lambda: w._volume is not None, label="演示卷")
+
+    # 切到手动范围 + 扫描
+    w.scope_panel.set_manual(True)
+    w._on_scan()
+    pump(a, lambda: w._report is not None, label="扫描")
+    report = w._report
+    frags = report.fragmented_files
+    assert len(frags) >= 4, "合成卷碎片文件太少，无法验证范围"
+
+    chosen = tuple(f.file_id for f in frags[:3])
+    untouched = tuple(f for f in report.files if f.file_id not in chosen)
+    w._selection = chosen
+    w._refresh_scope_summary()
+    w._strategy = Strategy.COALESCE
+
+    # 预演必须只含选中的文件
+    w.service.submit(_replan_command(Strategy.COALESCE, chosen))
+    pump(a, lambda: w._plan is not None and w._plan.op_count > 0, label="预演")
+    plan = w._plan
+    assert {op.file_id for op in plan.ops} <= set(chosen), "预演里混进了没选中的文件"
+    assert plan.op_count == len(chosen), f"选 {len(chosen)} 个却规划了 {plan.op_count} 个"
+
+    # 未选中的块先拍快照，执行后逐块比对（整卷模式也会通过"选中的搬了"，
+    # 但只有快照能证明"没选中的一个字节都没动"）
+    snapshot = {
+        blk: w._demo_device.read_blocks(blk, 1)
+        for frag in untouched
+        for ext in frag.extents
+        for blk in range(ext.start, ext.end)
+    }
+
+    # 开始（确认框用桩点"是"）
+    _answer_yes(w)
+    w._on_start()
+    pump(a, lambda: w.core.state in (JobState.DONE, JobState.FAILED, JobState.CANCELLED),
+         timeout=40, label="执行")
+    assert w.core.state is JobState.DONE, f"执行状态 {w.core.state}"
+    result = w.core.last_result
+    assert result is not None and result.moved_ops == len(chosen), (
+        f"只该搬 {len(chosen)} 个，实际 {result.moved_ops if result else '?'}"
+    )
+
+    # 逐块校验：选中的按计划搬完，其余必须原样
+    after = apply_plan(w._demo_layout, w.core.plan)
+    problems = verify(w._demo_device, after)
+    assert not problems, f"数据不一致：{problems[:2]}"
+
+    for frag in untouched:
+        for ext in frag.extents:
+            for blk in range(ext.start, ext.end):
+                got = w._demo_device.read_blocks(blk, 1)
+                assert got == snapshot[blk], f"没选中的文件被动了：{frag.path} 块 {blk}"
+
+    w.close()
+    return f"只搬了 {len(chosen)} 个文件，另 {len(untouched)} 个逐块未变"
+
+
+def _replan_command(strategy, file_ids):
+    from lbamover.contract.commands import Replan
+
+    return Replan(strategy, tuple(file_ids))
+
+
+def _answer_yes(window) -> None:
+    """把确认对话框换成"用户点了是"（返回 int 16384，和 PySide6 真实返回值一致）。"""
+    import lbamover.ui.main_window as mw_mod
+
+    box = mw_mod.QMessageBox
+
+    class _Yes:
+        StandardButton = box.StandardButton
+        Icon = box.Icon
+
+        @staticmethod
+        def question(*_a, **_k):
+            return int(box.StandardButton.Yes)
+
+        @staticmethod
+        def information(*_a, **_k):
+            return int(box.StandardButton.Ok)
+
+    mw_mod.QMessageBox = _Yes
+    window._restore_messagebox = lambda: setattr(mw_mod, "QMessageBox", box)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="LBAMover 冒烟验证")
     ap.add_argument("--no-gui", action="store_true", help="跳过 GUI 部分")
@@ -350,6 +451,14 @@ def main(argv: list[str] | None = None) -> int:
             return ui_roundtrip(app)
 
         check("窗口构建 + 扫描 + 执行 + 校验", _ui)
+
+        def _ui_scope():
+            from PySide6.QtWidgets import QApplication
+
+            app = QApplication.instance() or QApplication([])
+            return ui_manual_scope(app)
+
+        check("手动范围：只搬选中的文件", _ui_scope)
     else:
         print("\n[3/4] GUI 部分已跳过（--no-gui）")
 

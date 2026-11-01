@@ -27,6 +27,7 @@ from ..contract.commands import (
     CancelJob,
     Command,
     PauseJob,
+    Replan,
     ResumeJob,
     SetParams,
     Shutdown,
@@ -50,6 +51,10 @@ from .control import RunControl
 from .errors import CancelledError, PlanRejected
 from .frag import DEFAULT_BUCKETS, analyze, bucketize, free_extents_from_files
 from .planner import build_plan, validate_plan
+
+#: 扫描进度的最小上报间隔（秒）。太密会淹掉 UI 事件队列，太疏进度条会一顿一顿。
+#: 测试里可以把它改成 0，否则"毫秒内连抛三次"只会被节流成一次。
+SCAN_PROGRESS_MIN_INTERVAL = 0.2
 from .safety import DEFAULT_POLICY, ProtectionPolicy, audit_plan
 from .scheduler import ExecutionResult, JobRunner
 
@@ -169,6 +174,18 @@ class EngineCore:
 
         self._set_state(JobState.SCANNING, f"扫描 {vol.mount_point}")
         t0 = time.monotonic()
+        # 扫描进度的时间基准与节流点：进入扫描就重置，否则上一轮的节流
+        # 时间戳会让新扫描的头 0.2s 没有第一帧进度。
+        self._scan_started_at = t0
+        self._scan_emit_at = 0.0
+        self._scan_log_at = 0.0
+        self._emit(
+            ProgressEvent(
+                Progress(current_path=f"正在扫描 {vol.mount_point}", scanned_items=0),
+                seq=self._next_seq(),
+                job_id=self.job_id,
+            )
+        )
         cat = self.catalog
         owned = None
         restricted = False
@@ -259,13 +276,32 @@ class EngineCore:
             return factory(vol)
 
     def _scan_progress(self, seen: int, current: str) -> None:
-        """按时间节流上报遍历进度。
+        """上报遍历进度：事件给进度条，日志给追溯。
 
-        按"每 N 个文件"报会在一堆小文件里刷屏、在大文件里长时间沉默。
-        按秒节流才能让用户稳定看到"还在动"。
+        两套节流各有各的用处：
+
+        * **事件 0.2s** —— 进度条要"在动"的感觉，太稀疏会看着像卡住；
+        * **日志 5s** —— 日志是给人翻记录的，每 0.2s 一行会把有用信息冲掉。
+
+        以前只有日志（2.5s 一行），于是"扫描没有进度条"，大卷上用户只能盯着
+        一片静止的界面猜它死没死。
         """
         now = time.monotonic()
-        if now - getattr(self, "_scan_log_at", 0.0) < 2.5:
+        elapsed = now - getattr(self, "_scan_started_at", 0.0)
+        if now - getattr(self, "_scan_emit_at", 0.0) >= SCAN_PROGRESS_MIN_INTERVAL:
+            self._scan_emit_at = now
+            self._emit(
+                ProgressEvent(
+                    Progress(
+                        current_path=current,
+                        elapsed_s=elapsed if elapsed > 0 else 0.0,
+                        scanned_items=seen,
+                    ),
+                    seq=self._next_seq(),
+                    job_id=self.job_id,
+                )
+            )
+        if now - getattr(self, "_scan_log_at", 0.0) < 5.0:
             return
         self._scan_log_at = now
         self._log(
@@ -645,6 +681,12 @@ class EngineService:
             if cmd.strategy is not None and cmd.strategy.writes_blocks:
                 # 预览：让用户在点「开始」之前就看到会动多少数据
                 self.core.make_plan(cmd.strategy, cmd.file_ids)
+            return
+        if isinstance(cmd, Replan):
+            if self.core.report is None:
+                self.core._log(LogLevel.WARNING, "还没有扫描结果，先扫描再预演")
+                return
+            self.core.make_plan(cmd.strategy, cmd.file_ids)
             return
         if isinstance(cmd, StartJob):
             spec = cmd.spec

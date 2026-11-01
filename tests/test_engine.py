@@ -314,3 +314,58 @@ class TestEngineService:
         svc, _core, _sink = self._service(tmp_path, layout, dev, vol)
         svc.stop(timeout=3)
         assert svc._thread is None
+
+
+class TestScanProgress:
+    """扫描进度：没有进度条时，大卷上界面看起来就是卡死。
+
+    扫描没有"总量"可算（要遍历完才知道有多少文件），所以上报的是**已看条目数**
+    与当前路径，UI 用不确定进度条 + 条目数展示，而不是编一个百分比出来。
+    """
+
+    def test_scan_emits_progress_events_with_counts(self, tmp_path, monkeypatch):
+        import lbamover.engine.engine as engine_mod
+        from lbamover.contract.enums import EventKind
+
+        # 关掉节流：真实场景是 0.2s 一次，测试里三次回调发生在同一毫秒内
+        monkeypatch.setattr(engine_mod, "SCAN_PROGRESS_MIN_INTERVAL", 0.0)
+        from lbamover.contract.models import Extent
+        from lbamover.ntfs.catalog import CatalogStats
+
+        layout = build_layout(512, file_count=6, seed=7)
+        vol = make_volume(layout.geometry)
+
+        class SlowCatalog:
+            """模拟未提权的目录遍历：会多次回调进度。"""
+
+            restricted = False
+
+            def __init__(self) -> None:
+                self.stats = CatalogStats(kind="遍历", files=1)
+
+            def list_files(self, volume):
+                for i in (1, 50, 120):
+                    self.on_progress(i, f"T:/f{i}.bin")
+                return layout.files[:1]
+
+            def free_extents(self, volume):
+                return (Extent(400, 100),)
+
+            def close(self):
+                pass
+
+        cat = SlowCatalog()
+
+        def factory(volume, on_progress=None):
+            cat.on_progress = on_progress or (lambda n, p: None)
+            return cat
+
+        sink = ListSink()
+        core = EngineCore(sink=sink, catalog=UnsupportedCatalog(), catalog_factory=factory)
+        core.set_target(vol, JobParams())
+        core.scan(vol)
+
+        events = [e for e in sink.events if getattr(e, "kind", None) is EventKind.PROGRESS]
+        counts = [e.progress.scanned_items for e in events]
+        assert counts and max(counts) >= 120, f"没有上报扫描条目数：{counts}"
+        assert any("f120" in e.progress.current_path for e in events), "没有上报当前路径"

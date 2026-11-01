@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 from ..contract.models import Extent, FileFrag, Geometry, VolumeInfo, normalize_extents
 from ..devices.base import DeviceError
@@ -80,14 +81,20 @@ class MftCatalog:
         min_clusters: int = 1,
         max_records: int | None = None,
         root: str = "",
+        on_progress: Callable[[int, str], None] | None = None,
     ) -> None:
         self.device = device
         self._boot = boot
+        #: ``(已看条目数, 当前路径)``。百万条记录的卷上解析要十几秒，
+        #: 没有回调界面会静止十几秒（用户以为卡死）。
+        self._on_progress = on_progress
         #: 路径前缀（``R:\``）。MFT 里存的是相对卷根的路径，界面上直接显示
         #: "下载中转.zip" 会让人分不清是哪个盘。
         self._root = root
         self._min_clusters = max(1, min_clusters)
         self._max_records = max_records
+        #: 进度上报的基数（上一阶段已完成的条目数），保证 N 只增不减
+        self._report_base = 0
         self._files: tuple[FileFrag, ...] | None = None
         self._free: tuple[Extent, ...] | None = None
         self._stats = CatalogStats()
@@ -123,6 +130,7 @@ class MftCatalog:
         mft_runs = self._mft_runs()
         records, bad, entries = self._read_records(mft_runs)
 
+        self._report_base = len(records)
         files, skipped, skipped_notes = self._build_files(records, entries, boot)
         notes.extend(skipped_notes)
 
@@ -254,6 +262,15 @@ class MftCatalog:
         for item in drain():
             yield item
 
+    def _report(self, count: int, current: str) -> None:
+        """上报进度。``count`` 是**本阶段内**的计数，这里加上前面阶段的基数。
+
+        不加基数的话，界面上的"N 项"会从 46000 突然掉回 1000（记录解析结束、
+        开始组装路径），看起来像任务重启了。
+        """
+        if self._on_progress is not None:
+            self._on_progress(self._report_base + count, current)
+
     def _read_records(self, mft_runs):
         """扫全表，返回（记录字典, 坏记录数, FRN→(父,名) 表）。"""
         boot = self.boot
@@ -263,6 +280,8 @@ class MftCatalog:
         index = 0
         for index, raw in self._iter_record_bytes(mft_runs):
             number = index // boot.record_size
+            if not number & 0xFFF:  # 每 4096 条报一次，够密且几乎不花钱
+                self._report(number, f"$MFT 记录 {number}")
             if self._max_records is not None and number >= self._max_records:
                 break
             # 未使用的 MFT 槽位是全零：这是正常状态，不是"坏记录"。
@@ -294,7 +313,9 @@ class MftCatalog:
             skipped += 1
             reasons[reason] = reasons.get(reason, 0) + 1
 
-        for number, rec in sorted(records.items()):
+        for count, (number, rec) in enumerate(sorted(records.items()), 1):
+            if not count & 0x3FFF:  # 每 16384 个文件报一次
+                self._report(count, f"组装路径 {count}/{len(records)}")
             if number < FIRST_USER_RECORD:
                 continue  # 元文件不算"跳过"，它们本来就不是整理对象
             if rec.is_dir:

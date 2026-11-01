@@ -88,6 +88,13 @@ def build_plan(
         )
 
     selected, missing = select_files(report, strategy, file_ids)
+    notes: list[str] = []
+    if missing and selected:
+        # 部分失效是很常见的：用户选完文件、点了开始，中间文件被删掉/改名。
+        # 只跳过并说清楚，不要整单拒绝 —— 但也不能一声不吭。
+        notes.append(
+            f"{len(missing)} 个指定文件已不在本次扫描结果里（可能被删除或改名），已跳过"
+        )
     if not selected:
         why = (
             f"指定的 {len(missing)} 个文件在扫描结果中不存在"
@@ -114,7 +121,6 @@ def build_plan(
     tail_limit = geometry.block_count - max(0, params.reserve_tail_blocks)
     ops: list[MoveOp] = []
     reasons: list[str] = []
-    notes: list[str] = []
     cursor = 0
 
     for f in ordered:

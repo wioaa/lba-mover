@@ -17,6 +17,7 @@ __all__ = [
     "CancelJob",
     "Command",
     "PauseJob",
+    "Replan",
     "ResumeJob",
     "SetParams",
     "Shutdown",
@@ -64,6 +65,27 @@ class UpdateTarget(Command):
 
     def describe(self) -> str:
         return f"选择目标卷 {self.volume.mount_point}"
+
+
+class Replan(Command):
+    """用**现有的扫描结果**重新规划一次，不重新扫描。
+
+    为什么需要它：手动选择文件后，用户要立刻看到"这批文件会搬多少块"，
+    而不是等下一次扫描。重新扫描在百万文件的卷上要几分钟，而扫描结果与
+    文件范围是两件事 —— 前者没变，后者变了。
+    """
+
+    __slots__ = ("strategy", "file_ids")
+    name = "replan"
+
+    def __init__(self, strategy: Strategy, file_ids: tuple[str, ...] = ()) -> None:
+        object.__setattr__(self, "strategy", strategy)
+        object.__setattr__(self, "file_ids", file_ids)
+
+    def describe(self) -> str:
+        if self.file_ids:
+            return f"按选定文件重新预演（{len(self.file_ids)} 个）"
+        return "重新预演整卷"
 
 
 class StartJob(Command):

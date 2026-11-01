@@ -29,6 +29,7 @@ class ControlBar(QWidget):
         self._state = JobState.IDLE
         self._has_target = False
         self._restricted = False
+        self._scope_ok = True
 
         self.summary = QLabel("选择目标卷后开始")
         self.summary.setStyleSheet(f"color: {palette.text_faint}; font-size: 12px;")
@@ -76,6 +77,17 @@ class ControlBar(QWidget):
         self._restricted = restricted
         self.sync_state(self._state)
 
+    def set_scope_ok(self, ok: bool) -> None:
+        """范围是否可执行（手动选择模式下没勾选文件 = 不可执行）。
+
+        和 ``set_restricted`` 一样，这里只更新一个标志位并重算按钮状态 ——
+        按钮可用性仍然只有 :meth:`sync_state` 一个出口。
+        """
+        if self._scope_ok == ok:
+            return
+        self._scope_ok = ok
+        self.sync_state(self._state)
+
     def sync_state(self, state: JobState) -> None:
         self._state = state
         running = state in (JobState.RUNNING, JobState.PAUSED, JobState.STOPPING)
@@ -85,7 +97,11 @@ class ControlBar(QWidget):
         self.btn_scan.setEnabled(self._has_target and not running and not busy)
         # 受限扫描（未提权）只给了预览数据，按它去写盘等于拿别人的簇当空地
         self.btn_start.setEnabled(
-            self._has_target and not running and not busy and not self._restricted
+            self._has_target
+            and not running
+            and not busy
+            and not self._restricted
+            and self._scope_ok
         )
         self.btn_pause.setEnabled(state in (JobState.RUNNING, JobState.PAUSED))
         self.btn_stop.setEnabled(running or state is JobState.PAUSED)
@@ -96,7 +112,9 @@ class ControlBar(QWidget):
         else:
             self.btn_scan.setText("扫描 / 预演")
 
-        if self._restricted and idle:
+        if not self._scope_ok:
+            self.btn_start.setToolTip("当前是「手动选择」范围，请先点左栏「选择文件…」勾选文件")
+        elif self._restricted and idle:
             self.btn_start.setToolTip("受限扫描（未提权）只能预览：请点标题栏权限徽标提权重启后重新扫描")
         else:
             self.btn_start.setToolTip("")
@@ -115,6 +133,8 @@ class ControlBar(QWidget):
             self.summary.setText("执行失败，详情见日志面板")
         elif state is JobState.CANCELLED:
             self.summary.setText("已停止，断点已保留，可再次开始续做")
+        elif state is JobState.IDLE and not self._scope_ok:
+            self.summary.setText("手动选择范围：先勾选要整理的文件，或把范围切回「整卷」")
         elif state is JobState.IDLE and self._restricted:
             # 比"接下来点哪"更重要的信息：现在这套数据不能用来执行
             self.summary.setText(

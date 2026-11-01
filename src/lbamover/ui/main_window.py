@@ -19,6 +19,7 @@ import traceback
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QInputDialog,
@@ -33,7 +34,15 @@ from PySide6.QtWidgets import (
 )
 
 from .. import VERSION_DISPLAY
-from ..contract.commands import CancelJob, PauseJob, ResumeJob, SetParams, StartJob, UpdateTarget
+from ..contract.commands import (
+    CancelJob,
+    PauseJob,
+    Replan,
+    ResumeJob,
+    SetParams,
+    StartJob,
+    UpdateTarget,
+)
 from ..contract.enums import JobState, LogLevel, Strategy, VolumeKind
 from ..contract.models import FragReport, JobParams, JobSpec, Plan, Progress, VolumeInfo
 from ..devices.base import DeviceError
@@ -51,8 +60,10 @@ from .widgets.flow import FlowContainer
 from .widgets.frag_map import FragMap
 from .widgets.log_view import LogView
 from .widgets.params_panel import ParamsPanel
+from .widgets.file_select import FileSelectDialog
 from .widgets.progress_card import ProgressCard
 from .widgets.rate_chart import RateChart
+from .widgets.scope_panel import ScopePanel
 from .widgets.strategy_panel import STRATEGY_HELP, StrategyPanel
 from .widgets.volume_picker import VolumePicker
 
@@ -87,9 +98,10 @@ class MainWindow(QMainWindow):
         self._p = palette
         self.setWindowTitle(f"LBAMover {VERSION_DISPLAY} — LBA 块级流式整理")
         self.setMinimumSize(840, 600)
-        # 940 是"所有卡片都不必滚动"的最小高度（实测 900 时进度卡底部会被
-        # 截掉 33px）。1080p 屏放得下；更矮的屏按设计出滚动条。
-        self.resize(1360, 940)
+        # 1000 是"所有卡片都不必滚动"的最小高度：940 时左栏装上「整理范围」
+        # 卡之后差 53px（多出滚动条），实测 1000 归零。1080p 屏（工作区约
+        # 1040）放得下；更矮的屏按设计出滚动条。
+        self.resize(1360, 1000)
 
         # -- 状态 --
         self._volumes: list[VolumeInfo] = []
@@ -102,6 +114,12 @@ class MainWindow(QMainWindow):
         self._demo_device: MemoryDevice | None = None
         self._demo_layout = None
         self._demo_volume: VolumeInfo | None = None
+        # 手动选择：``_selection`` 存 file_id，不存行号 —— 行号随筛选/排序变化
+        self._manual_scope = False
+        self._selection: tuple[str, ...] = ()
+        self._sel_blocks = 0
+        self._sel_stale = 0
+        self._id_index: dict[str, object] | None = None
 
         # -- 引擎 --
         self.bridge = EngineBridge(self)
@@ -198,6 +216,10 @@ class MainWindow(QMainWindow):
         card_vol.add(self.picker, 1)
         card_vol.setMinimumHeight(206)
 
+        card_scope = Card("整理范围", "整卷 / 只整理勾选的文件")
+        self.scope_panel = ScopePanel(self._p)
+        card_scope.add(self.scope_panel)
+
         card_strategy = Card("整理策略", "你要解决哪种碎？")
         self.strategy_panel = StrategyPanel(self._p)
         card_strategy.add(self.strategy_panel)
@@ -210,6 +232,7 @@ class MainWindow(QMainWindow):
         risk.setStyleSheet(f"color: {self._p.warn}; font-size: 11px;")
 
         lay.addWidget(card_vol, 1)
+        lay.addWidget(card_scope)
         lay.addWidget(card_strategy)
         lay.addWidget(card_params)
         lay.addWidget(risk)
@@ -305,6 +328,9 @@ class MainWindow(QMainWindow):
         self.picker.volumeSelected.connect(self._on_volume_selected)
         self.picker.refreshRequested.connect(self._load_volumes)
         self.strategy_panel.strategyChanged.connect(self._on_strategy)
+        self.scope_panel.scopeChanged.connect(self._on_scope_changed)
+        self.scope_panel.pickRequested.connect(self._open_file_picker)
+        self.scope_panel.clearRequested.connect(self._clear_selection)
         self.params_panel.paramsChanged.connect(self._on_params)
 
         self.control.scanRequested.connect(self._on_scan)
@@ -369,6 +395,11 @@ class MainWindow(QMainWindow):
         # 演示卷用内存目录；真实卷每次扫描时临时打开 MFT
         self.core.catalog_factory = None if vol.device_path == DEMO_DEVICE_PATH else _open_ntfs_catalog
         self.core.set_target(vol, self._params)
+        # 选择是按卷的：换了盘，"上次选的 12 个文件"就不再有意义
+        self._selection = ()
+        self._id_index = None
+        self.scope_panel.set_available(False)
+        self._refresh_scope_summary()
         self.frag_map.set_report(None)
         self.progress.reset()
         self.rate_chart.clear()
@@ -387,6 +418,99 @@ class MainWindow(QMainWindow):
         self._strategy = strategy
         self.log_view.append(LogLevel.INFO, f"策略：{STRATEGY_HELP.get(strategy, strategy.value)}")
 
+    # -- 整理范围（手动选择文件） -----------------------------------------
+
+    def _scope_file_ids(self) -> tuple[str, ...]:
+        """当前生效的 file_id 列表。空元组 = 整卷 —— 这条语义来自引擎，别改。"""
+        return self._selection if self._manual_scope else ()
+
+    def _on_scope_changed(self, manual: bool) -> None:
+        self._manual_scope = manual
+        self.log_view.append(
+            LogLevel.INFO,
+            "范围：手动选择文件（只处理勾选的文件）"
+            if manual
+            else "范围：整卷（按策略自动挑选文件）",
+        )
+        self._refresh_scope_summary()
+        # 切回整卷时立刻把预览恢复成整卷口径，否则界面上还挂着上一次
+        # "只整理 12 个文件"的预演数字，与实际要跑的东西不符。
+        if self._report is not None:
+            self.service.submit(Replan(self._strategy, self._scope_file_ids()))
+
+    def _ensure_id_index(self) -> dict[str, object]:
+        """``file_id → FileFrag``。只建一次，换卷/重扫时失效。
+
+        百万文件建一遍约 0.2~0.4s，所以**不主动建**：只有真的用手动模式
+        算统计时才建。整卷模式下这段成本不该被所有人付。
+        """
+        if self._id_index is None:
+            files = self._report.files if self._report is not None else ()
+            self._id_index = {f.file_id: f for f in files}
+        return self._id_index
+
+    def _refresh_scope_summary(self) -> None:
+        self._sel_blocks = 0
+        self._sel_stale = 0
+        if self._selection and self._report is not None:
+            index = self._ensure_id_index()
+            blocks = 0
+            stale = 0
+            for fid in self._selection:
+                frag = index.get(fid)
+                if frag is None:
+                    stale += 1
+                else:
+                    blocks += frag.total_blocks
+            self._sel_blocks = blocks
+            self._sel_stale = stale
+        block_size = self._volume.geometry.block_size if self._volume is not None else 4096
+        self.scope_panel.set_selection(
+            len(self._selection), self._sel_blocks, block_size, self._sel_stale
+        )
+        # 手动模式下一个文件都没选时不许开始：否则 file_ids 为空会被引擎
+        # 理解成"整卷"，用户以为只动 12 个文件，实际会动几万个。
+        scope_ok = not (self._manual_scope and not self._selection)
+        self.control.set_scope_ok(scope_ok)
+
+    def _open_file_picker(self) -> None:
+        if self._report is None:
+            self.scope_panel.set_available(False)
+            self.log_view.append(LogLevel.WARNING, "先扫描一次，再从中挑选文件")
+            return
+        vol = self._volume
+        block_size = vol.geometry.block_size if vol is not None else 4096
+        dlg = FileSelectDialog(
+            self._report.files,
+            block_size,
+            self._p,
+            preselect=self._selection,
+            parent=self,
+        )
+        if dlg.exec() != int(QDialog.DialogCode.Accepted):
+            return
+        self._selection = dlg.selection_ids()
+        self._refresh_scope_summary()
+        if not self._selection:
+            self.log_view.append(LogLevel.INFO, "已清空文件选择")
+            return
+        self.log_view.append(
+            LogLevel.INFO,
+            f"已选 {len(self._selection)} 个文件，"
+            f"共 {fmt_count(self._sel_blocks)} 块 / "
+            f"{fmt_bytes(self._sel_blocks * block_size)}",
+        )
+        self.service.submit(Replan(self._strategy, self._scope_file_ids()))
+
+    def _clear_selection(self) -> None:
+        if not self._selection:
+            return
+        self._selection = ()
+        self._refresh_scope_summary()
+        self.log_view.append(LogLevel.INFO, "已清空文件选择")
+        if self._report is not None:
+            self.service.submit(Replan(self._strategy, self._scope_file_ids()))
+
     def _on_params(self, params: JobParams) -> None:
         self._params = params
         if self.core.state in (JobState.RUNNING, JobState.PAUSED):
@@ -403,8 +527,16 @@ class MainWindow(QMainWindow):
         self.log_view.clear_banner()
         self.rate_chart.clear()
         self.progress.reset()
+        # 手动模式下还没选文件时**不做预演**：file_ids 为空等于整卷，
+        # 预演出来的"要搬 6.5 GiB"会和用户接下来只整理几个文件的意图不符。
+        preview = None if (self._manual_scope and not self._selection) else self._strategy
         self.service.submit(
-            UpdateTarget(self._volume, self._params, strategy=self._strategy, file_ids=())
+            UpdateTarget(
+                self._volume,
+                self._params,
+                strategy=preview,
+                file_ids=self._scope_file_ids(),
+            )
         )
 
     def _on_start(self) -> None:
@@ -417,6 +549,14 @@ class MainWindow(QMainWindow):
                 "「只分析」不会写入任何数据。请选择「合并碎片」等策略后再开始。",
             )
             return
+        if self._manual_scope and not self._selection:
+            QMessageBox.information(
+                self,
+                "还没有选中文件",
+                "当前是「手动选择」范围，但没有勾选任何文件。\n"
+                "请点左栏「选择文件…」勾选要整理的文件，或把范围切回「整卷」。",
+            )
+            return
         if not self._confirm_write(self._volume):
             return
         self.log_view.clear_banner()
@@ -425,7 +565,7 @@ class MainWindow(QMainWindow):
             volume=self._volume,
             strategy=self._strategy,
             params=self._params,
-            file_ids=(),
+            file_ids=self._scope_file_ids(),
         )
         self.service.submit(StartJob(spec))
 
@@ -492,10 +632,27 @@ class MainWindow(QMainWindow):
 
     def _on_progress(self, pr: Progress) -> None:
         self.progress.update_progress(pr)
-        self.rate_chart.push(pr.rate_bps)
+        # 扫描阶段没有"搬运速率"这回事，往曲线里推 0 只会得到一条贴底的
+        # 假折线，看起来像"卡住了"。
+        if not pr.scanned_items:
+            self.rate_chart.push(pr.rate_bps)
 
     def _on_report(self, report: FragReport) -> None:
         self._report = report
+        # 报告换了，file_id 索引必须重建；老选择里可能有的文件已经没了
+        self._id_index = None
+        if self._selection:
+            valid = {f.file_id for f in report.files}
+            kept = tuple(i for i in self._selection if i in valid)
+            dropped = len(self._selection) - len(kept)
+            self._selection = kept
+            if dropped:
+                self.log_view.append(
+                    LogLevel.WARNING,
+                    f"有 {dropped} 个已选文件不在本次扫描结果里，已从选择中移除",
+                )
+        self.scope_panel.set_available(True)
+        self._refresh_scope_summary()
         # 受限扫描（未提权）只允许看：把"开始整理"锁掉，并说清原因
         self.control.set_restricted(report.restricted)
         self.frag_map.set_report(report)

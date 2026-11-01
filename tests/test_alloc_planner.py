@@ -254,3 +254,66 @@ class TestPlannerOutcomes:
         p1 = build_plan("j", Strategy.COALESCE, report)
         p2 = build_plan("j", Strategy.COALESCE, report)
         assert p1.plan_hash == p2.plan_hash
+
+
+class TestSelectFiles:
+    """手动指定文件范围（``file_ids``）。
+
+    这是"只整理这几个文件"的引擎侧入口。它有两个必须守住的语义：
+
+    * 指定了文件就**只**动这些文件（多搬一个 = 用户没同意的写盘）；
+    * 指定了但找不到，必须**说清楚**而不是悄悄当成整卷 ——
+      "空元组 = 整卷"这条语义一旦被误解，用户以为动了 3 个文件，
+      实际把整卷几十万个文件都搬了。
+    """
+
+    def _report(self):
+        files = (
+            FileFrag("a", "A.bin", (Extent(0, 10), Extent(50, 10)), 0),  # 2 段
+            FileFrag("b", "B.bin", (Extent(100, 20),), 0),               # 连续
+            FileFrag("c", "C.bin", (Extent(150, 5), Extent(180, 5)), 0),  # 2 段
+        )
+        return make_report(files, total=400)
+
+    def test_only_listed_files_are_selected(self):
+        report = self._report()
+        picked, missing = select_files(report, Strategy.COMPACT, ("a", "c"))
+        assert {f.file_id for f in picked} == {"a", "c"}
+        assert missing == ()
+
+    def test_empty_ids_means_whole_volume(self):
+        report = self._report()
+        picked, missing = select_files(report, Strategy.COMPACT, ())
+        assert len(picked) == report.file_count
+        assert missing == ()
+
+    def test_duplicate_ids_are_deduped(self):
+        report = self._report()
+        picked, _ = select_files(report, Strategy.COMPACT, ("a", "a", "b"))
+        assert len(picked) == 2
+
+    def test_coalesce_still_drops_already_contiguous(self):
+        # 手动选了一个本来就连续的文件：COALESCE 下没有可合并的东西
+        report = self._report()
+        picked, _ = select_files(report, Strategy.COALESCE, ("b",))
+        assert picked == []
+
+    def test_plan_ops_are_limited_to_selection(self):
+        report = self._report()
+        plan = build_plan("j", Strategy.COMPACT, report, file_ids=("a",))
+        assert plan.feasible
+        assert {op.file_id for op in plan.ops} == {"a"}, "计划里出现了没选中的文件"
+
+    def test_partially_missing_is_reported_but_still_plans(self):
+        report = self._report()
+        plan = build_plan("j", Strategy.COMPACT, report, file_ids=("a", "gone"))
+        assert plan.feasible
+        assert {op.file_id for op in plan.ops} == {"a"}
+        assert any("已不在本次扫描结果" in n for n in plan.notes)
+
+    def test_all_missing_is_infeasible(self):
+        report = self._report()
+        plan = build_plan("j", Strategy.COMPACT, report, file_ids=("gone",))
+        assert plan.feasible is False
+        assert plan.ops == ()
+        assert any("不存在" in r for r in plan.reasons)

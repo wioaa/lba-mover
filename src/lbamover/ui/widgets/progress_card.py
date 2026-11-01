@@ -36,6 +36,7 @@ class ProgressCard(QWidget):
     def __init__(self, palette: Palette = DARK, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._p = palette
+        self._state = JobState.IDLE
 
         self.percent_label = QLabel("0.0%")
         self.percent_label.setObjectName("heroValue")
@@ -83,7 +84,17 @@ class ProgressCard(QWidget):
     # -- 更新 -------------------------------------------------------------
 
     def set_state(self, state: JobState) -> None:
+        self._state = state
         self.state_chip.setText(_STATE_TEXT.get(state, state.value))
+        # 扫描/规划没有"总量"可算，进度条切成不确定模式（持续滚动），
+        # 数字位改显示已看条目数。给个假百分比是骗人的：扫描到 90% 才发
+        # 现有 300 万个文件的事经常发生。
+        if state in (JobState.SCANNING, JobState.PLANNING):
+            self.bar.setRange(0, 0)
+            if state is JobState.PLANNING:
+                self.percent_label.setText("规划中")
+        else:
+            self.bar.setRange(0, 1000)
         color = self._p.text_dim
         if state in (JobState.RUNNING, JobState.SCANNING, JobState.PLANNING):
             color = self._p.accent
@@ -101,6 +112,15 @@ class ProgressCard(QWidget):
         )
 
     def update_progress(self, pr: Progress) -> None:
+        if self._state is JobState.SCANNING:
+            # 扫描：只报"看了多少条"和"看到哪了"，不给百分比
+            if pr.scanned_items:
+                self.percent_label.setText(f"{fmt_count(pr.scanned_items)} 项")
+            if pr.current_path:
+                self.current_label.setText(f"已扫描：{_elide(pr.current_path, 90)}")
+            return
+        if self._state is not JobState.RUNNING:
+            self.bar.setRange(0, 1000)
         self.percent_label.setText(fmt_percent(pr.ratio))
         self.bar.setValue(int(round(pr.ratio * 1000)))
         self.t_rate.set_value(fmt_rate(pr.rate_bps))
@@ -117,6 +137,7 @@ class ProgressCard(QWidget):
             self.current_label.setText("全部文件处理完毕")
 
     def reset(self) -> None:
+        self.bar.setRange(0, 1000)
         self.percent_label.setText("0.0%")
         self.bar.setValue(0)
         for tile in (self.t_rate, self.t_eta, self.t_retry, self.t_fail):

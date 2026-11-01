@@ -157,7 +157,9 @@ def open_ntfs_catalog(
             # 仍然来自文件系统本身，只是拿不到 $Bitmap、看不到打不开的文件。
             return DirectoryCatalog(volume, on_progress=on_progress)
         raise CatalogError(f"打开卷 {volume.device_path} 失败：{exc}") from exc
-    return MftCatalog(device, min_clusters=min_clusters, root=volume.mount_point)
+    return MftCatalog(
+        device, min_clusters=min_clusters, root=volume.mount_point, on_progress=on_progress
+    )
 
 
 class UnsupportedCatalog:

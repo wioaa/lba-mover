@@ -694,6 +694,10 @@ class Progress:
     skipped_ops: int = 0
     current_path: str = ""
     elapsed_s: float = 0.0
+    #: 扫描阶段已经看过的条目数。扫描没有"总量"可算（要遍历完才知道有多少
+    #: 文件），所以它是**不确定进度**：UI 显示条目数 + 滚动条，而不是百分比。
+    #: 执行阶段它保持 0，不要拿它当"已处理文件数"用。
+    scanned_items: int = 0
 
     @property
     def ratio(self) -> float:

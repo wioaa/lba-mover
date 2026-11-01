@@ -286,6 +286,49 @@ QListWidget::item:hover {{
     background: {p.panel_alt};
 }}
 
+/* ---------------- 表格（手动选择文件） ---------------- */
+QTableView {{
+    background: {p.panel_alt};
+    alternate-background-color: {p.panel_alt};
+    border: 1px solid {p.border};
+    border-radius: 10px;
+    gridline-color: {p.border};
+    selection-background-color: {p.accent}26;
+    selection-color: {p.text};
+}}
+QTableView::item {{
+    padding: 1px 6px;
+}}
+QTableView::item:selected {{
+    background: {p.accent}26;
+    color: {p.text};
+}}
+QHeaderView::section {{
+    background: {p.panel};
+    color: {p.text_faint};
+    border: none;
+    border-bottom: 1px solid {p.border};
+    padding: 6px;
+    font-size: 11px;
+}}
+QTableCornerButton::section {{
+    background: {p.panel};
+    border: none;
+}}
+/* 表格里的勾选框：不显式描边的话，未勾选状态在深色底上几乎看不见，
+   用户找不到点哪里（截图评审时发现的）。 */
+QTableView::indicator {{
+    width: 14px;
+    height: 14px;
+    border-radius: 4px;
+    border: 1px solid {p.border_strong};
+    background: {p.panel};
+}}
+QTableView::indicator:checked {{
+    background: {p.accent};
+    border-color: {p.accent};
+}}
+
 /* ---------------- 输入 ---------------- */
 QSpinBox, QDoubleSpinBox, QComboBox, QLineEdit {{
     background: {p.panel_alt};

@@ -263,3 +263,46 @@ class TestParallelQuery:
     def test_zero_workers_is_treated_as_serial(self):
         cat = self._run(0)
         assert cat._workers == 1
+
+
+class TestStableFileIds:
+    """``file_id`` 必须**跨扫描稳定**。
+
+    这条以前用的遍历序号（``walk-12``）。序号的取值取决于遍历顺序和并发完成
+    顺序，两次扫描几乎必然不同。而 file_id 会被用到扫描之外：
+
+    * 手动选择文件 → 点「开始整理」时引擎会**重新扫描**一次；
+    * 计划指纹（plan_hash）按 op 的 file_id 算，断点续做靠它比对。
+
+    序号版本意味着"用户选的 12 个文件"在重新扫描后指向了另外 12 个文件，
+    或者断点在文件没变的情况下被判为"计划已变化"。所以 id 取路径。
+    """
+
+    ENTRIES = [
+        ("Q:\\b.bin", 0, 4096),
+        ("Q:\\a.bin", 0, 8192),
+        ("Q:\\c.bin", 0, 4096),
+    ]
+    RUNS = {
+        "Q:\\a.bin": ((0, 10, 2),),
+        "Q:\\b.bin": ((0, 20, 1),),
+        "Q:\\c.bin": ((0, 30, 1),),
+    }
+
+    def _ids(self, entries):
+        cat = DirectoryCatalog(
+            volume(),
+            scanner=fake_scanner(entries),
+            query=lambda p: self.RUNS.get(p, ()),
+            workers=1,
+        )
+        return {f.path: f.file_id for f in cat.list_files()}
+
+    def test_id_is_the_path_not_a_sequence_number(self):
+        ids = self._ids(self.ENTRIES)
+        assert ids == {p: p for p, _a, _s in self.ENTRIES}
+
+    def test_ids_survive_a_rescan_in_a_different_order(self):
+        first = self._ids(self.ENTRIES)
+        second = self._ids(list(reversed(self.ENTRIES)))
+        assert first == second, "换了遍历顺序，同一个文件的 id 就变了"
