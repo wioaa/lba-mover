@@ -424,6 +424,35 @@ class TestVolumePicker:
 
 
 class TestMainWindowSmoke:
+    def test_refresh_keeps_engine_target(self, qapp, monkeypatch):
+        """刷新卷列表不能把用户选的目标换回第一块盘。
+
+        这是"界面显示 R:、实际去动 C:"的成因：延迟加载重建列表时若以
+        picker 的高亮为依据，程序化切换目标（没有经过点击）就会丢选择。
+        """
+        from lbamover.ui import main_window as mw
+
+        vols = []
+        for letter in ("C:", "R:"):
+            vol = sample_volume()
+            object.__setattr__(vol, "mount_point", letter + "\\")
+            object.__setattr__(vol, "device_path", "\\\\.\\" + letter[:-1])
+            vols.append(vol)
+        monkeypatch.setattr(mw, "enumerate_volumes", lambda: list(vols))
+
+        w = mw.MainWindow(palette=DARK)
+        try:
+            w._load_volumes()
+            w.picker.select_letter("R:")
+            assert w._volume is not None and w._volume.mount_point.startswith("R:")
+            w._load_volumes()  # 模拟延迟加载 / 用户点「刷新」
+            assert w._volume is not None
+            assert w._volume.mount_point.startswith("R:"), "刷新后目标被换成了别的盘"
+            assert w.picker.current() is not None
+            assert w.picker.current().mount_point.startswith("R:")
+        finally:
+            w.deleteLater()
+
     def test_window_constructs_in_demo_mode(self, qapp):
         from lbamover.ui.main_window import DEMO_DEVICE_PATH, MainWindow
 

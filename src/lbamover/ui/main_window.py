@@ -315,13 +315,22 @@ class MainWindow(QMainWindow):
         all_volumes = self._volumes + extra
         # 重建列表时必须保住当前选择：启动时的延迟加载曾把用户刚选的
         # 演示卷换回 C:，然后对着真盘跑演示数据，属于最危险的一类错。
-        current = self.picker.current()
+        #
+        # 以 ``self._volume``（引擎真正的目标）为准，而不是只看 picker 的
+        # 选中项：程序化切换目标（例如从命令行/自动化驱动）不会经过点击，
+        # picker 的高亮还停在旧项上，用它做依据就会把目标换回第一块盘 ——
+        # 界面显示的盘和实际要动的盘不一致，是宁可崩也不能出现的情况。
+        anchor = self._volume or self.picker.current()
         preselect = None
-        if current is not None:
+        if anchor is not None:
             for i, v in enumerate(all_volumes):
-                if v.device_path == current.device_path:
+                if v.device_path == anchor.device_path:
                     preselect = i
                     break
+        if preselect is None and anchor is not None:
+            self.log_view.append(
+                LogLevel.WARNING, f"目标卷 {anchor.mount_point} 已不可用，请重新选择"
+            )
         self.picker.set_volumes(all_volumes, preselect=preselect)
         self.log_view.append(
             LogLevel.INFO,

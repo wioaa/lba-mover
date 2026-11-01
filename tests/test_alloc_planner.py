@@ -194,7 +194,7 @@ class TestPlannerInvariants:
                 MoveOp(1, "b", "b", (Extent(20, 10),), dst_start=55),
             ),
         )
-        assert any("目标区与另一个 op" in p for p in validate_plan(bad, 200))
+        assert any("目标区重叠" in p or "目标区与另一个 op" in p for p in validate_plan(bad, 200))
 
     def test_validate_plan_flags_false_parallel_claim(self):
         from lbamover.contract.models import MoveOp, Plan

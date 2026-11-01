@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import bisect
 from typing import Iterable, Sequence
 
 from ..contract.enums import Strategy
@@ -117,18 +118,17 @@ def build_plan(
     cursor = 0
 
     for f in ordered:
-        # 轮到自己时才把自己的源区从"禁区"里摘掉
-        blocked.subtract(f.extents)
-        # 但自己的源区仍然不能是本次的目标（否则读到一半被自己覆盖）
-        avoid = IntervalSet([*blocked, *f.extents])
-
+        # 此刻 blocked 里还包含自己的源区 —— 分配时正好把它当禁区（不能写到
+        # 自己还没读完的地方），分配完再摘掉。这样不用每个文件复制一份几千
+        # 个区间的 avoid 集合（那是 O(文件数 × 区间数)）。
         n = f.total_blocks
         dst = free.allocate(
             n,
-            avoid=avoid,
+            avoid=blocked,
             from_tail=(strategy is Strategy.RELOCATE_TAIL),
             max_end=tail_limit,
         )
+        blocked.subtract(f.extents)
         if dst is None:
             reasons.append(
                 f"{f.path}: 找不到 {n} 块（{n * geometry.block_size / 1048576:.1f} MiB）"
@@ -180,14 +180,33 @@ def _needs_serial(ops: Sequence[MoveOp]) -> bool:
 
     并发执行时，后一个 op 的写入可能落在前一个 op 尚未读完的源区上，
     结果是数据静默损坏。这种计划只能在"前一个完全结束后"才允许开始下一个。
+
+    实现：把所有源区间排序后二分。朴素的双重循环在真实卷上是
+    O(op²)，几千个文件要跑十几秒；而源区间互不重叠，只要看目标区左边界
+    附近那一个就够。
     """
-    for i, op in enumerate(ops):
+    if len(ops) < 2:
+        return False
+    srcs = sorted(
+        (s.start, s.end, op.op_id) for op in ops for s in op.src_extents if s.length > 0
+    )
+    if not srcs:
+        return False
+    starts = [s[0] for s in srcs]
+    for op in ops:
         dst = op.dst_extent
-        for j, other in enumerate(ops):
-            if i == j:
+        i = bisect.bisect_left(starts, dst.end) - 1
+        while i >= 0:
+            start, end, owner = srcs[i]
+            if end <= dst.start:
+                # 源区间互不重叠且升序：比它更早的都不可能与 dst 相交
+                if owner != op.op_id:
+                    break
+                i -= 1
                 continue
-            if any(dst.overlaps(src) for src in other.src_extents):
+            if owner != op.op_id:
                 return True
+            i -= 1
     return False
 
 
@@ -197,7 +216,7 @@ def validate_plan(plan: Plan, geometry_block_count: int) -> list[str]:
     这是"宁可拒绝执行也不要写错的"最后一道闸门，故意做成纯函数以便单测。
     """
     problems: list[str] = []
-    dsts: list[Extent] = []
+    dsts: list[tuple[int, int, int]] = []  # (start, end, op_id)
     for op in plan.ops:
         dst = op.dst_extent
         if dst.end > geometry_block_count:
@@ -208,18 +227,20 @@ def validate_plan(plan: Plan, geometry_block_count: int) -> list[str]:
             problems.append(f"op{op.op_id}: 目标区与自身源区重叠（会自我覆盖）")
         if op.blocks <= 0:
             problems.append(f"op{op.op_id}: 块数为 0")
-        for prev in dsts:
-            if prev.overlaps(dst):
-                problems.append(f"op{op.op_id}: 目标区与另一个 op 的目标区重叠 {dst} / {prev}")
-        dsts.append(dst)
-    if plan.requires_serial is False:
-        # 计划声明可并行，就必须真的没有"目标踩源"的情况
-        for i, op in enumerate(plan.ops):
-            for j, other in enumerate(plan.ops):
-                if i == j:
-                    continue
-                if any(op.dst_extent.overlaps(s) for s in other.src_extents):
-                    problems.append(
-                        f"op{op.op_id}: 目标区与 op{other.op_id} 的源区重叠，但计划声明可并行"
-                    )
+        dsts.append((dst.start, dst.end, op.op_id))
+
+    # 目标区两两重叠：排序后只需比对相邻项（重叠必然发生在相邻者之间）
+    dsts.sort()
+    for prev, cur in zip(dsts, dsts[1:]):
+        if cur[0] < prev[1]:
+            problems.append(
+                f"op{cur[2]}: 目标区与 op{prev[2]} 的目标区重叠 "
+                f"[{cur[0]}, {cur[1]}) / [{prev[0]}, {prev[1]})"
+            )
+
+    if plan.requires_serial is False and _needs_serial(plan.ops):
+        # 声明可并行，就必须真的没有"目标踩源"的情况。
+        # 这里直接复用 _needs_serial 的排序二分：朴素双循环是 O(op²)，真实卷上
+        # 两千多个 op 要跑一分钟，而它只是个自检。
+        problems.append("计划声明可并行，但存在目标区与另一个 op 的源区重叠的情况")
     return problems
