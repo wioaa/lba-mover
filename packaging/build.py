@@ -31,7 +31,6 @@ BUILD = os.path.join(ROOT, "build")
 APP_DIR = os.path.join(DIST, "LBAMover")
 EXE_GUI = os.path.join(APP_DIR, "LBAMover.exe")
 EXE_CLI = os.path.join(APP_DIR, "LBAMover-cli.exe")
-
 sys.path.insert(0, os.path.join(ROOT, "src"))
 from lbamover import VERSION_DISPLAY  # noqa: E402
 
@@ -163,11 +162,25 @@ def dir_size_mb(path: str) -> float:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global DIST, APP_DIR, EXE_GUI, EXE_CLI
+
     ap = argparse.ArgumentParser(description="LBAMover 封包")
     ap.add_argument("--no-wheel", action="store_true", help="不构建 wheel")
     ap.add_argument("--skip-verify", action="store_true", help="跳过产物验证（不推荐）")
     ap.add_argument("--keep-build", action="store_true", help="保留 build/ 中间目录")
+    ap.add_argument(
+        "--dist",
+        default=DIST,
+        help="产物输出目录（默认 dist/）。程序正开着时 dist/LBAMover/*.exe 被占用"
+        "清不掉，用这个参数换一个目录出包，互不影响",
+    )
     args = ap.parse_args(argv)
+
+    DIST = os.path.abspath(args.dist)
+    APP_DIR = os.path.join(DIST, "LBAMover")
+    EXE_GUI = os.path.join(APP_DIR, "LBAMover.exe")
+    EXE_CLI = os.path.join(APP_DIR, "LBAMover-cli.exe")
+    os.makedirs(DIST, exist_ok=True)
 
     log(f"目标版本 {VERSION_DISPLAY}")
     step_icon()

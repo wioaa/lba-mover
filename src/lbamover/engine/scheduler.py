@@ -42,7 +42,34 @@ __all__ = ["RateLimiter", "ExecutionResult", "JobRunner"]
 #: 什么都没搬"。
 #:
 #: 20 这个值是"够多到不可能是巧合、够少到不用等一小时才反应过来"。
+#:
+#: 注意它只统计**系统级**失败（搬簇、读写、复核布局），不统计"打不开文件"，
+#: 后者见 :data:`MAX_CONSECUTIVE_UNOPENABLE`。
 MAX_CONSECUTIVE_FAILURES = 20
+
+#: 连续多少个文件**打不开**才熔断。
+#:
+#: 为什么是 20 的 10 倍：规划按物理 LCN 排序（见 planner 的 ``_order_by_lcn``），
+#: 同一目录下同时创建的小文件在盘上是紧挨着的，所以在任务队列里也连在一起。
+#: 真机实测（F: 卷 / relocate_tail / 整卷）：Steam 开着，``Steam\logs`` 下
+#: 二十个 .txt 连续 winerror=32，加上 3 个正在被写入的文件，**连续 20 个失败
+#: 直接熔断，整卷一个文件都没搬成**。
+#:
+#: 打不开是"这一个文件现在搬不了"，不是"整卷不能搬"。200 的意思是：真的整卷
+#: 都被别的程序占满了才值得放弃。
+MAX_CONSECUTIVE_UNOPENABLE = 200
+
+#: 只影响单个文件、跳过就该继续的失败阶段。
+#:
+#: 用阶段而不是错误分类来分档，因为分类回答"要不要重试这个文件"，而熔断要
+#: 回答"还要不要继续搬别的文件"——这是两个问题。同是 RETRYABLE，打开文件
+#: 时的共享冲突只坑一个文件，写盘时的 IO 超时则说明设备已经不可靠。
+_LOCAL_FAILURE_STAGES = frozenset({"打开文件"})
+
+#: 连续 n 次失败时，n 该往哪个闸门累加。
+_FAILURE_KIND_SYSTEM = "system"
+_FAILURE_KIND_LOCAL = "local"
+
 
 
 class RateLimiter:
@@ -217,7 +244,8 @@ class JobRunner:
     def _run_pool(self, ops: list[MoveOp], workers: int, result: ExecutionResult) -> None:
         executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="lba-op")
         futures: dict[Future, MoveOp] = {}
-        consecutive = 0
+        consecutive_system = 0
+        consecutive_local = 0
         try:
             for op in ops:
                 if self.control.cancelled:
@@ -240,20 +268,39 @@ class JobRunner:
                     result.cancelled = True
                     break
                 if res.ok:
-                    consecutive = 0
+                    consecutive_system = 0
+                    consecutive_local = 0
                     continue
                 if res.cancelled:
                     continue
-                consecutive += 1
+                # 两条独立的连续计数：失败性质不同，混在一起数就会让"一整批
+                # 文件被同一个程序占着"把真正的系统故障线索淹掉（真机事故见
+                # MAX_CONSECUTIVE_UNOPENABLE 的注释）。
+                if res.stage in _LOCAL_FAILURE_STAGES:
+                    consecutive_local += 1
+                    consecutive_system = 0
+                else:
+                    consecutive_system += 1
+                    consecutive_local = 0
                 if self.halt_on_error:
                     self._log(f"遇到错误且开启了 fail-fast，停止后续任务：{res.error}")
                     self.control.request_cancel()
                     break
-                if consecutive >= MAX_CONSECUTIVE_FAILURES:
+                if consecutive_system >= MAX_CONSECUTIVE_FAILURES:
                     # 熔断的门槛是"连续"，不是"一个"：单个文件被独占打开、
                     # 权限不足都是常态，绝不能因此停掉整卷整理。
                     result.aborted = (
-                        f"连续 {consecutive} 个文件失败，判断为系统性故障，已中止剩余任务"
+                        f"连续 {consecutive_system} 个文件在「{res.stage or '执行'}」阶段失败，"
+                        f"判断为系统性故障，已中止剩余任务"
+                    )
+                    self._log(result.aborted)
+                    break
+                if consecutive_local >= MAX_CONSECUTIVE_UNOPENABLE:
+                    # 到这个数已经不只是"几个文件被占用"了，而是整卷都没法
+                    # 拿到句柄，继续跑只会把剩下的几十万次打开操作逐一撞死。
+                    result.aborted = (
+                        f"连续 {consecutive_local} 个文件打不开（被占用或权限不足），"
+                        f"整卷可能正被其他程序大量使用，已中止剩余任务"
                     )
                     self._log(result.aborted)
                     break

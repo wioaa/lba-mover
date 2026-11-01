@@ -45,7 +45,7 @@ python packaging/build.py            # 图标 → 版本资源 → PyInstaller �
 | --- | --- |
 | `dist/LBAMover/LBAMover.exe` | 图形界面，双击即用（单一 exe 3 MB，运行库在 `_internal/`） |
 | `dist/LBAMover/LBAMover-cli.exe` | 命令行，`--version` / `volumes` / `scan` / `selftest` / `smoke` |
-| `dist/LBAMover-2.0.0E-win64.zip` | 解包即用，约 48 MiB |
+| `dist/LBAMover-2.0.0F-win64.zip` | 解包即用，约 48 MiB |
 | `dist/lbamover-2.0.0-py3-none-any.whl` | `pip install` 用 |
 | `dist/SHA256SUMS.txt` | 上述产物的校验和 |
 
@@ -120,6 +120,7 @@ from lbamover.engine import EngineCore
 | **可用空间整理** | ✅ 按 GiB 指定大小，选卷首或卷尾。只承诺"这段连续空闲确实是空的"——做不到就报差额，不给"搬了一半"的结果 |
 | **手动选文件** | ✅ 只整理勾选的，选择身份是文件路径而非行号（跨扫描稳定） |
 | **失败原因 + 一键复制诊断** | ✅ 每条失败带阶段、异常类型、错误分类、Windows 错误码；日志面板把版本与明细打包成一段可直接粘贴求助的文本 |
+| **失败容忍** | ✅ 「打不开」（被占用 / 权限）与「其它阶段失败」分开计数：前者连续 200 个才中止，后者 20 个。Steam 开着时那十几个 `winerror=32` 不会再让整卷停下来 |
 | **结局三档** | ✅ 已完成 / 部分完成 / 失败。19 成功 1 失败不会再显示成绿色"已完成" |
 | 并发 / 限速 / 暂停 / 停止 / 断点续做 | ✅ 断点带计划指纹，计划变了拒绝续做 |
 | **未提权扫描** | ⚠ 只读预览。走目录遍历 + 逐文件簇映射（不需要权限），但拿不到 `$Bitmap`、看不到打不开的文件 → 界面锁住「开始整理」 |
@@ -160,7 +161,7 @@ GUI 的 CI 上跑完整流程，UI 能用假引擎单测，平台差异没有渗
 ## 版本号约定
 
 `pyproject.toml` 的 `version` 永远只写三段（`2.0.0`，PEP 440 合法），小版本字母放在
-`[tool.lbamover].revision`，由代码拼成 `2.0.0E` 对外展示。
+`[tool.lbamover].revision`，由代码拼成 `2.0.0F` 对外展示。
 
-`2.0.0E` 不是合法 PEP 440，pip 会直接拒绝——所以字母不能进 `version` 字段。
+`2.0.0F` 不是合法 PEP 440，pip 会直接拒绝——所以字母不能进 `version` 字段。
 两处必须一致，`tests/test_version.py` 盯着这件事。

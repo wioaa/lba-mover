@@ -394,3 +394,131 @@ class TestFailureIsolation:
         res = runner.run(plan)
         assert res.aborted == "", "零星失败不该触发熔断"
         assert res.failed_ops == (MAX_CONSECUTIVE_FAILURES + 6) // 2
+
+
+class _ScriptedExecutor:
+    """按 op_id 返回预设结果，用来复现真机上出现过的失败序列。
+
+    为什么不用 MemoryDevice 的 fail_lba_set：那种方式只能造"写盘失败"，而
+    真机事故是**打不开文件**（winerror=32）与**布局不符**交错出现，两者在
+    熔断上的分量完全不同 —— 用一个能精确编排阶段的执行器才能测这件事。
+    """
+
+    def __init__(self, script: dict[int, tuple[str, str, str, int]], cluster_size: int = 4096):
+        self.script = script
+        self.cluster_size = cluster_size
+
+    def run_op(self, op, start_blocks: int = 0):
+        from lbamover.engine.pipeline import OpResult
+
+        spec = self.script.get(op.op_id)
+        if spec is None:
+            return OpResult(op.op_id, op.blocks, op.blocks * self.cluster_size, ok=True)
+        stage, error_type, error_class, winerror = spec
+        return OpResult(
+            op.op_id, 0, 0, ok=False,
+            error=f"{stage}失败", stage=stage, error_type=error_type,
+            error_class=error_class, winerror=winerror,
+        )
+
+    def close(self) -> None:
+        pass
+
+
+class TestBreakerAgainstRealWorldReport:
+    r"""2026-11-01 的真机报告（F: 卷 / relocate_tail / 整卷）。
+
+    那次 20 个失败里 17 个是 ``Steam\logs`` 下的 winerror=32、3 个是"布局
+    复核不通过"，连续 20 个触发熔断，**整卷一个文件都没搬成**。根因是规划按
+    物理 LCN 排序，同目录小文件挨着排，于是"同一批文件被同一个程序占着"会
+    在队列里连成一片；而熔断把它们统统当成系统性故障。
+    """
+
+    def _plan(self, count: int) -> Plan:
+        ops = tuple(
+            MoveOp(
+                op_id=i, file_id=str(i), path=f"/f{i}",
+                src_extents=(Extent(6000 + i * 16, 8),),
+                dst_start=100 + i * 32, verify=False,
+            )
+            for i in range(count)
+        )
+        return Plan(job_id="t", strategy=Strategy.RELOCATE_TAIL, ops=ops)
+
+    def _runner(self, tmp_path, script, count: int):
+        dev = MemoryDevice(8192, 4096)
+        runner = JobRunner(
+            dev, dev, JobParams(chunk_blocks=8, max_retries=0, concurrency=1), RunControl(),
+            store=CheckpointStore(tmp_path / "cp.json"),
+            executor_factory=lambda _r: _ScriptedExecutor(script),
+        )
+        return runner, self._plan(count)
+
+    def test_open_file_burst_does_not_trip_breaker(self, tmp_path):
+        """真机那 20 个失败的真实序列：不该熔断，后面的文件要继续搬。"""
+        fail_prefix = 20
+        tail_ok = 30
+        script: dict[int, tuple[str, str, str, int]] = {}
+        # op0/op1 布局不符，op2-4 被占用，op5 布局不符，op6-19 被占用
+        script[0] = ("复核布局", "LayoutMismatch", "fatal", 0)
+        script[1] = ("复核布局", "LayoutMismatch", "fatal", 0)
+        for i in (2, 3, 4):
+            script[i] = ("打开文件", "DeviceError", "retryable", 32)
+        script[5] = ("复核布局", "LayoutMismatch", "fatal", 0)
+        for i in range(6, fail_prefix):
+            script[i] = ("打开文件", "DeviceError", "retryable", 32)
+
+        runner, plan = self._runner(tmp_path, script, fail_prefix + tail_ok)
+        res = runner.run(plan)
+
+        assert res.aborted == "", (
+            f"一整批文件被同一个程序占着不是系统性故障，不该熔断：{res.aborted}"
+        )
+        assert res.failed_ops == fail_prefix
+        assert res.moved_ops == tail_ok, "熔断之外的失败不该让后面的文件停下"
+
+    def test_mass_unopenable_eventually_trips(self, tmp_path):
+        """整卷都拿不到句柄时才熔断，而不是 20 个就停。"""
+        from lbamover.engine.scheduler import MAX_CONSECUTIVE_UNOPENABLE
+
+        script = {i: ("打开文件", "DeviceError", "retryable", 32) for i in range(MAX_CONSECUTIVE_UNOPENABLE + 10)}
+        runner, plan = self._runner(tmp_path, script, MAX_CONSECUTIVE_UNOPENABLE + 10)
+        res = runner.run(plan)
+
+        assert res.aborted, "整卷打不开必须留下原因"
+        assert "打不开" in res.aborted
+        assert res.failed_ops == MAX_CONSECUTIVE_UNOPENABLE
+
+    def test_system_stage_failure_trips_at_twenty(self, tmp_path):
+        """搬簇阶段连续失败仍然是系统级故障，20 个就停。"""
+        from lbamover.engine.scheduler import MAX_CONSECUTIVE_FAILURES
+
+        script = {
+            i: ("搬簇", "DeviceError", "retryable", 1117)
+            for i in range(MAX_CONSECUTIVE_FAILURES + 6)
+        }
+        runner, plan = self._runner(tmp_path, script, MAX_CONSECUTIVE_FAILURES + 6)
+        res = runner.run(plan)
+
+        assert res.aborted
+        assert "系统性故障" in res.aborted
+        assert "搬簇" in res.aborted, "熔断原因必须点出是哪个阶段，否则用户无从判断"
+        assert res.failed_ops == MAX_CONSECUTIVE_FAILURES
+
+    def test_alternating_kinds_reset_each_counter(self, tmp_path):
+        """两种失败交替出现时两个计数互相清零 —— 谁都不该单独堆到阈值。"""
+        from lbamover.engine.scheduler import MAX_CONSECUTIVE_FAILURES
+
+        count = MAX_CONSECUTIVE_FAILURES * 2
+        script = {}
+        for i in range(count):
+            script[i] = (
+                ("打开文件", "DeviceError", "retryable", 32)
+                if i % 2 == 0
+                else ("搬簇", "DeviceError", "retryable", 1117)
+            )
+        runner, plan = self._runner(tmp_path, script, count)
+        res = runner.run(plan)
+
+        assert res.aborted == "", "交替出现的两类失败不该被当成同类连续失败"
+        assert res.failed_ops == count
