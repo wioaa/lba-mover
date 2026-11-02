@@ -23,6 +23,7 @@ from .commands import (
 from .enums import (
     ErrorClass,
     EventKind,
+    Intensity,
     JobState,
     LogLevel,
     Strategy,
@@ -55,6 +56,7 @@ __all__ = [
     # enums
     "ErrorClass",
     "EventKind",
+    "Intensity",
     "JobState",
     "LogLevel",
     "Strategy",
