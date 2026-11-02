@@ -110,7 +110,19 @@ class ControlBar(QWidget):
             and self._scope_ok
         )
         self.btn_pause.setEnabled(state in (JobState.RUNNING, JobState.PAUSED))
-        self.btn_stop.setEnabled(running or state is JobState.PAUSED)
+        # 扫描与规划也要能停。旧版这里只认 RUNNING/PAUSED，于是规划阶段
+        # （真实卷上几十秒）**整个按钮是灰的** —— 用户点了没反应，只能等。
+        # 状态机侧已经支持在循环内部响应取消，这里把入口打开。
+        self.btn_stop.setEnabled(
+            state
+            in (
+                JobState.SCANNING,
+                JobState.PLANNING,
+                JobState.RUNNING,
+                JobState.PAUSED,
+            )
+        )
+        self.btn_stop.setText("停止中…" if state is JobState.STOPPING else "停止")
         self.btn_pause.setText("继续" if state is JobState.PAUSED else "暂停")
 
         if busy:
@@ -132,7 +144,8 @@ class ControlBar(QWidget):
         elif state is JobState.PAUSED:
             self.summary.setText("已暂停，可随时继续或停止（断点已保存）")
         elif state is JobState.STOPPING:
-            self.summary.setText("正在停止，等待在途 chunk 写完…")
+            # 扫描/规划阶段没有 chunk，说"在途 chunk 写完"对不上事实
+            self.summary.setText("正在停止，等待当前步骤收尾…")
         elif state is JobState.DONE:
             self.summary.setText("已完成。可再次扫描确认碎片度变化")
         elif state is JobState.PARTIAL:

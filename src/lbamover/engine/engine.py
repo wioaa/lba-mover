@@ -48,7 +48,7 @@ from ..contract.ports import EventSink, NullSink
 from .catalog import CatalogError, StaticCatalog
 from .checkpoint import Checkpoint, CheckpointStore, JsonlJournal, default_state_dir
 from .control import RunControl
-from .errors import CancelledError, PlanRejected
+from .errors import CancelledError, PlanRejected, PlanningCancelled
 from .frag import DEFAULT_BUCKETS, analyze, bucketize, free_extents_from_files
 from .planner import build_plan, validate_plan
 
@@ -69,8 +69,23 @@ class DeviceProviderError(RuntimeError):
 #: 之后引擎进入一个"看起来在跑其实没跑"的状态。
 _ALLOWED: dict[JobState, set[JobState]] = {
     JobState.IDLE: {JobState.SCANNING, JobState.PLANNING, JobState.RUNNING, JobState.FAILED},
-    JobState.SCANNING: {JobState.IDLE, JobState.PLANNING, JobState.FAILED, JobState.CANCELLED},
-    JobState.PLANNING: {JobState.IDLE, JobState.RUNNING, JobState.FAILED, JobState.CANCELLED},
+    # 扫描/规划期间允许进入 STOPPING：那两个阶段没有"在途 chunk"，停止是
+    # 让循环在下一次检查点退出。不加这条的话，规划中按停止会打一行
+    # "非法状态迁移" 警告然后继续把整轮算完 —— 用户看到的就是按钮没反应。
+    JobState.SCANNING: {
+        JobState.IDLE,
+        JobState.PLANNING,
+        JobState.STOPPING,
+        JobState.FAILED,
+        JobState.CANCELLED,
+    },
+    JobState.PLANNING: {
+        JobState.IDLE,
+        JobState.RUNNING,
+        JobState.STOPPING,
+        JobState.FAILED,
+        JobState.CANCELLED,
+    },
     JobState.RUNNING: {
         JobState.PAUSED,
         JobState.STOPPING,
@@ -233,6 +248,11 @@ class EngineCore:
                         closer()
                     except OSError:
                         pass
+        # 目录服务未必每读几项就回调一次（MFT 路径按 4096 条报一次），所以
+        # 这里再查一遍：停止请求可能正好落在两次回调之间。
+        if self.control.cancelled:
+            self._set_state(JobState.CANCELLED, "用户停止")
+            raise CancelledError("扫描已取消")
         if not free:
             # 目录服务没给自由空间时用补集推算，两条路径互相校验
             free = free_extents_from_files(vol.geometry, files)
@@ -295,6 +315,10 @@ class EngineCore:
         一片静止的界面猜它死没死。
         """
         now = time.monotonic()
+        # 扫描/规划阶段的停止必须是"看得见"的：这两个阶段由引擎线程整段占住，
+        # 命令队列无人消费，所以只能在循环内部（也就是这个回调里）查标志。
+        if self.control.cancelled:
+            raise CancelledError("扫描已取消")
         elapsed = now - getattr(self, "_scan_started_at", 0.0)
         if now - getattr(self, "_scan_emit_at", 0.0) >= SCAN_PROGRESS_MIN_INTERVAL:
             self._scan_emit_at = now
@@ -320,14 +344,14 @@ class EngineCore:
 
     # -- 保护策略 ---------------------------------------------------------
 
-    def _screened_report(self) -> FragReport:
+    def _screened_report(self, cancel=None) -> FragReport:
         """按保护策略过滤后的报告。
 
         **原报告保持不动**：执行前审计要靠它认出"这个文件本来是受保护的"，
         如果这里把原报告也换掉，审计就再也说不清为什么该拦。
         """
         assert self.report is not None
-        allowed, blocked = self.policy.screen(self.report.files)
+        allowed, blocked = self.policy.screen(self.report.files, cancel=cancel)
         if not blocked:
             return self.report
         counts: dict[str, int] = {}
@@ -356,6 +380,11 @@ class EngineCore:
         vol = self.volume
         if vol is None or os.name != "nt":
             return False
+        # 缓存模式（磁盘或内存）必须拿到可读写的**块设备**才能中转。而
+        # MOVE_FILE 路径刻意不打开裸设备（它要开文件句柄），所以这里必须
+        # 让开 —— 否则 ``runner.src`` 是 None，缓存引擎第一个 read 就炸。
+        if self.params.exec_mode is not ExecMode.NATIVE:
+            return False
         if not vol.filesystem.upper().startswith("NTFS"):
             return False
         if plan is not None and not plan.strategy.writes_blocks:
@@ -371,8 +400,11 @@ class EngineCore:
 
         这道闸门放在**执行前**而不是构造参数里，是因为 ``JobParams`` 可以在
         界面上随时改，而卷是运行时才知道的。
+
+        内存缓存与磁盘缓存在这一点上**完全一样**：中转介质是内存不代表写入
+        目标的方式变了 —— 它仍然是裸写块设备。
         """
-        if self.params.exec_mode is not ExecMode.CACHED:
+        if not self.params.exec_mode.uses_cache:
             return
         vol = self.volume
         if vol is None:
@@ -386,13 +418,15 @@ class EngineCore:
                     "缓存模式适用于卷镜像与内存盘。",
                 ]
             )
-        if not self.params.cache_dir.strip():
+        if self.params.exec_mode is ExecMode.CACHED and not self.params.cache_dir.strip():
             raise PlanRejected(["缓存搬运必须指定工作目录（施工盘应指向另一块盘）"])
 
     def make_executor_factory(self, plan: Plan | None = None):
         """返回 ``factory(runner) -> Executor``；``None`` 表示用逐块拷贝。"""
         if self.params.exec_mode is ExecMode.CACHED:
             return self._make_cached_factory()
+        if self.params.exec_mode is ExecMode.MEMCACHED:
+            return self._make_memcached_factory()
         if not self.uses_cluster_mover(plan):
             return None
         from ..devices.win32 import Win32ClusterMover
@@ -442,7 +476,28 @@ class EngineCore:
 
         return factory
 
+    def _make_memcached_factory(self):
+        """内存块池引擎的工厂。与上面两个工厂**没有任何共享代码**。"""
+        from .memcache_engine import MemCacheConfig, MemCacheExecutor
+
+        config = MemCacheConfig.from_params(self.params)
+
+        def factory(runner):
+            return MemCacheExecutor(
+                runner.src,
+                runner.dst,
+                runner.params,
+                config,
+                control=self.control,
+            )
+
+        return factory
+
     # -- 规划 -------------------------------------------------------------
+
+    def _cancel_requested(self) -> bool:
+        """给规划器的取消查询。**只读**：不要在这里重置任何标志。"""
+        return self.control.cancelled
 
     def make_plan(
         self,
@@ -454,12 +509,36 @@ class EngineCore:
         if self.report is None or self.volume is None:
             raise ValueError("请先扫描目标卷")
         p = params or self.params
+        # 取消标志是**一次性**的：上一轮规划被停掉之后，下一次规划必须能正常
+        # 跑（否则"改一下强度想重新预演"会立刻又被取消，看起来像卡死）。
+        #
+        # 判定依据是 STOPPING —— 它是"有人正在等这次停止生效"的唯一状态。
+        # 别的状态里出现取消标志，只能说明那是上一轮留下的。
+        if self.state is not JobState.STOPPING:
+            self.control = RunControl()
         self.job_id = f"job-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         self._set_state(JobState.PLANNING, f"规划 {strategy.value}")
 
-        plan_report = self._screened_report()
-        plan = build_plan(self.job_id, strategy, plan_report, file_ids=file_ids, params=p)
-        problems = validate_plan(plan, self.volume.geometry.block_count)
+        try:
+            plan_report = self._screened_report(cancel=self._cancel_requested)
+            plan = build_plan(
+                self.job_id,
+                strategy,
+                plan_report,
+                file_ids=file_ids,
+                params=p,
+                cancel=self._cancel_requested,
+            )
+            problems = validate_plan(plan, self.volume.geometry.block_count)
+        except PlanningCancelled:
+            # 取消不是"计划不可行"，也不能留下一份"看似正常"的空计划：
+            # 界面会把空计划显示成"没有需要整理的文件"，用户以为盘很健康。
+            self._log(
+                LogLevel.INFO,
+                "已停止规划：本次没有生成计划，也没有写入任何数据",
+            )
+            self._set_state(JobState.CANCELLED, "用户停止")
+            raise CancelledError("规划已取消") from None
         if problems:
             plan = replace(plan, feasible=False, reasons=tuple(problems))
         self.plan = plan
@@ -744,7 +823,10 @@ class EngineService:
             return
         if isinstance(cmd, CancelJob):
             self.core.control.request_cancel()
-            self.core._set_state(JobState.STOPPING, "用户停止")
+            # 只有"正在占用引擎线程"的状态才需要 STOPPING 这个中间态。
+            # 空闲时按停止（按钮本来就禁用）不该把状态机推进一个不存在的阶段。
+            if self.core.state.is_active:
+                self.core._set_state(JobState.STOPPING, "用户停止")
             if not cmd.keep_checkpoint:
                 self._queue.put(Shutdown())  # 复用队列做"尽快收工"信号
             return
@@ -768,6 +850,12 @@ class EngineService:
                 continue
             try:
                 self._handle(cmd)
+            except CancelledError as exc:
+                # 取消不是命令失败。**绝不能**落到下面的分支：那会先打一行
+                # "命令 X 执行失败" 再把状态改成 IDLE，用户按的停止就变成了
+                # "什么都没发生，界面又回到可以开始的样子"。
+                if self.core.state.is_active:
+                    self.core._set_state(JobState.CANCELLED, str(exc) or "已取消")
             except Exception as exc:  # noqa: BLE001 - 工作线程不能死
                 self.core._log(LogLevel.ERROR, f"命令 {cmd.name} 执行失败：{exc}")
                 self.core._set_state(JobState.IDLE, "命令失败")

@@ -230,14 +230,29 @@ class TestPackTailPanel:
         panel._group.button(1).click()
         assert not panel.pack.isVisibleTo(panel)
 
-    def test_intensity_disabled_with_reason(self, panel):
+    def test_intensity_available_with_own_wording(self, panel):
+        """压实现在可调强度，且说明行必须换成压实自己的语义。
+
+        旧版把这一行禁用，理由是"压实要看全部数据"。结果是用户唯一能调的只剩
+        "范围"，而真正需要调的"要不要动大文件"没有入口。现在可调，但**不能**
+        沿用合并碎片的文案 —— "只做最碎的 20%" 在压实里是另一回事。
+        """
         panel._group.button(5).click()
-        assert not panel.intensity_row.isEnabled(), (
-            "压实必须动范围内全部数据，档位不能可用"
+        assert panel.intensity_row.isEnabled(), "压实必须能调强度"
+        assert "压实" in panel.intensity_hint.text() or "压" in panel.intensity_hint.text()
+        panel.set_intensity(Intensity.FAST)
+        assert "多段" in panel.intensity_hint.text(), (
+            "快速档在压实里是「只压多段文件」，文案要说清"
         )
-        assert "留洞" in panel.intensity_hint.text(), (
-            "要说明为什么，否则用户以为功能被禁用了"
-        )
+        panel.set_intensity(Intensity.EXTREME)
+        assert "大文件" in panel.intensity_hint.text()
+        assert panel.extreme_row.isVisibleTo(panel), "极端档要能调大文件下限"
+
+    def test_switching_away_restores_generic_wording(self, panel):
+        panel._group.button(5).click()
+        panel._group.button(1).click()
+        assert panel.intensity_row.isEnabled()
+        assert panel.intensity_hint.text().startswith("强度 · 全部碎片文件")
 
     def test_switching_away_restores_intensity(self, panel):
         panel._group.button(5).click()

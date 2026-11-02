@@ -295,6 +295,12 @@ class TestEngineService:
             svc.stop()
 
     def test_cancel_sets_control(self, tmp_path):
+        """空闲时按停止：只置取消标志，**不**把状态机推进 STOPPING。
+
+        STOPPING 的语义是"正在等当前步骤收尾"。空闲时没有任何步骤在跑，
+        推进去就会永远停在"正在停止…"，而按钮又是灰的 —— 界面看起来死了。
+        （按钮本身在空闲时也是禁用的，这条路只有 API/自动化能走到。）
+        """
         layout = build_layout(256, file_count=6, seed=1)
         dev = MemoryDevice(layout.total_blocks, layout.geometry.block_size)
         populate(dev, layout)
@@ -303,6 +309,20 @@ class TestEngineService:
         try:
             svc.submit(CancelJob())
             assert core.control.cancelled
+            assert core.state is JobState.IDLE
+        finally:
+            svc.stop()
+
+    def test_cancel_during_planning_enters_stopping(self, tmp_path):
+        """规划中按停止：进入 STOPPING，并由规划循环自己收尾成 CANCELLED。"""
+        layout = build_layout(256, file_count=6, seed=1)
+        dev = MemoryDevice(layout.total_blocks, layout.geometry.block_size)
+        populate(dev, layout)
+        vol = make_volume(layout.geometry)
+        svc, core, _sink = self._service(tmp_path, layout, dev, vol)
+        try:
+            core._set_state(JobState.PLANNING, "测试")
+            svc.submit(CancelJob())
             assert core.state is JobState.STOPPING
         finally:
             svc.stop()

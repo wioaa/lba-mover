@@ -13,10 +13,34 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import Callable
 
-from .errors import CancelledError
+from .errors import CancelledError, PlanningCancelled
 
-__all__ = ["RunControl"]
+__all__ = ["RunControl", "CancelCheck", "check_cancel", "CANCEL_CHECK_EVERY"]
+
+#: 长循环里检查取消的间隔（按元素计）。
+#:
+#: 为什么不每个元素都查：``cancel()`` 是一次 Python 调用，几十万文件的卷上
+#: 就是几十万次额外调用；而 256 个一查的响应延迟实测仍是毫秒级。
+#: 为什么不更稀：**规划阶段按停止没反应**曾经是真实缺陷 —— 那些循环里一次
+#: 取消检查都没有，用户只能等整轮算完（大卷上几十秒），而界面上什么提示都没有。
+CANCEL_CHECK_EVERY = 256
+
+#: 取消查询：``lambda: control.cancelled``，``None`` 表示不关心取消。
+CancelCheck = Callable[[], bool]
+
+
+def check_cancel(cancel: CancelCheck | None, index: int) -> None:
+    """协作式取消检查。每 :data:`CANCEL_CHECK_EVERY` 个元素查一次。
+
+    放在控制模块而不是规划器里：扫描过滤、规划、审计三处长循环都要用同一个
+    节流口径，抄三份一定会漂移（一份每 256 查、另一份每 1 查，行为就不同）。
+    """
+    if cancel is None or index % CANCEL_CHECK_EVERY:
+        return
+    if cancel():
+        raise PlanningCancelled("已取消")
 
 
 class RunControl:

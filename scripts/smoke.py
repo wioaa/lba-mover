@@ -31,6 +31,13 @@ if _SRC not in sys.path:
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+# 冒烟必须**自给自足**：它验证的是"默认配置下能不能跑通"，不能被开发机上
+# 真实存在的那份用户配置影响（比如上次手工把策略停在「腾出可用空间」，
+# 冒烟就会因为恢复了这个策略而失败 —— 那不是产品坏了，是验证不干净）。
+# 每个进程一个临时配置，跑完随临时目录一起消失。
+_SMOKE_CONFIG_DIR = tempfile.mkdtemp(prefix="lbamover-smoke-")
+os.environ["LBAMOVER_CONFIG"] = os.path.join(_SMOKE_CONFIG_DIR, "settings.json")
+
 RESULTS: list[tuple[str, bool, str]] = []
 
 

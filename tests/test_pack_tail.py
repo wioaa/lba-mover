@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from lbamover.contract.enums import Strategy
+from lbamover.contract.enums import Intensity, Strategy
 from lbamover.contract.models import Extent, FileFrag, FragReport, Geometry, JobParams
 from lbamover.engine.alloc import IntervalSet
 from lbamover.engine.frag import analyze, free_extents_from_files
@@ -169,8 +169,13 @@ class TestScope:
         assert any("已经贴着卷尾" in n for n in plan.notes)
 
     def test_file_that_cannot_be_moved_is_named(self):
-        """搬不动的文件（目标区被自己另一段占着）要具名报出，不能算成"已完成"。"""
-        report = make_report([f("holey", (900, 20), (960, 20))], total=1000)
+        """真的搬不动（区间里连 n 块的连续空闲都没有）时要具名报出。
+
+        注意判据不是"目标区被自己另一段占着"：那种情况现在会退一步，在已
+        压实区之前找一段连续空闲（2.0.0K）。只有**连退一步都放不下**才算
+        搬不动 —— 这里让 40 块的文件陷在三个 20 块的空洞里。
+        """
+        report = make_report([f("holey", (920, 20), (960, 20))], total=1000)
         plan = build_plan(
             "t", Strategy.PACK_TAIL, report, params=JobParams(pack_span_blocks=100)
         )
@@ -178,6 +183,21 @@ class TestScope:
         assert any("holey" in n for n in plan.notes), (
             f"必须点名是哪个文件没挪动，实际：{plan.notes}"
         )
+
+    def test_file_blocked_by_itself_moves_to_a_hole_before_it(self):
+        """被自己另一段挡住时，退一步放到它前面最近的连续空闲里。
+
+        这是 2.0.0K 修的"压实只对小文件起效"：旧实现遇到这种文件直接跳过。
+        """
+        report = make_report([f("holey", (900, 20), (960, 20))], total=1000)
+        plan = build_plan(
+            "t", Strategy.PACK_TAIL, report, params=JobParams(pack_span_blocks=100)
+        )
+        assert len(plan.ops) == 1
+        op = plan.ops[0]
+        assert op.dst_start == 920, "应落在 [920,960)，既不压自己的源区也不越界"
+        assert not any(e.overlaps(op.dst_extent) for e in op.src_extents)
+        assert any("空隙" in n for n in plan.notes), "留了空隙就必须说出来"
 
     def test_reserved_tail_is_honoured(self):
         """卷尾保留区不能被压实占用 —— 那是给别的策略留的退路。"""
@@ -227,3 +247,88 @@ class TestFragmentedFilesAtTail:
         if plan.ops and any(op.file_id == "wide" for op in plan.ops):
             return  # 能搬就无需报
         assert "wide" in text, f"搬不动的文件必须具名，实际输出：{text}"
+
+
+class TestBigFilesAndIntensity:
+    """2.0.0K：大文件不再被无条件跳过，且压实可以用强度档位收窄范围。
+
+    旧实现只认「紧贴 cursor」这一种落点。大文件要一段 n 块的连续空闲，而
+    紧贴 cursor 的那段通常还被尚未搬走的数据占着 —— 于是大文件一个都搬不动，
+    表现为**"压实只对小文件起效"**。
+    """
+
+    def test_big_file_in_the_middle_is_moved(self):
+        """尾部堆满小文件、中间躺一个大文件：大文件必须也被搬。
+
+        这是"只对小文件起效"的直接回归：按末尾 LCN 降序，小文件先被压实到
+        卷尾，接着大文件的目标段被它们原来的位置占着 —— 旧版在这里 stuck。
+        """
+        smalls = [f(f"s{i}", (700 + i * 10, 8)) for i in range(6)]
+        big = f("big", (100, 200), (400, 200))
+        report = make_report([*smalls, big], total=1200)
+        plan = build_plan("t", Strategy.PACK_TAIL, report)
+        moved = {op.file_id for op in plan.ops}
+        assert "big" in moved, (
+            f"大文件必须能搬，实际搬了 {sorted(moved)}；notes={list(plan.notes)}"
+        )
+        # 搬完之后 big 仍是单段、且不与自己的源区重叠
+        op = next(o for o in plan.ops if o.file_id == "big")
+        assert not any(e.overlaps(op.dst_extent) for e in op.src_extents)
+        assert not validate_plan(plan, 1200)
+
+    def test_gap_is_reported_when_not_tight(self):
+        """放不进紧贴位置时会留空隙 —— 这个量必须报出来，不能假装压得很实。"""
+        report = make_report([f("holey", (900, 20), (960, 20))], total=1000)
+        plan = build_plan(
+            "t", Strategy.PACK_TAIL, report, params=JobParams(pack_span_blocks=100)
+        )
+        assert plan.ops, "这个布局是能搬的（前面有 20 块空洞）"
+        assert any("空隙" in n for n in plan.notes), f"notes={list(plan.notes)}"
+
+    def test_strict_mode_refuses_to_leave_holes(self):
+        """「彻底」档要求紧贴：同样的布局，放不进紧贴位置的文件就不动并说明。"""
+        report = make_report([f("holey", (900, 20), (960, 20))], total=1000)
+        loose = build_plan(
+            "t", Strategy.PACK_TAIL, report, params=JobParams(pack_span_blocks=100)
+        )
+        strict = build_plan(
+            "t",
+            Strategy.PACK_TAIL,
+            report,
+            params=JobParams(pack_span_blocks=100, intensity=Intensity.THOROUGH),
+        )
+        assert loose.ops, "标准档会退一步把它放进前面的空洞"
+        assert strict.ops == (), "严格档不许留空隙"
+        assert any("彻底" in n for n in strict.notes), f"notes={list(strict.notes)}"
+
+    def test_fast_only_moves_fragmented_files(self):
+        """快速档：只搬多段文件。单段文件本来就在自己的位置上，搬它没有收益。"""
+        report = make_report(
+            [f("frag", (100, 20), (600, 20)), f("solid", (300, 40))], total=1200
+        )
+        plan = build_plan(
+            "t", Strategy.PACK_TAIL, report, params=JobParams(intensity=Intensity.FAST)
+        )
+        assert {op.file_id for op in plan.ops} == {"frag"}
+
+    def test_extreme_only_moves_big_files(self):
+        report = make_report(
+            [
+                f("small", (100, 4)),
+                f("big", (400, 300)),
+            ],
+            total=1200,
+        )
+        params = JobParams(intensity=Intensity.EXTREME, extreme_min_mib=1)
+        # 1 MiB / 4096B = 256 块；big 有 300 块，small 只有 4 块
+        plan = build_plan("t", Strategy.PACK_TAIL, report, params=params)
+        assert {op.file_id for op in plan.ops} == {"big"}
+
+    def test_empty_selection_explains_the_threshold(self):
+        """筛不出文件时必须说清是门槛挡的，不能报"没有文件"。"""
+        report = make_report([f("small", (100, 4))], total=1200)
+        params = JobParams(intensity=Intensity.EXTREME, extreme_min_mib=8)
+        plan = build_plan("t", Strategy.PACK_TAIL, report, params=params)
+        assert plan.ops == ()
+        text = " ".join(plan.notes)
+        assert "极端档" in text and "没有" not in text.replace("没有一个", ""), text

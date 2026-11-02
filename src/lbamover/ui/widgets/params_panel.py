@@ -114,7 +114,7 @@ class ParamsPanel(QWidget):
         # 目录输入框**常驻**高级区（不随勾选显隐）：勾选后才发现没地方
         # 放缓存，构造会直接抛 ValueError，用户看到的是"参数非法"这种
         # 完全指不到根因的提示。
-        self.exec_cached = QCheckBox("跨盘缓存")
+        self.exec_cached = QCheckBox("跨盘缓存（磁盘中转）")
         self.exec_cached.setToolTip(
             "把数据先顺序写到工作目录，再顺序写回目标。\n"
             "换的是另一套执行引擎，与盘内搬簇不共享代码。\n"
@@ -125,6 +125,33 @@ class ParamsPanel(QWidget):
         self.cache_dir.setPlaceholderText("缓存工作目录（应指向另一块盘）")
         self.cache_dir.setMinimumHeight(26)
         self.cache_dir.setToolTip("例如 I:/lbamover-cache")
+
+        # -- 内存缓存（固定块池，第三套引擎）--------------------------
+        self.exec_memcached = QCheckBox("内存缓存（内存块池）")
+        self.exec_memcached.setToolTip(
+            "数据不落盘：读进一个**预分配**的内存块池，攒满一块就回写。\n"
+            "收益来自「多个碎读攒成一次大写」，不是「更快」——\n"
+            "它和跨盘缓存一样只用于镜像与内存盘（真机仍走搬簇）。\n"
+            "内存占用是固定的：块数 × 块大小，运行期不增长。"
+        )
+        # 两个数字含义不同：块大小决定一次能凑多长，块数决定能提前读多少。
+        # 合成一个"总大小"旋钮就调不动这个取舍了。
+        self.mem_blocks = _spin(
+            1,
+            4096,
+            32,
+            " 块",
+            "块池里的块数。它同时是内存上限与读写错位深度："
+            "块越多越能提前读，但内存占用线性增长",
+        )
+        self.mem_kib = _spin(
+            16,
+            65536,
+            1024,
+            " KiB",
+            "单块大小。块越大，回写时一次写得越长、目标盘的小写越少；"
+            "代价是攒满一块要等更久",
+        )
 
         # -- 目标区预占 ----------------------------------------------
         self.preoccupy = QCheckBox("预占目标区")
@@ -141,6 +168,9 @@ class ParamsPanel(QWidget):
             self.partial_lock,
             self.exec_cached,
             self.cache_dir,
+            self.exec_memcached,
+            self.mem_blocks,
+            self.mem_kib,
             self.preoccupy,
         )
         self.advanced_toggle = QPushButton("高级参数 ▸")
@@ -149,11 +179,14 @@ class ParamsPanel(QWidget):
         self.advanced_toggle.setChecked(False)
         self.advanced_toggle.clicked.connect(self._toggle_advanced)
         # 先插进表单再统一隐藏。反过来的话 setRowVisible 时这几行还没进
-        # 表单，是空操作 —— 而 insertRow 插入的行默认可见，界面会多出三行，
-        # 压实模式的内容高度直接超出可视区 97px。
-        form.insertRow(form.indexOf(self.partial_lock) + 1, "缓存", self.cache_dir)
+        # 表单，是空操作 —— 而 insertRow 插入的行默认可见，界面会多出几行，
+        # 压实模式的内容高度直接超出可视区。
+        form.insertRow(form.indexOf(self.partial_lock) + 1, "缓存目录", self.cache_dir)
         form.insertRow(form.indexOf(self.cache_dir), "", self.exec_cached)
-        form.insertRow(form.indexOf(self.cache_dir) + 1, "", self.preoccupy)
+        form.insertRow(form.indexOf(self.cache_dir) + 1, "", self.exec_memcached)
+        form.insertRow(form.indexOf(self.exec_memcached) + 1, "内存块数", self.mem_blocks)
+        form.insertRow(form.indexOf(self.mem_blocks) + 1, "块大小", self.mem_kib)
+        form.insertRow(form.indexOf(self.mem_kib) + 1, "", self.preoccupy)
         for widget in self._advanced_rows:
             form.setRowVisible(widget, False)
 
@@ -183,7 +216,10 @@ class ParamsPanel(QWidget):
             widget.valueChanged.connect(self._emit)
         # 复选框与输入框没有 valueChanged，得按各自信号接 —— 混在一个
         # 循环里会在窗口构造期就抛 AttributeError，整个界面起不来。
-        self.exec_cached.toggled.connect(self._emit)
+        self.exec_cached.toggled.connect(self._on_exec_cached)
+        self.exec_memcached.toggled.connect(self._on_exec_memcached)
+        self.mem_blocks.valueChanged.connect(self._emit)
+        self.mem_kib.valueChanged.connect(self._emit)
         self.cache_dir.textChanged.connect(self._emit)
         self.preoccupy.toggled.connect(self._emit)
         self.rate.valueChanged.connect(self._emit)
@@ -191,6 +227,7 @@ class ParamsPanel(QWidget):
         self.ignore_errors.toggled.connect(self._on_ignore_errors_toggled)
         self.partial_lock.toggled.connect(self._emit)
 
+        self._sync_exec_rows()
         self._refresh_budget()
 
     # -- 状态 -------------------------------------------------------------
@@ -212,18 +249,24 @@ class ParamsPanel(QWidget):
                 reserve_tail_blocks=self.reserve.value(),
                 ignore_errors=self.ignore_errors.isChecked(),
                 partial_lock=self.partial_lock.isChecked(),
-                exec_mode=(
-                    ExecMode.CACHED
-                    if self.exec_cached.isChecked()
-                    else ExecMode.NATIVE
-                ),
+                exec_mode=self.exec_mode(),
                 cache_dir=self._cache_dir_text(),
+                mem_cache_blocks=self.mem_blocks.value(),
+                mem_cache_block_kib=self.mem_kib.value(),
                 preoccupy_target=self.preoccupy.isChecked(),
             )
         except ValueError as exc:
             self.error.setText(str(exc))
             self.error.setVisible(True)
             return None
+
+    def exec_mode(self) -> ExecMode:
+        """三种搬运方式互斥。**判定只看勾选**，不猜默认值。"""
+        if self.exec_memcached.isChecked():
+            return ExecMode.MEMCACHED
+        if self.exec_cached.isChecked():
+            return ExecMode.CACHED
+        return ExecMode.NATIVE
 
     def apply(self, params: JobParams) -> None:
         self._suppress = True
@@ -239,12 +282,18 @@ class ParamsPanel(QWidget):
             self.ignore_errors.setChecked(params.ignore_errors)
             self.partial_lock.setChecked(params.partial_lock)
             self.exec_cached.setChecked(params.exec_mode is ExecMode.CACHED)
+            self.exec_memcached.setChecked(params.exec_mode is ExecMode.MEMCACHED)
+            self.mem_blocks.setValue(params.mem_cache_blocks)
+            self.mem_kib.setValue(params.mem_cache_block_kib)
             if params.cache_dir:
                 self.cache_dir.setText(params.cache_dir)
             self.preoccupy.setChecked(params.preoccupy_target)
         finally:
             self._suppress = False
         self._sync_ignore_hint()
+        # 恢复配置后要重算"哪些输入框有意义"：只 apply 不 sync 的话，
+        # 恢复出来的内存缓存参数会是灰的，用户以为存丢了。
+        self._sync_exec_rows()
         self._refresh_budget()
 
     def _cache_dir_text(self) -> str:
@@ -260,6 +309,37 @@ class ParamsPanel(QWidget):
         import tempfile
 
         return os.path.join(tempfile.gettempdir(), "lbamover-cache")
+
+    # -- 三种搬运方式的互斥 ---------------------------------------------
+
+    def _on_exec_cached(self, checked: bool) -> None:
+        if checked and self.exec_memcached.isChecked():
+            # 程序化取消勾选**必须屏蔽信号**：否则会再发一次 toggled，
+            # _emit 在两者都未勾的瞬间造出一份 NATIVE 参数，把刚做的选择
+            # 又冲刷回默认值。
+            self.exec_memcached.blockSignals(True)
+            self.exec_memcached.setChecked(False)
+            self.exec_memcached.blockSignals(False)
+        self._sync_exec_rows()
+        self._emit()
+
+    def _on_exec_memcached(self, checked: bool) -> None:
+        if checked and self.exec_cached.isChecked():
+            self.exec_cached.blockSignals(True)
+            self.exec_cached.setChecked(False)
+            self.exec_cached.blockSignals(False)
+        self._sync_exec_rows()
+        self._emit()
+
+    def _sync_exec_rows(self) -> None:
+        """缓存目录只在「跨盘缓存」下有意义；块池参数只在「内存缓存」下有意义。
+
+        不禁用而是提示：用户会先勾再填。把输入框整行隐藏会让"要填什么"
+        完全不可见，那正是旧版"勾了缓存才发现没地方放"的成因。
+        """
+        self.cache_dir.setEnabled(self.exec_cached.isChecked())
+        self.mem_blocks.setEnabled(self.exec_memcached.isChecked())
+        self.mem_kib.setEnabled(self.exec_memcached.isChecked())
 
     def _toggle_advanced(self) -> None:
         shown = self.advanced_toggle.isChecked()
@@ -281,6 +361,9 @@ class ParamsPanel(QWidget):
             self.reserve,
             self.exec_cached,
             self.cache_dir,
+            self.exec_memcached,
+            self.mem_blocks,
+            self.mem_kib,
             self.preoccupy,
         ):
             widget.setEnabled(not locked)
@@ -320,11 +403,19 @@ class ParamsPanel(QWidget):
     def _refresh_budget(self) -> None:
         chunk_bytes = self.chunk.value() * self._block_size
         budget = chunk_bytes * self.depth.value() * self.concurrency.value()
-        self.budget.setText(
-            f"内存上界 ≈ {fmt_bytes(budget)}"
+        # 块池是**额外**的固定占用，不是流水线缓冲的一部分。不单列出来，
+        # 用户看到的"内存上界"就比实际少几十上百 MiB。
+        pool = 0
+        if self.exec_memcached.isChecked():
+            pool = self.mem_blocks.value() * self.mem_kib.value() * 1024
+        text = (
+            f"内存上界 ≈ {fmt_bytes(budget + pool)}"
             f"（{self.chunk.value()} 块 × {fmt_bytes(self._block_size)}"
-            f" × 深度 {self.depth.value()} × 并发 {self.concurrency.value()}），与卷大小无关"
+            f" × 深度 {self.depth.value()} × 并发 {self.concurrency.value()}"
+            + (f"，另有内存块池 {fmt_bytes(pool)}" if pool else "")
+            + "），与卷大小无关"
         )
+        self.budget.setText(text)
 
 
 def _spin(lo: int, hi: int, val: int, suffix: str, tip: str) -> QSpinBox:

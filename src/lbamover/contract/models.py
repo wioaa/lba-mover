@@ -747,6 +747,14 @@ class JobParams:
     #: 缓存工作目录。``CACHED`` 模式下必须填，且**应该指向另一块盘**：
     #: 指向同一块盘时总 IO 翻倍而顺序性不会变好，纯亏。
     cache_dir: str = ""
+    #: 内存缓存的块数（``MEMCACHED`` 模式）。固定分配这么多块，用完不再增长。
+    #:
+    #: 为什么是"块数 × 块大小"两个旋钮而不是一个总字节数：攒块的**粒度**
+    #: 决定回写时一次能凑多长（块越大，目标盘的小写越少），而**块数**决定
+    #: 能提前读多少。两个数回答的是两个问题，合成一个就调不动了。
+    mem_cache_blocks: int = 32
+    #: 内存缓存单块大小（KiB）。默认 1 MiB，接近 NTFS 单次大 IO 的甜点。
+    mem_cache_block_kib: int = 1024
     #: 整理强度：与策略正交的「动多少文件」维度。默认 ``STANDARD`` 就是
     #: 2.0.0H 之前的行为（只动碎片文件），所以升级本身不改变任何结果。
     intensity: Intensity = Intensity.STANDARD
@@ -791,6 +799,17 @@ class JobParams:
             # 构造期就炸，而不是跑到一半才发现没地方放缓存 —— 那时候
             # 已经在写盘了，中途停止会留下一个半搬运的卷。
             errors.append("缓存搬运必须指定 cache_dir")
+        if not (1 <= self.mem_cache_blocks <= 4096):
+            errors.append("mem_cache_blocks 必须在 1..4096")
+        if not (16 <= self.mem_cache_block_kib <= 65536):
+            errors.append("mem_cache_block_kib 必须在 16..65536（KiB）")
+        elif self.mem_cache_blocks * self.mem_cache_block_kib > 8 * 1024 * 1024:
+            # 上限 8 GiB。没有这条的话，手滑把两个数都拉到最大就是一串
+            # MemoryError，而且是在已经写过一些块之后 —— 比构造期报错糟得多。
+            errors.append(
+                f"内存缓存总量 {self.mem_cache_blocks * self.mem_cache_block_kib / 1024:.0f} MiB "
+                "超过 8 GiB 上限"
+            )
         if not (1 <= self.extreme_min_mib <= 1 << 20):
             errors.append("extreme_min_mib 必须在 1..1048576")
         if errors:
@@ -808,6 +827,19 @@ class JobParams:
     def buffer_budget_bytes(self) -> int:
         """流水线的总内存上界（字节），不含 Python 对象开销。"""
         return self.chunk_bytes * self.queue_depth * self.concurrency
+
+    @property
+    def mem_cache_bytes(self) -> int:
+        """内存缓存块池的固定占用（字节）。与 ``buffer_budget_bytes`` **相加**，
+        才是这个任务真正的内存上界 —— 少算这一块，用户在"内存上界"里看到的
+        数字就比实际少几百 MiB。``MEMCACHED`` 之外的模式下它是 0。"""
+        if self.exec_mode is not ExecMode.MEMCACHED:
+            return 0
+        return self.mem_cache_blocks * self.mem_cache_block_kib * 1024
+
+    @property
+    def total_memory_budget_bytes(self) -> int:
+        return self.buffer_budget_bytes + self.mem_cache_bytes
 
     def with_overrides(self, **kw: Any) -> "JobParams":
         return replace(self, **kw)

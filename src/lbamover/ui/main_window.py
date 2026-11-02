@@ -52,6 +52,7 @@ from ..engine.catalog import StaticCatalog, UnsupportedCatalog, open_ntfs_catalo
 from ..engine.engine import EngineCore, EngineService
 from ..engine.synth import apply_plan, build_layout, populate, verify
 from ..platform.volumes import enumerate_volumes
+from ..settings import AppSettings, SettingsStore
 from .bridge import EngineBridge
 from .format import fmt_bytes, fmt_count, fmt_percent
 from .theme import DARK, LIGHT, Palette, apply_theme
@@ -92,6 +93,13 @@ def confirmed(ret) -> bool:
 DEMO_DEVICE_PATH = "memory://lbamover-demo"
 DEMO_BLOCK_BUDGET = 8192  # 32 MiB @ 4 KiB，足够排出十几段碎片
 
+#: 配置保存的防抖间隔（毫秒）。
+#:
+#: 拖一次并发数的滑块会连发十几个 ``valueChanged``，每次都落盘既慢又毫无
+#: 意义。800ms 足够短 —— 进程被强杀也只丢最近一次改动；也足够长 ——
+#: 一次拖动只在松手后写一次。关窗时另有强制落盘（见 ``closeEvent``）。
+SAVE_DEBOUNCE_MS = 800
+
 
 class MainWindow(QMainWindow):
     def __init__(self, palette: Palette = DARK, parent: QWidget | None = None) -> None:
@@ -122,6 +130,24 @@ class MainWindow(QMainWindow):
         self._sel_stale = 0
         self._id_index: dict[str, object] | None = None
 
+        # -- 配置持久化 --
+        # 保存时机有三处，缺一不可：
+        #   1. 改动后 800ms 防抖（_schedule_save）—— 崩了也只丢最后一次改动；
+        #   2. 关窗时强制落盘（closeEvent）—— 正常退出一定写成功；
+        #   3. 不做"只在退出时写"—— 那样崩一次就回到默认值，正是要修的问题。
+        self._store = SettingsStore()
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(SAVE_DEBOUNCE_MS)
+        self._save_timer.timeout.connect(self._save_settings)
+        #: 恢复配置期间不触发保存：否则恢复动作本身会被当成"用户改了设置"
+        self._restoring = False
+        #: 保存失败的说明只提示一次，避免每 800ms 刷一行
+        self._save_error = ""
+        #: 上次的目标卷 + 待恢复的"按卷换算"参数（reclaim/pack 需要块大小）
+        self._pending_volume_path = ""
+        self._restore_spans = False
+
         # -- 引擎 --
         self.bridge = EngineBridge(self)
         # 真机卷走 NTFS 文件表解析（每次扫描临时打开、用完即关）；
@@ -135,6 +161,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self._wire()
+        self._restore_settings()
         self.service.start()
         QTimer.singleShot(0, self._load_volumes)
         QTimer.singleShot(120, self._probe_capabilities)
@@ -352,6 +379,21 @@ class MainWindow(QMainWindow):
         self.bridge.jobFinished.connect(self._on_job_finished)
         self.log_view.diagnoseRequested.connect(self._copy_diagnostic)
 
+        # 配置持久化的触发点：任何"用户改了一个设置"的信号都走同一条防抖。
+        # 逐个信号连（而不是重写控件），是因为控件的 setChecked/setValue 也
+        # 会发同样的信号 —— 那样恢复配置的过程会反过来触发保存。
+        for signal in (
+            self.strategy_panel.strategyChanged,
+            self.strategy_panel.intensityChanged,
+            self.strategy_panel.extremeMinChanged,
+            self.strategy_panel.reclaimChanged,
+            self.strategy_panel.packChanged,
+            self.params_panel.paramsChanged,
+            self.scope_panel.scopeChanged,
+            self.picker.volumeSelected,
+        ):
+            signal.connect(self._schedule_save)
+
     # ------------------------------------------------------------------
     # 目标与参数
     # ------------------------------------------------------------------
@@ -373,6 +415,19 @@ class MainWindow(QMainWindow):
         # 界面显示的盘和实际要动的盘不一致，是宁可崩也不能出现的情况。
         anchor = self._volume or self.picker.current()
         preselect = None
+        if anchor is None and self._pending_volume_path:
+            # 启动时优先回到上次的卷。它可能已经不在了（拔了移动硬盘），
+            # 那就退回第一块盘并说一声，而不是静默换目标 —— 静默换目标
+            # 意味着用户以为在整理 D:，实际动的是 C:。
+            for i, v in enumerate(all_volumes):
+                if v.device_path == self._pending_volume_path:
+                    preselect = i
+                    break
+            if preselect is None:
+                self.log_view.append(
+                    LogLevel.WARNING,
+                    f"上次的目标卷 {self._pending_volume_path} 不在本机，已改为第一个可用卷",
+                )
         if anchor is not None:
             for i, v in enumerate(all_volumes):
                 if v.device_path == anchor.device_path:
@@ -402,6 +457,18 @@ class MainWindow(QMainWindow):
         self.strategy_panel.pack.set_geometry(
             vol.geometry.block_size, vol.geometry.block_count
         )
+        if self._restore_spans:
+            # 恢复配置里那两个"以块为单位"的界面值。必须在 set_geometry 之后：
+            # 它们会被卷容量夹紧，夹紧本身也要反映到 _params 里（走 _merge_reclaim）。
+            self._restoring = True
+            try:
+                self.strategy_panel.reclaim.set_values(
+                    self._params.reclaim_blocks, self._params.reclaim_at
+                )
+                self.strategy_panel.pack.set_blocks(self._params.pack_span_blocks)
+            finally:
+                self._restoring = False
+                self._restore_spans = False
         params = self.params_panel.current()
         if params is not None:
             self._params = self._merge_reclaim(params)
@@ -686,10 +753,19 @@ class MainWindow(QMainWindow):
         return confirmed(ret)
 
     def _on_stop(self) -> None:
+        # 两个阶段的代价完全不同，不能共用一句"当前 chunk 会写完再退出"：
+        # 规划阶段根本没有 chunk，而用户真正要知道的是"会不会写坏东西"。
+        if self.core.state in (JobState.SCANNING, JobState.PLANNING):
+            text = (
+                "当前正在扫描 / 规划，还没有写入任何数据。\n\n"
+                "停止会丢弃这次结果，回到可以重新扫描的状态。确定停止？"
+            )
+        else:
+            text = "停止后当前 chunk 会写完再退出，断点会保留以便续做。确定停止？"
         ret = QMessageBox.question(
             self,
             "停止任务",
-            "停止后当前 chunk 会写完再退出，断点会保留以便续做。确定停止？",
+            text,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -934,6 +1010,89 @@ class MainWindow(QMainWindow):
         )
 
     # ------------------------------------------------------------------
+    # 配置持久化
+    # ------------------------------------------------------------------
+
+    def _restore_settings(self) -> None:
+        """启动时恢复上次的配置。**任何异常都不能挡住启动。**
+
+        配置是便利功能：读不了、坏了、字段非法，都只在日志里说一声，界面
+        照常起来。反过来（启动失败）等于用户改坏一个数字就打不开程序。
+        """
+        loaded = self._store.load()
+        st = loaded.settings
+        self._restoring = True
+        try:
+            self._params = st.params
+            self._strategy = st.strategy
+            self.params_panel.apply(st.params)
+            self.strategy_panel.set_strategy(st.strategy)
+            self.strategy_panel.set_intensity(st.params.intensity)
+            self.strategy_panel.set_extreme_min_mib(st.params.extreme_min_mib)
+            # 可用空间整理 / 压实范围用的是"块数"，换算要块大小 —— 现在没有
+            # 卷，留到第一次 _on_volume_selected 里补。不补的话，恢复出来的
+            # 参数会跟着首个卷的几何被重新按默认值算一遍（静默丢用户设置）。
+            self._restore_spans = True
+            self._pending_volume_path = st.volume_path
+            if not st.left_panel_visible:
+                self.left_panel.setVisible(False)
+                self.btn_left.setChecked(False)
+                self._left_user_hidden = True
+            if st.window_width >= self.minimumWidth() and st.window_height >= self.minimumHeight():
+                self.resize(st.window_width, st.window_height)
+        finally:
+            self._restoring = False
+
+        if loaded.recovered:
+            self.log_view.append(
+                LogLevel.WARNING,
+                "上次的配置没能读出来，已按默认值启动（原文件已备份，见日志明细）",
+            )
+        for note in loaded.notes:
+            self.log_view.append(LogLevel.WARNING, f"配置：{note}")
+        if loaded.missing:
+            self.log_view.append(
+                LogLevel.INFO,
+                f"首次启动，配置将保存到 {self._store.path}",
+            )
+
+    def _schedule_save(self, *_args) -> None:
+        """改动后延迟落盘。``*_args`` 是信号带过来的值（策略、参数对象…），不用。"""
+        if self._restoring:
+            return
+        self._save_timer.start()
+
+    def _settings_snapshot(self) -> AppSettings:
+        return AppSettings(
+            strategy=self._strategy,
+            params=self._params,
+            volume_path=self._volume.device_path if self._volume is not None else "",
+            # isVisible() 依赖祖先窗口是否已显示，关窗路径上不可靠；
+            # isHidden() 只反映本控件的显隐意图。
+            left_panel_visible=not self.left_panel.isHidden(),
+            window_width=self.width(),
+            window_height=self.height(),
+        )
+
+    def _save_settings(self) -> None:
+        """立刻落盘。失败只提示一次 —— 每 800ms 刷一行同样的错误没人看得下去。"""
+        self._save_timer.stop()
+        error = self._store.save(self._settings_snapshot())
+        if not error:
+            if self._save_error:
+                self._save_error = ""
+                self.log_view.append(LogLevel.INFO, "配置已恢复保存")
+            return
+        if error == self._save_error:
+            return
+        self._save_error = error
+        self.log_view.append(
+            LogLevel.WARNING,
+            f"配置保存失败：{error}",
+            "设置只是便利功能，不影响扫描与整理；下次改配置会再试一次",
+        )
+
+    # ------------------------------------------------------------------
     # 杂项
     # ------------------------------------------------------------------
 
@@ -942,6 +1101,7 @@ class MainWindow(QMainWindow):
         self.left_panel.setVisible(visible)
         self.btn_left.setChecked(visible)
         self._left_user_hidden = not visible
+        self._schedule_save()
 
     def _probe_capabilities(self) -> None:
         try:
@@ -1024,6 +1184,9 @@ class MainWindow(QMainWindow):
             if not confirmed(ret):
                 event.ignore()
                 return
+        # 先落配置再停引擎：``service.stop`` 最长等 5 秒，而"这次的设置"
+        # 是关窗后唯一还需要活下来的东西 —— 不能排在可能卡住的步骤后面。
+        self._save_settings()
         try:
             self.service.stop(timeout=5.0)
         except Exception:  # noqa: BLE001

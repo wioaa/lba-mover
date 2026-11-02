@@ -41,6 +41,7 @@ __all__ = [
     "STRATEGY_SHORT",
     "STRATEGY_ORDER",
     "INTENSITY_HELP",
+    "PACK_TAIL_INTENSITY_HELP",
     "INTENSITY_ORDER",
     "DEFAULT_INTENSITY",
 ]
@@ -95,6 +96,19 @@ INTENSITY_HELP: dict[Intensity, str] = {
     Intensity.EXTREME: "只动大文件，按体积从大到小依次归位",
 }
 
+#: 压实模式下强度的含义**与其它模式不同**，说明行必须换成这一套。
+#:
+#: 其它模式里强度回答"挑多少文件才有收益"，压实回答"为了完整性愿意付多少
+#: 搬运量"。这不是文案差异：同一个"快速"在合并碎片里是"只做前 20%"，
+#: 在压实里是"只搬多段文件"——沿用原文案会让用户按错误的预期点按钮。
+PACK_TAIL_INTENSITY_HELP: dict[Intensity, str] = {
+    Intensity.FAST: "只压多段（碎片）文件 —— 只有它们在自身地址空间里留洞",
+    Intensity.STANDARD: "压实范围内全部数据，贴不紧时改放前面最近的空位",
+    Intensity.DEEP: "同「标准」：压实不区分文件大小，多搬大文件只会更慢",
+    Intensity.THOROUGH: "全部数据，且必须紧贴 —— 放不进去的文件就不动，不留空隙",
+    Intensity.EXTREME: "只压不小于「大文件下限」的文件，一次性贴到卷尾",
+}
+
 #: 切模式时带出的默认强度。**不是绑定**——切完仍可自由改档位，这里只负责
 #: 让"切换到某个模式"的初始结果符合直觉：
 #: ``COMPACT`` 的旧语义是"全部文件都往卷首挤"，对应彻底档；
@@ -110,7 +124,13 @@ DEFAULT_INTENSITY: dict[Strategy, Intensity] = {
 
 #: 这几档不看强度：两个约束式任务（必须动到范围内的**全部**数据，挑一部
 #: 分就等于没做），一个不产生操作。
-_INTENSITY_FREE = (Strategy.RECLAIM, Strategy.PACK_TAIL, Strategy.ANALYZE_ONLY)
+#:
+#: ``PACK_TAIL`` **不在这里**（2.0.0K 起）。旧版把它一并禁用，理由是"压实
+#: 要看范围内全部数据"。但实测下来，那个禁用让用户唯一能调的只剩"范围"，
+#: 而真正需要调的恰恰是"要不要动大文件" —— 大文件贴不上去的时候，用户
+#: 没有别的入口。现在它在压实下的语义另行定义，见
+#: :data:`PACK_TAIL_INTENSITY_HELP`。
+_INTENSITY_FREE = (Strategy.RECLAIM, Strategy.ANALYZE_ONLY)
 
 
 class ReclaimPanel(QWidget):
@@ -487,8 +507,6 @@ class StrategyPanel(QWidget):
             self.intensity_row.setEnabled(False)
             if strategy is Strategy.RECLAIM:
                 why = "强度 · 这项任务必须搬开所有挡路文件，档位不适用"
-            elif strategy is Strategy.PACK_TAIL:
-                why = "强度 · 压实要看范围内的全部数据，只压一部分就会留洞"
             else:
                 why = "强度 · 只分析不搬任何文件，档位不适用"
             self.intensity_hint.setText(why)
@@ -496,7 +514,13 @@ class StrategyPanel(QWidget):
             return
 
         self.intensity_row.setEnabled(True)
-        self.intensity_hint.setText(f"强度 · {INTENSITY_HELP[intensity]}")
+        if strategy is Strategy.PACK_TAIL:
+            # 压实有自己的一套档位语义，用通用文案会让人按错预期点按钮
+            self.intensity_hint.setText(
+                f"强度 · {PACK_TAIL_INTENSITY_HELP[intensity]}"
+            )
+        else:
+            self.intensity_hint.setText(f"强度 · {INTENSITY_HELP[intensity]}")
         self.extreme_row.setVisible(intensity is Intensity.EXTREME)
 
     def setEnabled(self, enabled: bool) -> None:  # noqa: N802 - Qt 命名

@@ -41,6 +41,8 @@ from typing import Iterable, Sequence
 from ..contract.enums import FreeSpaceSide, Intensity, Strategy
 from ..contract.models import Extent, FragReport, JobParams, MoveOp, Plan
 from .alloc import FreeSpaceMap, IntervalSet
+from .control import CANCEL_CHECK_EVERY, CancelCheck, check_cancel
+from .errors import PlanningCancelled
 
 __all__ = [
     "build_plan",
@@ -50,6 +52,7 @@ __all__ = [
     "FAST_RATIO",
     "FAST_MAX_FILES",
     "DEEP_SMALL_FILE_MIB",
+    "CANCEL_CHECK_EVERY",
 ]
 
 #: 「快速」档只做收益最好的这一比例。20% 是按"少数文件占掉大部分碎片收益"
@@ -149,8 +152,14 @@ def build_plan(
     *,
     file_ids: Sequence[str] = (),
     params: JobParams | None = None,
+    cancel: CancelCheck | None = None,
 ) -> Plan:
-    """生成执行计划。**不抛异常**——不可行时返回 ``feasible=False`` 并带原因。"""
+    """生成执行计划。**不抛异常**——不可行时返回 ``feasible=False`` 并带原因。
+
+    唯一的例外是取消：``cancel()`` 返回真时抛 :class:`PlanningCancelled`。
+    取消不是"计划不可行"，把它伪装成一份空计划会让界面显示"没有需要整理的
+    文件"，用户会以为盘很健康。
+    """
     params = params or JobParams()
     geometry = report.geometry
 
@@ -164,10 +173,10 @@ def build_plan(
         )
 
     if strategy is Strategy.RECLAIM:
-        return _build_reclaim_plan(job_id, report, params, file_ids)
+        return _build_reclaim_plan(job_id, report, params, file_ids, cancel=cancel)
 
     if strategy is Strategy.PACK_TAIL:
-        return _build_pack_tail_plan(job_id, report, params, file_ids)
+        return _build_pack_tail_plan(job_id, report, params, file_ids, cancel=cancel)
 
     selected, missing = select_files(
         report, strategy, file_ids, intensity=params.intensity, params=params
@@ -199,7 +208,8 @@ def build_plan(
 
     # 尚未搬走的文件占的块 —— 目标区绝对不能落在这里
     blocked = IntervalSet()
-    for f in ordered:
+    for i, f in enumerate(ordered):
+        check_cancel(cancel, i)
         blocked.add_many(f.extents)
 
     tail_limit = geometry.block_count - max(0, params.reserve_tail_blocks)
@@ -207,7 +217,8 @@ def build_plan(
     reasons: list[str] = []
     cursor = 0
 
-    for f in ordered:
+    for i, f in enumerate(ordered):
+        check_cancel(cancel, i)
         # 此刻 blocked 里还包含自己的源区 —— 分配时正好把它当禁区（不能写到
         # 自己还没读完的地方），分配完再摘掉。这样不用每个文件复制一份几千
         # 个区间的 avoid 集合（那是 O(文件数 × 区间数)）。
@@ -288,11 +299,43 @@ def _empty_reason(report: FragReport, params: JobParams) -> str:
     return "没有需要整理的文件（未发现碎片）"
 
 
+#: 压实模式下各强度档位「参与重排哪些文件」。
+#:
+#: 压实的强度语义与其它模式**不一样**，必须直说：其它模式回答"挑多少文件
+#: 才有收益"，而压实回答"愿不愿意为了完整性付出搬运量"。
+#:
+#: * ``FAST``     只搬多段文件 —— 只有它们在自己的地址空间里制造空隙；
+#: * ``STANDARD`` 范围内全部数据（旧行为，默认）；
+#: * ``DEEP``     同 ``STANDARD``：压实没有"小文件"这个维度，多搬大文件
+#:                并不更彻底，只会更慢；
+#: * ``THOROUGH`` 范围内全部数据，且**落点必须紧贴**（宁可搬不动也不留空隙）；
+#: * ``EXTREME``  只搬 ≥「大文件下限」的文件，把它们一次性贴到卷尾。
+#:
+#: ``DEEP`` 与 ``STANDARD`` 等价是刻意的：与其编一个假的差异，不如让用户在
+#: 说明行里看到"这两档在压实下一样"。见 ``ui/widgets/strategy_panel.py``。
+_PACK_TAIL_STRICT = frozenset({Intensity.THOROUGH})
+
+
+def _pack_tail_pool(files: list, params: JobParams) -> list:
+    """按强度档位筛出参与压实的文件。"""
+    intensity = params.intensity
+    if intensity is Intensity.FAST:
+        return [f for f in files if f.run_count > 1]
+    if intensity is Intensity.EXTREME:
+        limit = max(1, params.extreme_min_mib) * 1024 * 1024
+        size = max(1, params.block_size)
+        return [f for f in files if f.total_blocks * size >= limit]
+    # STANDARD / DEEP / THOROUGH：全部数据。THOROUGH 的差别在落点策略上。
+    return files
+
+
 def _build_pack_tail_plan(
     job_id: str,
     report: FragReport,
     params: JobParams,
     file_ids: Sequence[str],
+    *,
+    cancel: CancelCheck | None = None,
 ) -> Plan:
     """尾部压实：把卷尾一段内的数据紧贴卷尾重排。
 
@@ -308,13 +351,18 @@ def _build_pack_tail_plan(
       正好给下一个；
     * 文件已经单段且末尾正好贴着 ``cursor``，说明它就在正确位置，只需把
       ``cursor`` 前移；
-    * 否则把它放到 ``[cursor - n, cursor)``。这一段在**规划时**就必须是空的
-      （逐个检查），所以执行时目标必然可用，不需要串行复用，也不需要
-      拓扑排序 —— 这是刻意选的：两阶段搬运在真机上出错后几乎无法回滚。
+    * 否则先试 ``[cursor - n, cursor)``（紧贴，压实质量最好）；
+    * 紧贴放不下时**退一步**：在已压实区之前找一段最靠后的连续空闲。这一步
+      是 2.0.0K 加的，原因是旧实现直接跳过 —— 大文件需要一段 n 块的连续
+      空洞，而卷尾附近几乎不可能有，于是"压实只对小文件起效"；
+    * 连退一步也放不下（真的没有 n 块的连续空闲）才记为搬不动。
 
-    碰到搬不动的文件（目标区被自己或别的东西挡住）就把 ``cursor`` 退到它的
-    起点，当作"它已就位"，继续往前压。压不动的部分会在 ``notes`` 里报出来，
-    而不是假装压实成功。
+    **为什么"退一步"是安全的**：落点仍然只从 ``FreeSpaceMap`` 里取，而
+    "尚未搬走的文件"的块根本不在自由表里，所以它不可能覆盖还没读的数据。
+    这一点和 ``covers`` 检查等价，只是不要求落在紧贴位置。
+
+    **代价**是压实区内部会留下空隙。空隙量会算进 ``notes`` 并如实报出来 ——
+    压实本来就是一个"尽量"的动作，留了洞还说"已压实"才是撒谎。
     """
     geometry = report.geometry
     total = geometry.block_count
@@ -347,8 +395,25 @@ def _build_pack_tail_plan(
             notes=(f"卷尾 {_mib(span, geometry)} 范围内没有文件，无需压实",),
         )
 
+    # 强度筛选放在"范围内"之后：先按范围收窄，再按档位收窄，两个条件都要满足。
+    selected = _pack_tail_pool(in_span, params)
+    if not selected:
+        skipped = len(in_span)
+        return Plan(
+            job_id=job_id,
+            strategy=Strategy.PACK_TAIL,
+            ops=(),
+            feasible=True,
+            notes=(
+                f"卷尾 {_mib(span, geometry)} 范围内有 {skipped} 个文件，"
+                f"但没有一个符合「{params.intensity.label}」档的筛选条件"
+                f"（极端档只动 ≥{max(1, params.extreme_min_mib)} MiB 的文件，"
+                f"快速档只动多段碎片文件）。换成「标准」档可压实全部数据",
+            ),
+        )
+
     ordered = sorted(
-        in_span, key=lambda f: (f.extents[-1].end, f.file_id), reverse=True
+        selected, key=lambda f: (f.extents[-1].end, f.file_id), reverse=True
     )
     free = FreeSpaceMap(report.free_extents, capacity=total)
 
@@ -359,11 +424,18 @@ def _build_pack_tail_plan(
     moved_blocks = 0
     already = 0
     stuck: list[str] = []
+    loose = 0
+    loose_sample: list[str] = []
+    holes = 0
+    strict = params.intensity in _PACK_TAIL_STRICT
 
     if missing:
         notes.append(f"{len(missing)} 个指定文件已不在本次扫描结果里，已跳过")
+    if strict:
+        notes.append("「彻底」档要求落点紧贴已压实区，放不进紧贴位置的整份文件不动")
 
-    for f in ordered:
+    for i, f in enumerate(ordered):
+        check_cancel(cancel, i)
         n = f.total_blocks
         f_start = f.extents[0].start
         f_end = f.extents[-1].end
@@ -382,39 +454,78 @@ def _build_pack_tail_plan(
             )
             break
 
-        if not free.covers(dst, n):
-            # 目标段不空（多半是文件自己的另一段横跨过来）。当作它已就位，
-            # 光标退到它前面继续 —— 压不动的那块会在下面报出来。
-            stuck.append(f.path)
-            cursor = min(cursor, f_start)
+        if free.covers(dst, n):
+            free.reserve(Extent(dst, n))
+            free.release(f.extents)
+            ops.append(
+                MoveOp(
+                    op_id=len(ops),
+                    file_id=f.file_id,
+                    path=f.path,
+                    src_extents=tuple(f.extents),
+                    dst_start=dst,
+                    verify=params.verify,
+                )
+            )
+            moved_blocks += n
+            cursor = dst
             continue
 
-        free.reserve(Extent(dst, n))
-        free.release(f.extents)
-        ops.append(
-            MoveOp(
-                op_id=len(ops),
-                file_id=f.file_id,
-                path=f.path,
-                src_extents=tuple(f.extents),
-                dst_start=dst,
-                verify=params.verify,
+        # 紧贴放不下。多见于大文件：它要一段 n 块的**连续**空闲，而紧贴
+        # cursor 的那一段被前面的文件占着（那些文件按顺序还没轮到）。
+        # 旧实现在这里直接跳过，于是大文件永远搬不动 —— 表现为"压实只对
+        # 小文件起效"。退一步：在 [start_bound, cursor) 里找最靠后的连续空闲。
+        if not strict:
+            fallback = free.allocate(
+                n, from_tail=True, min_start=start_bound, max_end=cursor
             )
-        )
-        moved_blocks += n
-        cursor = dst
+            if fallback is not None:
+                gap = cursor - (fallback + n)
+                holes += max(0, gap)
+                loose += 1
+                if len(loose_sample) < 3:
+                    loose_sample.append(f.path)
+                free.release(f.extents)
+                ops.append(
+                    MoveOp(
+                        op_id=len(ops),
+                        file_id=f.file_id,
+                        path=f.path,
+                        src_extents=tuple(f.extents),
+                        dst_start=fallback,
+                        verify=params.verify,
+                    )
+                )
+                moved_blocks += n
+                # **游标不前移**：fallback 可能远在更前面，把游标拉过去会让
+                # 中间所有数据失去"往尾部聚"的约束，压实就退化成乱搬。
+                # 那块空隙留给后面更小的文件去填（它们优先紧贴 cursor）。
+                continue
+
+        # 走到这里说明：紧贴放不下，且（严格档或）连退一步也没找到 n 块的
+        # 连续空闲。当作它已就位，游标退到它前面继续。
+        stuck.append(f.path)
+        cursor = min(cursor, f_start)
+        continue
 
     if already:
         notes.append(f"{already} 个文件已经贴着卷尾，不需要动")
+    if loose:
+        notes.append(
+            f"{loose} 个文件放不进紧贴位置（多为大文件，紧贴段被尚未搬走的数据占着），"
+            f"已改为落在前面最近的连续空闲里（例如 {loose_sample[0]}）；"
+            f"压实区内部因此留下约 {_mib(holes, geometry)} 空隙"
+        )
     if stuck:
         notes.append(
-            f"{len(stuck)} 个文件因为自身分段横跨目标区而没挪动（例如 {stuck[0]}），"
+            f"{len(stuck)} 个文件既找不到紧贴位置、也没有足够大的连续空闲（例如 {stuck[0]}），"
             f"它们会在压实数据区里留下空隙"
         )
     if ops:
         notes.append(
-            f"压实后数据区从 {cursor} 到 {tail_limit} 共 "
+            f"压实后紧密段从 {cursor} 到 {tail_limit} 共 "
             f"{_mib(tail_limit - cursor, geometry)}，其前方为连续空闲"
+            + (f"（内部另有约 {_mib(holes, geometry)} 空隙）" if holes else "")
         )
         if cursor > start_bound:
             notes.append(
@@ -526,6 +637,8 @@ def _build_reclaim_plan(
     report: FragReport,
     params: JobParams,
     file_ids: Sequence[str],
+    *,
+    cancel: CancelCheck | None = None,
 ) -> Plan:
     """「可用空间整理」：把目标区里挡路的文件全部搬出去，让该区变成连续空闲。
 
@@ -630,7 +743,8 @@ def _build_reclaim_plan(
     ops: list[MoveOp] = []
     stuck: list[str] = []
     cursor = 0
-    for f in ordered:
+    for i, f in enumerate(ordered):
+        check_cancel(cancel, i)
         n = f.total_blocks
         dst = free.allocate(
             n, avoid=blocked, from_tail=from_tail, min_start=min_start, max_end=max_end

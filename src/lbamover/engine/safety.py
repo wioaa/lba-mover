@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from ..contract.enums import Strategy
 from ..contract.models import FileFrag, FragReport, Plan, VolumeInfo
 from ..ntfs.record import FILE_ATTR_SYSTEM
+from .control import CancelCheck, check_cancel
 
 __all__ = [
     "ProtectionPolicy",
@@ -122,11 +123,22 @@ class ProtectionPolicy:
                 return f"受保护目录（{prefix}）"
         return None
 
-    def screen(self, files: tuple[FileFrag, ...]) -> tuple[tuple[FileFrag, ...], list[tuple[FileFrag, str]]]:
-        """把文件分成「可动」「拦截」两组。"""
+    def screen(
+        self,
+        files: tuple[FileFrag, ...],
+        cancel: CancelCheck | None = None,
+    ) -> tuple[tuple[FileFrag, ...], list[tuple[FileFrag, str]]]:
+        """把文件分成「可动」「拦截」两组。
+
+        ``cancel`` 是规划阶段的取消出口：这里要遍历**整卷**文件（百万级，
+        逐个做字符串归一化与前缀比对），实测是规划里最贵的一段。没有取消
+        检查的话，用户按了停止要等它跑完才有反应 —— 而那正是"停止按钮在
+        规划阶段无效"的一半原因（另一半是按钮本身是禁用的）。
+        """
         allowed: list[FileFrag] = []
         blocked: list[tuple[FileFrag, str]] = []
-        for f in files:
+        for i, f in enumerate(files):
+            check_cancel(cancel, i)
             why = self.verdict(f)
             if why is None:
                 allowed.append(f)
@@ -165,7 +177,9 @@ class PlanAudit:
 DEFAULT_POLICY = ProtectionPolicy()
 
 
-def _audit_reclaim_region(plan: Plan, report: FragReport) -> list[str]:
+def _audit_reclaim_region(
+    plan: Plan, report: FragReport, cancel: CancelCheck | None = None
+) -> list[str]:
     """复核「目标区最后是不是真的全空」。
 
     三条缺一不可：挡路的文件都搬走、目标区没有搬不动的占用、没有任何
@@ -176,7 +190,8 @@ def _audit_reclaim_region(plan: Plan, report: FragReport) -> list[str]:
     problems: list[str] = []
     moved = {op.file_id for op in plan.ops}
     left: list[str] = []
-    for f in report.files:
+    for i, f in enumerate(report.files):
+        check_cancel(cancel, i)
         if not f.extents:
             continue
         if f.extents[-1].end <= target.start or f.extents[0].start >= target.end:
@@ -207,6 +222,7 @@ def audit_plan(
     policy: ProtectionPolicy | None = None,
     *,
     volume: VolumeInfo | None = None,
+    cancel: CancelCheck | None = None,
 ) -> PlanAudit:
     """执行前复核：计划里有没有受保护对象、搬完还剩多少空间。
 
@@ -223,7 +239,8 @@ def audit_plan(
             reasons.append(v)
 
     by_id = {f.file_id: f for f in report.files}
-    for op in plan.ops:
+    for i, op in enumerate(plan.ops):
+        check_cancel(cancel, i)
         target = by_id.get(op.file_id)
         if target is None:
             # 计划里的文件在报告里找不到 = 计划过期，不能凭它写盘
@@ -239,7 +256,7 @@ def audit_plan(
     # 「可用空间整理」多一道几何复核：它卖的是"这几块会空出来"这个承诺，
     # 承诺没兑现等于白搬几十 GB。规划器已经算过，但那依赖它自己不出错。
     if plan.strategy is Strategy.RECLAIM and plan.reclaim_extent is not None:
-        reasons.extend(_audit_reclaim_region(plan, report))
+        reasons.extend(_audit_reclaim_region(plan, report, cancel))
 
     if plan.strategy is Strategy.RECLAIM:
         # 只是把数据挪位，空闲总量不变；"搬出去的文件要有地方落"这个峰值

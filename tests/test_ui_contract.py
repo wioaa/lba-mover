@@ -191,6 +191,28 @@ class TestControlBar:
         assert not bar.btn_scan.isEnabled()
         assert "扫描中" in bar.btn_scan.text()
 
+    def test_stop_available_while_planning(self, qapp):
+        """规划阶段「停止」必须可用。
+
+        真实卷上规划要几十秒，旧版这个按钮在这段时间里是灰的 —— 用户点了
+        没反应，而界面上又没有任何"不能停"的说明，只能干等。按钮可用性只在
+        ``sync_state`` 一处决定，所以这一条只能靠状态断言，不能靠点。
+        """
+        bar = ControlBar(DARK)
+        bar.set_target_available(True)
+        for state in (JobState.SCANNING, JobState.PLANNING):
+            bar.sync_state(state)
+            assert bar.btn_stop.isEnabled(), f"{state.value} 阶段必须能停"
+            assert bar.btn_stop.text() == "停止"
+
+    def test_stopping_disables_stop_and_says_so(self, qapp):
+        bar = ControlBar(DARK)
+        bar.set_target_available(True)
+        bar.sync_state(JobState.STOPPING)
+        assert not bar.btn_stop.isEnabled(), "已经在停了，再点没有意义"
+        assert bar.btn_stop.text() == "停止中…"
+        assert "当前步骤" in bar.summary.text(), "规划阶段没有 chunk，不能说'等 chunk 写完'"
+
     def test_terminal_state_reenables(self, qapp):
         bar = ControlBar(DARK)
         bar.set_target_available(True)

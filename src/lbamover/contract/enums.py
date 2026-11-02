@@ -142,21 +142,31 @@ _INTENSITY_LABELS: dict["Intensity", str] = {
 
 
 class ExecMode(str, Enum):
-    """搬运方式。两套实现**完全独立**，只共享 ``run_op`` 契约。
+    """搬运方式。三套实现**完全独立**，只共享 ``run_op`` 契约。
 
     分开的理由是失败方式不同：``NATIVE`` 错在系统调用（文件被占用、布局变了、
-    权限不足），``CACHED`` 错在文件 IO 与容量（缓存盘满、路径不可写）。
-    混在一个类里，任何一次调试都要同时理解两条路径 —— 这是踩过的坑。
+    权限不足），``CACHED`` 错在文件 IO 与容量（缓存盘满、路径不可写），
+    ``MEMCACHED`` 错在内存分配（块池用完、MemoryError）。
 
-    ``CACHED`` 额外有一条硬边界：它**不能**作用于已挂载的 NTFS 卷。裸写绕过
-    文件系统，会覆盖 ``$MFT`` 指着的簇区，文件系统随即损坏。真机整理必须走
-    ``MOVE_FILE``。
+    混在一个类里，任何一次调试都要同时理解三条路径 —— 这是踩过的坑。
+
+    ``CACHED`` / ``MEMCACHED`` 有一条共同的硬边界：它们都**不能**作用于已挂载
+    的 NTFS 卷。裸写绕过文件系统，会覆盖 ``$MFT`` 指着的簇区，文件系统随即
+    损坏。真机整理必须走 ``MOVE_FILE``。
     """
 
     #: 盘内搬运：真机用 ``FSCTL_MOVE_FILE``，镜像用逐块直写。
     NATIVE = "native"
     #: 经缓存盘中转：读源 → 顺序写缓存 → 顺序读缓存 → 写目标。
     CACHED = "cached"
+    #: 经**内存块池**中转：固定 N 块 × M 字节，攒满一块即回写，池满时按
+    #: 先进先出淘汰最老的一块（见 ``engine/memcache_engine.py``）。
+    MEMCACHED = "memcached"
+
+    @property
+    def uses_cache(self) -> bool:
+        """是否需要一块中转缓存（磁盘目录或内存块池）。"""
+        return self is not ExecMode.NATIVE
 
 
 class FreeSpaceSide(str, Enum):

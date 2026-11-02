@@ -165,6 +165,8 @@ def _cmd_selftest(args: argparse.Namespace) -> int:
         ),
         exec_mode=ExecMode(getattr(args, "exec_mode", ExecMode.NATIVE.value)),
         cache_dir=str(getattr(args, "cache_dir", "") or ""),
+        mem_cache_blocks=int(getattr(args, "mem_cache_blocks", 32)),
+        mem_cache_block_kib=int(getattr(args, "mem_cache_kib", 1024)),
         preoccupy_target=bool(getattr(args, "preoccupy", False)),
     )
     return _run_pipeline(
@@ -212,6 +214,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         ),
         exec_mode=ExecMode(getattr(args, "exec_mode", ExecMode.NATIVE.value)),
         cache_dir=str(getattr(args, "cache_dir", "") or ""),
+        mem_cache_blocks=int(getattr(args, "mem_cache_blocks", 32)),
+        mem_cache_block_kib=int(getattr(args, "mem_cache_kib", 1024)),
         preoccupy_target=bool(getattr(args, "preoccupy", False)),
     )
     return _run_pipeline(
@@ -508,12 +512,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--exec-mode",
         default=ExecMode.NATIVE.value,
         choices=[m.value for m in ExecMode],
-        help="搬运方式。native=盘内搬簇（默认）；cached=经缓存盘中转的独立引擎",
+        help="搬运方式。native=盘内搬簇（默认）；cached=经缓存盘中转；"
+        "memcached=经内存块池中转（只用于镜像与内存盘）",
     )
     s.add_argument(
         "--cache-dir",
         default="",
         help="跨盘缓存的工作目录（应指向另一块盘）。--exec-mode cached 时必填",
+    )
+    s.add_argument(
+        "--mem-cache-blocks",
+        type=int,
+        default=32,
+        help="内存缓存的块数（--exec-mode memcached 时生效，默认 32）",
+    )
+    s.add_argument(
+        "--mem-cache-kib",
+        type=int,
+        default=1024,
+        help="内存缓存单块大小（KiB，默认 1024）。总量 = 块数 × 块大小",
     )
     s.add_argument(
         "--preoccupy", action="store_true", help="搬之前先占住目标区（需要管理员）"
@@ -555,9 +572,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--exec-mode",
         default=ExecMode.NATIVE.value,
         choices=[m.value for m in ExecMode],
-        help="native / cached",
+        help="native / cached / memcached",
     )
     r.add_argument("--cache-dir", default="", help="跨盘缓存工作目录")
+    r.add_argument("--mem-cache-blocks", type=int, default=32, help="内存缓存块数")
+    r.add_argument("--mem-cache-kib", type=int, default=1024, help="内存缓存单块大小（KiB）")
     r.add_argument("--preoccupy", action="store_true", help="预占目标区")
     r.add_argument("--strategy", default=Strategy.COALESCE.value,
                    choices=[s.value for s in Strategy if s.writes_blocks])
