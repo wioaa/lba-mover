@@ -273,6 +273,21 @@ class FreeSpaceMap:
             return True
         return IntervalSet(self._free).contains_range(ext)
 
+    def covers(self, start: int, length: int) -> bool:
+        """``[start, start+length)`` 是否**完全**落在某一段空闲区里。O(log n)。
+
+        与 :meth:`is_free` 的区别是它不重建 ``IntervalSet``：后者是
+        O(空闲段数)，在"每个文件查一次"的循环里会退化成 O(文件数 × 段数)，
+        真实卷上就是几十秒的规划时间。尾部压实每一轮都要查，必须走这条。
+        """
+        if length <= 0:
+            return True
+        i = bisect.bisect_right(self._starts, start) - 1
+        if i < 0:
+            return False
+        e = self._free[i]
+        return e.start <= start and e.end >= start + length
+
     # -- 内部 -------------------------------------------------------------
 
     def _consume(self, ext: Extent) -> None:

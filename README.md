@@ -45,7 +45,7 @@ python packaging/build.py            # 图标 → 版本资源 → PyInstaller �
 | --- | --- |
 | `dist/LBAMover/LBAMover.exe` | 图形界面，双击即用（单一 exe 3 MB，运行库在 `_internal/`） |
 | `dist/LBAMover/LBAMover-cli.exe` | 命令行，`--version` / `volumes` / `scan` / `selftest` / `smoke` |
-| `dist/LBAMover-2.0.0I-win64.zip` | 解包即用，约 48 MiB |
+| `dist/LBAMover-2.0.0J-win64.zip` | 解包即用，约 48 MiB |
 | `dist/lbamover-2.0.0-py3-none-any.whl` | `pip install` 用 |
 | `dist/SHA256SUMS.txt` | 上述产物的校验和 |
 
@@ -94,6 +94,7 @@ lbamover run --image disk.img --layout layout.json --strategy compact   # 对镜
 lbamover run --image disk.img --layout layout.json --strategy relocate_tail \
         --intensity extreme --extreme-min-mib 512   # 极端档：只把 ≥512 MiB 的大文件搬到卷尾
 lbamover smoke                        # 无头冒烟：建窗口 + 跑完一次真实搬迁
+lbamover selftest --blocks 4096 --files 24 --exec-mode cached --cache-dir I:/cache  # 缓存引擎
 ```
 
 ### 当库用
@@ -119,6 +120,9 @@ from lbamover.engine import EngineCore
 | 簇级搬迁（`FSCTL_MOVE_FILE`） | ✅ 代码完整，⚠ **尚未在真实卷上执行过** |
 | 保护层（元文件 / 系统目录 / 页面文件 / 空闲余量） | ✅ 规划前过滤 + 执行前二次审计 |
 | 三个动作策略：合并碎片 / 向卷首聚拢 / 搬到卷尾 | ✅ 外加「只分析」零写入模式 |
+| **压实卷尾** | ✅ 把卷尾一段范围内的**全部**数据（含本来连续的）按物理顺序重排到卷的绝对末尾，形成「前面一整块连续空闲 + 后面一整块数据」。范围可按 GiB 指定，0 = 整卷。压不动的文件（多段横跨目标区）会具名报出，不会假装压实成功 |
+| **跨盘缓存搬运**（独立引擎） | ⚠ 数据经工作目录中转：读源 → 顺序写缓存 → 顺序读 → 写目标。缓存盘侧 100% 顺序，目录可指向另一块盘。**只适用于镜像与内存盘**：已挂载的 NTFS 卷会被拒绝（裸写会损坏文件系统）。默认关闭 |
+| **目标区预占** | ⚠ 搬之前用占位文件把目标区扣住，防止执行期间被别的程序写进去。只防执行那一瞬间，规划阶段的抢占管不了；需要管理员权限，**真机尚未验证**。默认关闭 |
 | **五档整理强度** | ✅ 强度与策略**正交**：策略决定往哪搬，强度决定动多少文件。快速（最碎的 20%）/ 标准（全部碎片，等同旧版）/ 深度（+零散小文件）/ 彻底（全部文件）/ 极端（只动 ≥256 MiB 的大文件，按体积降序归位卷尾）。「腾出可用空间」是约束式任务，不看强度 |
 | **可用空间整理** | ✅ 按 GiB 指定大小，选卷首或卷尾。只承诺"这段连续空闲确实是空的"——做不到就报差额，不给"搬了一半"的结果 |
 | **手动选文件** | ✅ 只整理勾选的，选择身份是文件路径而非行号（跨扫描稳定） |
@@ -165,7 +169,7 @@ GUI 的 CI 上跑完整流程，UI 能用假引擎单测，平台差异没有渗
 ## 版本号约定
 
 `pyproject.toml` 的 `version` 永远只写三段（`2.0.0`，PEP 440 合法），小版本字母放在
-`[tool.lbamover].revision`，由代码拼成 `2.0.0I` 对外展示。
+`[tool.lbamover].revision`，由代码拼成 `2.0.0J` 对外展示。
 
-`2.0.0I` 不是合法 PEP 440，pip 会直接拒绝——所以字母不能进 `version` 字段。
+`2.0.0J` 不是合法 PEP 440，pip 会直接拒绝——所以字母不能进 `version` 字段。
 两处必须一致，`tests/test_version.py` 盯着这件事。

@@ -6,6 +6,7 @@ from enum import Enum
 
 __all__ = [
     "ErrorClass",
+    "ExecMode",
     "EventKind",
     "FreeSpaceSide",
     "Intensity",
@@ -81,6 +82,13 @@ class Strategy(str, Enum):
     COMPACT = "compact"
     #: 把选中文件搬到卷尾，为卷首让出连续空间。
     RELOCATE_TAIL = "relocate_tail"
+    #: 把卷尾一段范围内的**全部**数据（含本来就连续的文件）按物理顺序重排到
+    #: 卷的绝对末尾，形成"前面一整块连续空闲 + 后面一整块数据"。
+    #:
+    #: 与 ``RELOCATE_TAIL`` 的差别不是力度而是性质：后者只挑碎片文件、靠
+    #: first-fit 填尾巴，尾部的连续文件一个不动，结果是"填了但没实"；
+    #: 这个策略会**重排**尾部全部数据，让它们紧贴卷尾，中间不留洞。
+    PACK_TAIL = "pack_tail"
     #: 腾出**指定大小**的连续可用空间，位置可由 ``FreeSpaceSide`` 指定卷首/卷尾。
     #: 与 ``COMPACT`` 的差别是它不关心碎片度，只关心"目标区最后是不是全空"。
     RECLAIM = "reclaim"
@@ -131,6 +139,24 @@ _INTENSITY_LABELS: dict["Intensity", str] = {
     Intensity.THOROUGH: "彻底",
     Intensity.EXTREME: "极端",
 }
+
+
+class ExecMode(str, Enum):
+    """搬运方式。两套实现**完全独立**，只共享 ``run_op`` 契约。
+
+    分开的理由是失败方式不同：``NATIVE`` 错在系统调用（文件被占用、布局变了、
+    权限不足），``CACHED`` 错在文件 IO 与容量（缓存盘满、路径不可写）。
+    混在一个类里，任何一次调试都要同时理解两条路径 —— 这是踩过的坑。
+
+    ``CACHED`` 额外有一条硬边界：它**不能**作用于已挂载的 NTFS 卷。裸写绕过
+    文件系统，会覆盖 ``$MFT`` 指着的簇区，文件系统随即损坏。真机整理必须走
+    ``MOVE_FILE``。
+    """
+
+    #: 盘内搬运：真机用 ``FSCTL_MOVE_FILE``，镜像用逐块直写。
+    NATIVE = "native"
+    #: 经缓存盘中转：读源 → 顺序写缓存 → 顺序读缓存 → 写目标。
+    CACHED = "cached"
 
 
 class FreeSpaceSide(str, Enum):

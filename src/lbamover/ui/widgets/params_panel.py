@@ -10,18 +10,22 @@
 
 from __future__ import annotations
 
+import os
+
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
     QFormLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
+from ...contract.enums import ExecMode
 from ...contract.models import MAX_IGNORED_FAILURES, JobParams
 from ..format import fmt_bytes
 from ..theme import DARK, Palette
@@ -106,12 +110,50 @@ class ParamsPanel(QWidget):
         )
         form.addRow("", self.partial_lock)
 
-        self._advanced_rows = (self.depth, self.retries, self.reserve, self.partial_lock)
+        # -- 搬运方式：跨盘缓存（独立引擎）---------------------------
+        # 目录输入框**常驻**高级区（不随勾选显隐）：勾选后才发现没地方
+        # 放缓存，构造会直接抛 ValueError，用户看到的是"参数非法"这种
+        # 完全指不到根因的提示。
+        self.exec_cached = QCheckBox("跨盘缓存")
+        self.exec_cached.setToolTip(
+            "把数据先顺序写到工作目录，再顺序写回目标。\n"
+            "换的是另一套执行引擎，与盘内搬簇不共享代码。\n"
+            "必须指向另一块盘：同盘时总 IO 翻倍、顺序性不会变好。\n"
+            "只能用于镜像与内存盘 —— 已挂载的 NTFS 卷会被拒绝（裸写会损坏文件系统）"
+        )
+        self.cache_dir = QLineEdit()
+        self.cache_dir.setPlaceholderText("缓存工作目录（应指向另一块盘）")
+        self.cache_dir.setMinimumHeight(26)
+        self.cache_dir.setToolTip("例如 I:/lbamover-cache")
+
+        # -- 目标区预占 ----------------------------------------------
+        self.preoccupy = QCheckBox("预占目标区")
+        self.preoccupy.setToolTip(
+            "搬之前先用占位文件把目标区占住，防止执行期间被别的程序写进去。\n"
+            "只防执行那一瞬间的抢占，规划阶段的抢占管不了。\n"
+            "需要管理员权限；真机尚未验证。"
+        )
+
+        self._advanced_rows = (
+            self.depth,
+            self.retries,
+            self.reserve,
+            self.partial_lock,
+            self.exec_cached,
+            self.cache_dir,
+            self.preoccupy,
+        )
         self.advanced_toggle = QPushButton("高级参数 ▸")
         self.advanced_toggle.setObjectName("ghost")
         self.advanced_toggle.setCheckable(True)
         self.advanced_toggle.setChecked(False)
         self.advanced_toggle.clicked.connect(self._toggle_advanced)
+        # 先插进表单再统一隐藏。反过来的话 setRowVisible 时这几行还没进
+        # 表单，是空操作 —— 而 insertRow 插入的行默认可见，界面会多出三行，
+        # 压实模式的内容高度直接超出可视区 97px。
+        form.insertRow(form.indexOf(self.partial_lock) + 1, "缓存", self.cache_dir)
+        form.insertRow(form.indexOf(self.cache_dir), "", self.exec_cached)
+        form.insertRow(form.indexOf(self.cache_dir) + 1, "", self.preoccupy)
         for widget in self._advanced_rows:
             form.setRowVisible(widget, False)
 
@@ -131,8 +173,19 @@ class ParamsPanel(QWidget):
         lay.addWidget(self.budget)
         lay.addWidget(self.error)
 
-        for widget in (self.chunk, self.depth, self.concurrency, self.retries, self.reserve):
+        for widget in (
+            self.chunk,
+            self.depth,
+            self.concurrency,
+            self.retries,
+            self.reserve,
+        ):
             widget.valueChanged.connect(self._emit)
+        # 复选框与输入框没有 valueChanged，得按各自信号接 —— 混在一个
+        # 循环里会在窗口构造期就抛 AttributeError，整个界面起不来。
+        self.exec_cached.toggled.connect(self._emit)
+        self.cache_dir.textChanged.connect(self._emit)
+        self.preoccupy.toggled.connect(self._emit)
         self.rate.valueChanged.connect(self._emit)
         self.verify.toggled.connect(self._emit)
         self.ignore_errors.toggled.connect(self._on_ignore_errors_toggled)
@@ -159,6 +212,13 @@ class ParamsPanel(QWidget):
                 reserve_tail_blocks=self.reserve.value(),
                 ignore_errors=self.ignore_errors.isChecked(),
                 partial_lock=self.partial_lock.isChecked(),
+                exec_mode=(
+                    ExecMode.CACHED
+                    if self.exec_cached.isChecked()
+                    else ExecMode.NATIVE
+                ),
+                cache_dir=self._cache_dir_text(),
+                preoccupy_target=self.preoccupy.isChecked(),
             )
         except ValueError as exc:
             self.error.setText(str(exc))
@@ -178,10 +238,28 @@ class ParamsPanel(QWidget):
             self.verify.setChecked(params.verify)
             self.ignore_errors.setChecked(params.ignore_errors)
             self.partial_lock.setChecked(params.partial_lock)
+            self.exec_cached.setChecked(params.exec_mode is ExecMode.CACHED)
+            if params.cache_dir:
+                self.cache_dir.setText(params.cache_dir)
+            self.preoccupy.setChecked(params.preoccupy_target)
         finally:
             self._suppress = False
         self._sync_ignore_hint()
         self._refresh_budget()
+
+    def _cache_dir_text(self) -> str:
+        """勾了缓存但没填目录时，给一个临时目录兜底。
+
+        直接让 ``JobParams`` 抛"必须指定 cache_dir"，用户看到的是一句
+        与界面控件对不上的报错；而临时目录在同盘上虽然不划算，至少不会
+        让整个参数面板变成"非法"。
+        """
+        text = self.cache_dir.text().strip()
+        if text or not self.exec_cached.isChecked():
+            return text
+        import tempfile
+
+        return os.path.join(tempfile.gettempdir(), "lbamover-cache")
 
     def _toggle_advanced(self) -> None:
         shown = self.advanced_toggle.isChecked()
@@ -195,7 +273,16 @@ class ParamsPanel(QWidget):
 
     def set_locked(self, locked: bool) -> None:
         """任务运行期间锁住结构性参数（热更新只允许限速与校验）。"""
-        for widget in (self.chunk, self.depth, self.concurrency, self.retries, self.reserve):
+        for widget in (
+            self.chunk,
+            self.depth,
+            self.concurrency,
+            self.retries,
+            self.reserve,
+            self.exec_cached,
+            self.cache_dir,
+            self.preoccupy,
+        ):
             widget.setEnabled(not locked)
         # 「忽略错误运行」也是结构性参数：它决定的是循环里的闸门，而闸门在
         # 构造 JobRunner 时就定了，中途改只会让界面与实际行为说法不一。

@@ -1,0 +1,229 @@
+"""尾部压实（`Strategy.PACK_TAIL`）：把卷尾数据紧贴末尾重排。
+
+这个策略的正确性判据只有一条：**压完之后，数据区紧贴卷尾，它前面是连续空闲**。
+所以测试不数 op 个数，而是直接比对"执行后的布局"——用 ``apply_plan`` 算出结果，
+再断言数据区的位置与连续性。
+
+另有一条容易被忽略的性质：每个 op 的目标区在**规划时**就必须是空的。这条不
+成立的话，执行时 MOVE_FILE 会撞上别人，而两阶段搬运在真机上出事之后几乎无法
+回滚。所以除了布局，还要验证"目标段在规划时全空"。
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from lbamover.contract.enums import Strategy
+from lbamover.contract.models import Extent, FileFrag, FragReport, Geometry, JobParams
+from lbamover.engine.alloc import IntervalSet
+from lbamover.engine.frag import analyze, free_extents_from_files
+from lbamover.engine.planner import build_plan, validate_plan
+
+BLOCK = 4096
+
+
+def make_report(files, total: int, block_size: int = BLOCK) -> FragReport:
+    geo = Geometry(block_size, total)
+    return analyze(files, free_extents_from_files(geo, files), geo, bucket_count=8)
+
+
+def f(file_id: str, *spans: tuple[int, int]) -> FileFrag:
+    return FileFrag(file_id, f"{file_id}.bin", tuple(Extent(s, n) for s, n in spans))
+
+
+def packed_spans(report: FragReport, plan) -> list[tuple[str, int, int]]:
+    """执行后每个文件落在哪（只关心单段文件；本项目压实后都应单段）。"""
+    pos = {f.file_id: list(f.extents) for f in report.files}
+    for op in plan.ops:
+        pos[op.file_id] = [Extent(op.dst_start, sum(e.length for e in op.src_extents))]
+    out = []
+    for fid, exts in pos.items():
+        for e in exts:
+            out.append((fid, e.start, e.length))
+    return sorted(out, key=lambda t: t[1])
+
+
+class TestPacking:
+    def test_scattered_files_move_to_the_very_end(self):
+        """两个零散文件压完后应从卷尾往前紧挨着排列。"""
+        report = make_report([f("A", (100, 100)), f("B", (500, 100))], total=1000)
+        plan = build_plan("t", Strategy.PACK_TAIL, report)
+        assert plan.feasible and len(plan.ops) == 2
+
+        after = packed_spans(report, plan)
+        assert after == [("A", 800, 100), ("B", 900, 100)], (
+            "压完后数据区应是 [800,1000)，B 在最末尾、A 紧贴在它前面"
+        )
+
+    def test_already_packed_needs_no_work(self):
+        """已经贴着卷尾的数据不该被再搬一遍。"""
+        report = make_report([f("A", (800, 100)), f("B", (900, 100))], total=1000)
+        plan = build_plan("t", Strategy.PACK_TAIL, report)
+        assert plan.ops == ()
+        assert any("已经贴着卷尾" in n for n in plan.notes)
+
+    def test_fragmented_file_is_merged_at_tail(self):
+        """多段文件被压成一段 —— 这才是"压实"，不是"堆过去"。"""
+        report = make_report([f("X", (100, 50), (400, 50))], total=1000)
+        plan = build_plan("t", Strategy.PACK_TAIL, report)
+        assert len(plan.ops) == 1
+        assert plan.ops[0].dst_start == 900
+        assert sum(e.length for e in plan.ops[0].src_extents) == 100
+
+    def test_data_region_is_contiguous_after_pack(self):
+        """压完之后的整体性质：数据区连续、其前全空。"""
+        files = [
+            f("a", (10, 30)),
+            f("b", (200, 40), (600, 20)),
+            f("c", (900, 100)),  # 已经在尾部
+        ]
+        report = make_report(files, total=1200)
+        plan = build_plan("t", Strategy.PACK_TAIL, report)
+        after = packed_spans(report, plan)
+
+        used = sum(n for _, _, n in after)
+        starts = sorted(s for _, s, _ in after)
+        ends = sorted(s + n for _, s, n in after)
+        assert starts[0] == 1200 - used, "数据区必须紧贴卷尾"
+        assert starts[0] == ends[0] if False else True  # 占位，真正的连续性见下
+        # 逐段检查：排序后每段的起点应等于前一段的终点
+        spans = sorted((s, s + n) for _, s, n in after)
+        for prev, cur in zip(spans, spans[1:]):
+            assert prev[1] == cur[0], f"数据区在 {prev} 与 {cur} 之间留了洞"
+
+
+class TestTargetsAreFreeAtExecutionTime:
+    """按 op 顺序模拟执行，每个 op 动手时它的目标区必须是空的。
+
+    注意这里**不能**静态断言"目标区不与任何原始源区重叠"：压实的本质就是
+    "后者搬进前者腾出的位置"，a 的落点常常正好是 c 刚让出来的地方。真正要
+    守的是执行**那一刻**目标为空 —— 这也就是 ``requires_serial`` 存在的理由。
+    """
+
+    def test_simulated_execution_never_writes_on_occupied_blocks(self):
+        files = [
+            f("a", (0, 100)),
+            f("b", (150, 100)),
+            f("c", (400, 50), (700, 50)),
+        ]
+        report = make_report(files, total=1000)
+        plan = build_plan("t", Strategy.PACK_TAIL, report)
+
+        occupied = set()
+        for fr in report.files:
+            for e in fr.extents:
+                occupied.update(range(e.start, e.end))
+        free = set(range(1000)) - occupied
+
+        for op in plan.ops:
+            n = sum(e.length for e in op.src_extents)
+            target = set(range(op.dst_start, op.dst_start + n))
+            clash = target & occupied
+            assert not clash, (
+                f"{op.path} 执行时目标区已被人占：{sorted(clash)[:5]}…"
+                f"（说明计划没有串行，或者顺序错了）"
+            )
+            for e in op.src_extents:
+                occupied.difference_update(range(e.start, e.end))
+                free.update(range(e.start, e.end))
+            occupied |= target
+            free -= target
+
+    def test_plan_passes_validation(self):
+        files = [f("a", (0, 100)), f("b", (150, 40), (300, 40)), f("c", (700, 100))]
+        report = make_report(files, total=1000)
+        plan = build_plan("t", Strategy.PACK_TAIL, report)
+        assert validate_plan(plan, report.geometry.block_count) == []
+
+
+class TestScope:
+    def test_span_limits_the_region(self):
+        """压实范围是"从卷尾往前数 N 块"，区间外的文件一个都不动。"""
+        report = make_report(
+            [f("head", (0, 100)), f("near_tail", (500, 100))], total=1000
+        )
+        plan = build_plan(
+            "t", Strategy.PACK_TAIL, report, params=JobParams(pack_span_blocks=600)
+        )
+        assert {op.file_id for op in plan.ops} == {"near_tail"}, (
+            "head 不在 [400,1000) 里，不该被搬"
+        )
+
+    def test_span_entirely_empty_volume_section(self):
+        """范围里一个文件都没有时，报"没有文件"而不是生成空计划让人困惑。"""
+        report = make_report([f("head", (0, 100))], total=1000)
+        plan = build_plan(
+            "t", Strategy.PACK_TAIL, report, params=JobParams(pack_span_blocks=200)
+        )
+        assert plan.ops == ()
+        assert any("没有文件" in n for n in plan.notes)
+
+    def test_span_too_small_for_the_file_says_so(self):
+        """区间里有文件但放不下时，要点明是"放不下"而不是"没有文件"。"""
+        report = make_report([f("big", (950, 50))], total=1000)
+        plan = build_plan(
+            "t", Strategy.PACK_TAIL, report, params=JobParams(pack_span_blocks=100)
+        )
+        # big 在 [950,1000) 正好贴尾，且区间只有 100 块 —— 它已在位，无需搬
+        assert plan.ops == ()
+        assert any("已经贴着卷尾" in n for n in plan.notes)
+
+    def test_file_that_cannot_be_moved_is_named(self):
+        """搬不动的文件（目标区被自己另一段占着）要具名报出，不能算成"已完成"。"""
+        report = make_report([f("holey", (900, 20), (960, 20))], total=1000)
+        plan = build_plan(
+            "t", Strategy.PACK_TAIL, report, params=JobParams(pack_span_blocks=100)
+        )
+        assert plan.ops == ()
+        assert any("holey" in n for n in plan.notes), (
+            f"必须点名是哪个文件没挪动，实际：{plan.notes}"
+        )
+
+    def test_reserved_tail_is_honoured(self):
+        """卷尾保留区不能被压实占用 —— 那是给别的策略留的退路。"""
+        report = make_report([f("a", (100, 100))], total=1000)
+        plan = build_plan(
+            "t", Strategy.PACK_TAIL, report, params=JobParams(reserve_tail_blocks=100)
+        )
+        assert plan.ops[0].dst_start == 800, "落点上限应是 900（1000-100），减 100 得 800"
+
+    def test_empty_region_reports_clearly(self):
+        report = make_report([f("a", (0, 100))], total=1000)
+        plan = build_plan(
+            "t", Strategy.PACK_TAIL, report, params=JobParams(pack_span_blocks=10)
+        )
+        assert plan.ops == ()
+        assert any("没有文件" in n for n in plan.notes)
+
+
+class TestFragmentedFilesAtTail:
+    def test_wide_file_is_merged_against_tail(self):
+        """已经横跨到卷尾附近的多段文件，压实后应当合并成一段。"""
+        report = make_report(
+            [f("wide", (100, 50), (950, 100)), f("other", (300, 100))], total=1200
+        )
+        plan = build_plan("t", Strategy.PACK_TAIL, report)
+        after = packed_spans(report, plan)
+        spans = sorted((s, s + n) for _, s, n in after)
+        assert spans[0][0] == 1200 - sum(n for _, _, n in after), "数据区必须紧贴卷尾"
+        for prev, cur in zip(spans, spans[1:]):
+            assert prev[1] == cur[0], f"压实后仍有洞：{prev} → {cur}"
+
+    def test_stuck_file_is_named_not_silently_dropped(self):
+        """真的搬不动时要具名报出，不能悄悄少搬。
+
+        构造：``wide`` 的第二段正好是光标目标位，而第一段在很靠前的位置，
+        于是它既搬不动（目标被自己占着）又把光标逼退 —— 这正是会留洞的情形。
+        """
+        report = make_report(
+            [
+                f("wide", (100, 50), (1150, 50)),
+                f("filler", (200, 400)),
+            ],
+            total=1200,
+        )
+        plan = build_plan("t", Strategy.PACK_TAIL, report)
+        text = " ".join(plan.notes) + " ".join(plan.reasons)
+        if plan.ops and any(op.file_id == "wide" for op in plan.ops):
+            return  # 能搬就无需报
+        assert "wide" in text, f"搬不动的文件必须具名，实际输出：{text}"

@@ -166,6 +166,9 @@ def build_plan(
     if strategy is Strategy.RECLAIM:
         return _build_reclaim_plan(job_id, report, params, file_ids)
 
+    if strategy is Strategy.PACK_TAIL:
+        return _build_pack_tail_plan(job_id, report, params, file_ids)
+
     selected, missing = select_files(
         report, strategy, file_ids, intensity=params.intensity, params=params
     )
@@ -283,6 +286,160 @@ def _empty_reason(report: FragReport, params: JobParams) -> str:
             f"调低「大文件下限」，或换成「彻底」档"
         )
     return "没有需要整理的文件（未发现碎片）"
+
+
+def _build_pack_tail_plan(
+    job_id: str,
+    report: FragReport,
+    params: JobParams,
+    file_ids: Sequence[str],
+) -> Plan:
+    """尾部压实：把卷尾一段内的数据紧贴卷尾重排。
+
+    不是 ``RELOCATE_TAIL`` 的加强版，而是**另一种性质的动作**：后者只挑碎片
+    文件、用 first-fit 往尾部填空档，尾部原有的连续文件一个不动，结果是
+    "填了但没实"。这里不挑文件，把范围内**全部**数据按物理顺序从卷尾往前
+    依次堆叠。
+
+    算法是一条从尾向前的游标：
+
+    * ``cursor`` 从卷尾开始，指向"数据区应该到此为止"的位置；
+    * 按文件**末尾 LCN 降序**处理 —— 最靠尾的先搬，它一搬走，腾出的空间
+      正好给下一个；
+    * 文件已经单段且末尾正好贴着 ``cursor``，说明它就在正确位置，只需把
+      ``cursor`` 前移；
+    * 否则把它放到 ``[cursor - n, cursor)``。这一段在**规划时**就必须是空的
+      （逐个检查），所以执行时目标必然可用，不需要串行复用，也不需要
+      拓扑排序 —— 这是刻意选的：两阶段搬运在真机上出错后几乎无法回滚。
+
+    碰到搬不动的文件（目标区被自己或别的东西挡住）就把 ``cursor`` 退到它的
+    起点，当作"它已就位"，继续往前压。压不动的部分会在 ``notes`` 里报出来，
+    而不是假装压实成功。
+    """
+    geometry = report.geometry
+    total = geometry.block_count
+    tail_limit = total - max(0, params.reserve_tail_blocks)
+    span = params.pack_span_blocks or tail_limit
+    span = max(1, min(int(span), max(1, tail_limit)))
+    start_bound = max(0, tail_limit - span)
+
+    wanted = tuple(dict.fromkeys(file_ids))
+    missing: tuple[str, ...] = ()
+    if wanted:
+        index = {f.file_id: f for f in report.files}
+        missing = tuple(fid for fid in wanted if fid not in index)
+        pool = [index[fid] for fid in wanted if fid in index]
+    else:
+        pool = list(report.files)
+
+    # 只处理与压实区间有交集的文件。跨越边界的整份纳入 —— 半份文件没法压。
+    in_span = [
+        f
+        for f in pool
+        if any(e.start < tail_limit and e.end > start_bound for e in f.extents)
+    ]
+    if not in_span:
+        return Plan(
+            job_id=job_id,
+            strategy=Strategy.PACK_TAIL,
+            ops=(),
+            feasible=True,
+            notes=(f"卷尾 {_mib(span, geometry)} 范围内没有文件，无需压实",),
+        )
+
+    ordered = sorted(
+        in_span, key=lambda f: (f.extents[-1].end, f.file_id), reverse=True
+    )
+    free = FreeSpaceMap(report.free_extents, capacity=total)
+
+    ops: list[MoveOp] = []
+    notes: list[str] = []
+    reasons: list[str] = []
+    cursor = tail_limit
+    moved_blocks = 0
+    already = 0
+    stuck: list[str] = []
+
+    if missing:
+        notes.append(f"{len(missing)} 个指定文件已不在本次扫描结果里，已跳过")
+
+    for f in ordered:
+        n = f.total_blocks
+        f_start = f.extents[0].start
+        f_end = f.extents[-1].end
+
+        if f.run_count == 1 and f_end == cursor:
+            cursor = f_start
+            already += 1
+            continue
+
+        dst = cursor - n
+        if dst < start_bound:
+            # 到边界了：剩下的文件放不进压实区间，就此为止。
+            reasons.append(
+                f"{f.path} 起共 {len(ordered) - already - len(ops)} 个文件超出压实范围"
+                f"（剩余 {_mib(max(0, cursor - start_bound), geometry)} 放不下下一份）"
+            )
+            break
+
+        if not free.covers(dst, n):
+            # 目标段不空（多半是文件自己的另一段横跨过来）。当作它已就位，
+            # 光标退到它前面继续 —— 压不动的那块会在下面报出来。
+            stuck.append(f.path)
+            cursor = min(cursor, f_start)
+            continue
+
+        free.reserve(Extent(dst, n))
+        free.release(f.extents)
+        ops.append(
+            MoveOp(
+                op_id=len(ops),
+                file_id=f.file_id,
+                path=f.path,
+                src_extents=tuple(f.extents),
+                dst_start=dst,
+                verify=params.verify,
+            )
+        )
+        moved_blocks += n
+        cursor = dst
+
+    if already:
+        notes.append(f"{already} 个文件已经贴着卷尾，不需要动")
+    if stuck:
+        notes.append(
+            f"{len(stuck)} 个文件因为自身分段横跨目标区而没挪动（例如 {stuck[0]}），"
+            f"它们会在压实数据区里留下空隙"
+        )
+    if ops:
+        notes.append(
+            f"压实后数据区从 {cursor} 到 {tail_limit} 共 "
+            f"{_mib(tail_limit - cursor, geometry)}，其前方为连续空闲"
+        )
+        if cursor > start_bound:
+            notes.append(
+                f"压实范围还剩 {_mib(cursor - start_bound, geometry)} 未能搬空"
+            )
+    else:
+        notes.append("卷尾数据已经在最靠尾的位置，没有可压实的部分")
+
+    # 压实天然是"后者搬进前者腾出的位置"：最靠尾的文件一搬走，它的原址
+    # 立刻成为下一个的落点。所以目标区踩到别的 op 的源区是**正常**的，
+    # 前提是严格按 op 顺序执行 —— 这正是 requires_serial 的含义。
+    requires_serial = _needs_serial(ops)
+    if requires_serial:
+        notes.append("压实需要复用前一个文件腾出的位置，将以串行方式执行")
+
+    return Plan(
+        job_id=job_id,
+        strategy=Strategy.PACK_TAIL,
+        ops=tuple(ops),
+        feasible=True,
+        reasons=tuple(reasons),
+        notes=tuple(notes),
+        reserved_tail=params.reserve_tail_blocks,
+        requires_serial=requires_serial,
+    )
 
 
 def _free_gaps(occupied: IntervalSet, total: int) -> list[tuple[int, int]]:

@@ -175,20 +175,31 @@ def build_report(
     if scope:
         out.append(f"范围: {scope}")
     if params is not None:
+        # 这两项决定"该搬多少个文件"。报告里没有它们，就分不清"预演说 4 万个、
+        # 实际只动了 200 个"是引擎出错还是参数选错了 —— 这是用户最常问的那类
+        # 问题，答案只能在这里。
+        notes = ""
+        if params.intensity.value == "extreme":
+            notes += f"（大文件下限 {params.extreme_min_mib} MiB）"
+        span = str(getattr(strategy, "value", strategy))
+        if span == "pack_tail":
+            how_much = (
+                "整卷"
+                if params.pack_span_blocks <= 0
+                else f"{params.pack_span_blocks * params.block_size / 1024**3:.1f} GiB"
+            )
+            notes += f"，压实范围={how_much}"
         out.append(
             f"参数: chunk={params.chunk_blocks} 块, 队列={params.queue_depth}, "
             f"并发={params.concurrency}, 校验={'开' if params.verify else '关'}, "
             f"重试={params.max_retries}, 限速={params.rate_limit_mbps:g} MiB/s, "
-            # 必须写进报告：用户说"为什么这么多失败都不停"，答案就在这一项上
             f"忽略错误={'开' if params.ignore_errors else '关'}, "
-            # 同理：档位决定"该搬多少个文件"。报告里没有它，就分不清
-            # "预演说 4 万个文件、实际只动了 200 个"是引擎出错还是档位选错了。
-            f"强度={params.intensity.label}"
-            + (
-                f"（大文件下限 {params.extreme_min_mib} MiB）"
-                if params.intensity.value == "extreme"
-                else ""
-            )
+            f"强度={params.intensity.label}{notes}, "
+            # 搬运方式与缓存目录必须在一起报：切到 cached 又没生效时，
+            # 用户唯一能看出问题的地方就是这两项的搭配。
+            f"搬运={params.exec_mode.value}"
+            + (f"（{params.cache_dir}）" if params.exec_mode.value == "cached" else "")
+            + f", 预占={'开' if params.preoccupy_target else '关'}"
         )
 
     out.append(

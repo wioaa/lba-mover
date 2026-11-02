@@ -207,6 +207,7 @@ class NtfsMoveExecutor:
         on_chunk: Callable[[BlockSlice], None] | None = None,
         on_retry: Callable[[int, BaseException, float], None] | None = None,
         verify: bool = True,
+        preoccupy=None,
     ) -> None:
         self.mover = mover
         self.params = params
@@ -220,11 +221,45 @@ class NtfsMoveExecutor:
         #: 但必须留痕 —— 否则用户会以为"开了锁就万事大吉"。
         self.lock_failures = 0
         self.last_lock_error = ""
+        #: 目标区预占（可选）。占位文件按 op 建，执行该 op 前释放那一段。
+        #: 它是增强项：占不住就按原样跑，只在日志里说明，不阻止搬运。
+        self.preoccupy = preoccupy
         self.policy = RetryPolicy(
             max_retries=params.max_retries,
             base_delay=params.retry_base_ms / 1000.0,
             max_delay=params.retry_max_ms / 1000.0,
         )
+
+    # -- 生命周期 ---------------------------------------------------------
+
+    def close(self) -> None:
+        """收尾：把还没释放的占位文件全部删掉。
+
+        正常路径下每个 op 执行前都释放过，走到这里时字典应该是空的。
+        但取消、异常、崩在中间时不会 —— 那些占位文件留在卷根上，
+        用户的资源管理器里会多出一堆 `.lbamover-placeholder-*.tmp`。
+        """
+        if self.preoccupy is not None:
+            self.preoccupy.close()
+
+    def prepare(self, ops) -> None:
+        """在任何 op 开始前占住目标区。占不住不阻止执行。
+
+        为什么不能"占不住就拒绝跑"：预占是**降低风险**的手段，不是正确性前提。
+        布局复核与 execute 前的审计才是把关的。把它变成硬前置，会让这个功能
+        在权限不足的机器上直接把整理功能废掉。
+        """
+        if self.preoccupy is None:
+            return
+        report = self.preoccupy.occupy(ops)
+        if report.requested:
+            level = "占位未完全生效" if not report.all_ok else "占位完成"
+            self.lock_failures += 0 if report.all_ok else 1
+            self.last_lock_error = report.summary() if not report.all_ok else ""
+            if hasattr(self, "on_log") and callable(self.on_log):
+                self.on_log(f"{level}：{report.summary()}")
+            else:
+                self._preoccupy_note = f"{level}：{report.summary()}"
 
     # -- 单个 op ----------------------------------------------------------
 
@@ -238,6 +273,11 @@ class NtfsMoveExecutor:
         total = op.blocks
         if total <= 0:
             return OpResult(op.op_id, 0, 0, ok=True)
+
+        if self.preoccupy is not None:
+            # 释放这个 op 的目标段，紧接着就搬进去 —— 中间只隔一次 open_file。
+            # 预占的意义全在这个"紧接着"上：拖久了窗口又变回原来的大小。
+            self.preoccupy.release_for(op.op_id)
 
         try:
             handle = self.mover.open_file(op.path, writable=True)

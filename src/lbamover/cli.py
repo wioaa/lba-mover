@@ -18,7 +18,7 @@ import tempfile
 import time
 
 from . import VERSION_DISPLAY
-from .contract.enums import Intensity, Strategy, VolumeKind
+from .contract.enums import ExecMode, Intensity, Strategy, VolumeKind
 from .contract.models import JobParams, JobSpec, VolumeInfo
 from .contract.models import Geometry
 from .contract.ports import ListSink
@@ -46,6 +46,13 @@ def _cmd_volumes(args: argparse.Namespace) -> int:
             f"{v.geometry.block_size:>8} {'是' if v.is_system else '否':>6}"
         )
     return 0
+
+
+def _gib_to_blocks(gib: float, block_size: int) -> int:
+    """GiB → 块。0 保留为 0，因为压实策略里 0 的语义是"整卷"而不是"没设置"。"""
+    if gib is None or gib <= 0 or block_size <= 0:
+        return 0
+    return int(gib * 1024**3 // block_size)
 
 
 def _run_pipeline(
@@ -153,6 +160,12 @@ def _cmd_selftest(args: argparse.Namespace) -> int:
         partial_lock=bool(getattr(args, "partial_lock", False)),
         intensity=Intensity(getattr(args, "intensity", Intensity.STANDARD.value)),
         extreme_min_mib=int(getattr(args, "extreme_min_mib", 256)),
+        pack_span_blocks=_gib_to_blocks(
+            getattr(args, "pack_span_gib", 0), args.block_size
+        ),
+        exec_mode=ExecMode(getattr(args, "exec_mode", ExecMode.NATIVE.value)),
+        cache_dir=str(getattr(args, "cache_dir", "") or ""),
+        preoccupy_target=bool(getattr(args, "preoccupy", False)),
     )
     return _run_pipeline(
         layout,
@@ -194,6 +207,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
         partial_lock=bool(getattr(args, "partial_lock", False)),
         intensity=Intensity(getattr(args, "intensity", Intensity.STANDARD.value)),
         extreme_min_mib=int(getattr(args, "extreme_min_mib", 256)),
+        pack_span_blocks=_gib_to_blocks(
+            getattr(args, "pack_span_gib", 0), args.block_size
+        ),
+        exec_mode=ExecMode(getattr(args, "exec_mode", ExecMode.NATIVE.value)),
+        cache_dir=str(getattr(args, "cache_dir", "") or ""),
+        preoccupy_target=bool(getattr(args, "preoccupy", False)),
     )
     return _run_pipeline(
         layout, device, strategy=Strategy(args.strategy), params=params, quiet=False
@@ -479,6 +498,26 @@ def build_parser() -> argparse.ArgumentParser:
         default=256,
         help="极端强度下认定「大文件」的下限（MiB，默认 256）",
     )
+    s.add_argument(
+        "--pack-span-gib",
+        type=float,
+        default=0,
+        help="压实卷尾的范围（GiB，从卷尾往前算）。0 = 整卷",
+    )
+    s.add_argument(
+        "--exec-mode",
+        default=ExecMode.NATIVE.value,
+        choices=[m.value for m in ExecMode],
+        help="搬运方式。native=盘内搬簇（默认）；cached=经缓存盘中转的独立引擎",
+    )
+    s.add_argument(
+        "--cache-dir",
+        default="",
+        help="跨盘缓存的工作目录（应指向另一块盘）。--exec-mode cached 时必填",
+    )
+    s.add_argument(
+        "--preoccupy", action="store_true", help="搬之前先占住目标区（需要管理员）"
+    )
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=_cmd_selftest)
 
@@ -506,6 +545,20 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument(
         "--extreme-min-mib", type=int, default=256, help="极端强度的「大文件」下限（MiB）"
     )
+    r.add_argument(
+        "--pack-span-gib",
+        type=float,
+        default=0,
+        help="压实卷尾的范围（GiB，从卷尾往前算）。0 = 整卷",
+    )
+    r.add_argument(
+        "--exec-mode",
+        default=ExecMode.NATIVE.value,
+        choices=[m.value for m in ExecMode],
+        help="native / cached",
+    )
+    r.add_argument("--cache-dir", default="", help="跨盘缓存工作目录")
+    r.add_argument("--preoccupy", action="store_true", help="预占目标区")
     r.add_argument("--strategy", default=Strategy.COALESCE.value,
                    choices=[s.value for s in Strategy if s.writes_blocks])
     r.set_defaults(func=_cmd_run)

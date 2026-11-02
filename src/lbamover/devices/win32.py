@@ -197,6 +197,16 @@ def _kernel32():
                     ctypes.POINTER(ctypes.c_longlong),
                     wintypes.DWORD,
                 ]
+                # 占位文件用。**argtypes 必须显式声明**：不写的话 Python int
+                # 按 c_int 传，64 位长度会在 32 位边界被截断，而截断后的
+                # SetEndOfFile 会成功返回 —— 占位文件只有一半大小，看起来
+                # 一切正常。
+                lib.SetEndOfFile.restype = wintypes.BOOL
+                lib.SetEndOfFile.argtypes = [wintypes.HANDLE]
+                lib.SetFileValidData.restype = wintypes.BOOL
+                lib.SetFileValidData.argtypes = [wintypes.HANDLE, ctypes.c_longlong]
+                lib.DeleteFileW.restype = wintypes.BOOL
+                lib.DeleteFileW.argtypes = [wintypes.LPCWSTR]
                 lib.ReadFile.restype = wintypes.BOOL
                 lib.ReadFile.argtypes = [
                     wintypes.HANDLE,
@@ -857,6 +867,28 @@ class Win32VolumeDevice(BlockDeviceBase):
         return ext.start * self.geometry.block_size, ext.length * self.geometry.block_size
 
 
+def _set_file_size(k32, handle: int, size: int) -> bool:
+    """把文件扩到 ``size`` 字节（不改内容，只改逻辑大小）。"""
+    if not k32.SetFilePointerEx(
+        wintypes.HANDLE(handle), ctypes.c_longlong(size), None, 0  # FILE_BEGIN
+    ):
+        return False
+    return bool(k32.SetEndOfFile(wintypes.HANDLE(handle)))
+
+
+def _set_valid_data(k32, handle: int, size: int) -> bool:
+    """让文件的后备簇真正分配出来，但**不清零**。
+
+    这是 ``SetFileValidData`` 的全部意义：写零要几 GiB 的额外写入，而这里
+    只是一个元数据操作。代价是文件内容为未初始化数据，所以占位文件用完
+    立刻删除（见 PreoccupyGuard）。
+    """
+    from ..platform.privilege import enable_privilege
+
+    enable_privilege("SeManageVolumePrivilege")
+    return bool(k32.SetFileValidData(wintypes.HANDLE(handle), ctypes.c_longlong(size)))
+
+
 class Win32ClusterMover:
     """``FSCTL_MOVE_FILE`` 的最小封装：开卷、开文件、查映射、搬簇。
 
@@ -875,6 +907,74 @@ class Win32ClusterMover:
 
     def open_file(self, path: str, writable: bool = True) -> int:
         return Win32Native.open_file(path, writable=writable and self._writable)
+
+    # -- 目标区预占（可选能力）--------------------------------------------
+
+    def create_placeholder(self, path: str, size_bytes: int) -> int:
+        """建一个占住 ``size_bytes`` 字节的占位文件，返回句柄。
+
+        粒度交给调用方：簇大小是引擎侧的参数（``cluster_size``），后端不该
+        再存一份 —— 两份就会漂移（这个项目在 ``to_dict`` 上吃过一次）。
+        
+
+        用 ``SetFileValidData`` 而不是写零：后者要真的把目标区的字节写一遍，
+        几 GiB 的目标区就是几 GiB 的额外写入，比整理本身还慢。前者只是把
+        簇标记为"已分配、内容有效"，NTFS 直接分配簇、不清零。
+
+        **代价与前提**：``SetFileValidData`` 需要 ``SeManageVolumePrivilege``
+        （管理员），且文件里会是**未初始化数据**——如果别的程序能读到它，
+        就可能看到卷上的残留内容。所以占位文件用隐藏属性创建，用完立刻删除。
+
+        拿不到权限时抛错而不是降级写零：预占是为了省时间，降级之后它比不
+        预占还慢，那就该老老实实报"这个功能没生效"。
+        """
+        size = max(1, int(size_bytes))
+        k32 = _kernel32()
+        handle = k32.CreateFileW(
+            long_path(path),
+            GENERIC_READ | GENERIC_WRITE,
+            0,  # 独占：占位文件被别的进程打开就失去意义了
+            None,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY,
+            None,
+        )
+        if handle == INVALID_HANDLE_VALUE or handle is None:
+            err = ctypes.get_last_error()
+            raise DeviceError(
+                f"创建占位文件失败 {path}：{ctypes.FormatError(err) if err else '未知错误'}",
+                winerror=err,
+            )
+        try:
+            if not _set_file_size(k32, handle, size):
+                raise DeviceError(
+                    f"扩展占位文件失败 {path}：{ctypes.FormatError(ctypes.get_last_error())}",
+                    winerror=ctypes.get_last_error(),
+                )
+            if not _set_valid_data(k32, handle, size):
+                err = ctypes.get_last_error()
+                raise DeviceError(
+                    f"占位文件分配簇失败（多半缺少管理员权限）：{ctypes.FormatError(err)}",
+                    winerror=err,
+                )
+        except BaseException:
+            Win32Native.close(handle)
+            raise
+        return handle
+
+    def delete_file(self, path: str) -> None:
+        """删除占位文件。删不掉不抛 —— 那时目标区仍被占着，MOVE_FILE 会
+        报出更准确的错误码，这里抛异常只会把它盖掉。"""
+        try:
+            if not _kernel32().DeleteFileW(long_path(path)):
+                err = ctypes.get_last_error()
+                if err not in (2, 3):  # 文件不存在 / 路径不存在，都算已达成目的
+                    raise DeviceError(
+                        f"删除占位文件失败 {path}：{ctypes.FormatError(err)}", winerror=err
+                    )
+        except AttributeError:
+            # 非 Windows（不该走到这里）：静默跳过，别让收尾流程炸掉
+            return
 
     def query(self, handle: int) -> tuple[tuple[int, int, int], ...]:
         return Win32Native.query_retrieval_pointers(handle)

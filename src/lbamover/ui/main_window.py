@@ -332,6 +332,7 @@ class MainWindow(QMainWindow):
         self.strategy_panel.intensityChanged.connect(self._on_intensity)
         self.strategy_panel.extremeMinChanged.connect(self._on_extreme_min)
         self.strategy_panel.reclaimChanged.connect(self._on_reclaim_changed)
+        self.strategy_panel.packChanged.connect(self._on_pack_changed)
         self.scope_panel.scopeChanged.connect(self._on_scope_changed)
         self.scope_panel.pickRequested.connect(self._open_file_picker)
         self.scope_panel.clearRequested.connect(self._clear_selection)
@@ -398,6 +399,9 @@ class MainWindow(QMainWindow):
         self.strategy_panel.reclaim.set_geometry(
             vol.geometry.block_size, vol.geometry.block_count
         )
+        self.strategy_panel.pack.set_geometry(
+            vol.geometry.block_size, vol.geometry.block_count
+        )
         params = self.params_panel.current()
         if params is not None:
             self._params = self._merge_reclaim(params)
@@ -431,6 +435,12 @@ class MainWindow(QMainWindow):
             panel = self.strategy_panel.reclaim
             self._params = replace(
                 self._params, reclaim_blocks=panel.blocks(), reclaim_at=panel.side()
+            )
+        elif strategy is Strategy.PACK_TAIL:
+            # 压实的 0 是"整卷"，语义合法，但仍要同步一次面板值 —— 面板可能
+            # 还停在上一个卷的范围上。
+            self._params = replace(
+                self._params, pack_span_blocks=self.strategy_panel.pack.blocks()
             )
         self.log_view.append(LogLevel.INFO, f"策略：{STRATEGY_HELP.get(strategy, strategy.value)}")
 
@@ -544,6 +554,7 @@ class MainWindow(QMainWindow):
             reclaim_avoid_protected=self._params.reclaim_avoid_protected,
             intensity=self._params.intensity,
             extreme_min_mib=self._params.extreme_min_mib,
+            pack_span_blocks=self._params.pack_span_blocks,
         )
 
     def _on_intensity(self, intensity: Intensity) -> None:
@@ -583,6 +594,14 @@ class MainWindow(QMainWindow):
         )
         if self._strategy is Strategy.RECLAIM and self._report is not None:
             self.service.submit(Replan(self._strategy, self._scope_file_ids()))
+
+    def _on_pack_changed(self) -> None:
+        blocks = self.strategy_panel.pack.blocks()
+        self._params = replace(self._params, pack_span_blocks=blocks)
+        scope = "整卷" if blocks == 0 else fmt_bytes(blocks * self._params.block_size)
+        self.log_view.append(LogLevel.INFO, f"压实卷尾：范围 {scope}")
+        if self._strategy is Strategy.PACK_TAIL:
+            self._replan_if_ready()
 
     def _on_params(self, params: JobParams) -> None:
         self._params = self._merge_reclaim(params)

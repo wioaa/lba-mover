@@ -229,6 +229,15 @@ class JobRunner:
             )
 
         self._executor = self._make_executor()
+        prepare = getattr(self._executor, "prepare", None)
+        if prepare is not None and pending:
+            try:
+                prepare(pending)
+            except Exception as exc:  # noqa: BLE001 - 预占失败不该阻止搬运
+                self._log(f"目标区预占失败（按原样继续）：{exc}")
+            note = getattr(self._executor, "_preoccupy_note", "")
+            if note:
+                self._log(note)
         try:
             if pending:
                 self._run_pool(pending, workers, result)

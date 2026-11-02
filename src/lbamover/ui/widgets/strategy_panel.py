@@ -36,6 +36,7 @@ from ..theme import DARK, Palette
 __all__ = [
     "StrategyPanel",
     "ReclaimPanel",
+    "PackPanel",
     "STRATEGY_HELP",
     "STRATEGY_SHORT",
     "STRATEGY_ORDER",
@@ -51,6 +52,7 @@ STRATEGY_HELP: dict[Strategy, str] = {
     Strategy.COMPACT: "把文件往卷首挤，腾出尾部大块连续空间",
     Strategy.RELOCATE_TAIL: "把文件搬到卷尾，为卷首让位",
     Strategy.RECLAIM: "腾出指定大小的连续可用空间，位置可选卷首或卷尾",
+    Strategy.PACK_TAIL: "把卷尾数据紧贴末尾重排，在它前面腾出一整块连续空闲",
 }
 
 #: 网格里显示的短名。4~6 个字，两列放得下，也不至于要靠猜。
@@ -60,6 +62,7 @@ STRATEGY_SHORT: dict[Strategy, str] = {
     Strategy.COMPACT: "向卷首聚拢",
     Strategy.RELOCATE_TAIL: "搬到卷尾",
     Strategy.RECLAIM: "腾出可用空间",
+    Strategy.PACK_TAIL: "压实卷尾",
 }
 
 #: 按钮顺序。**索引是契约**：``set_strategy`` 与 UI 测试都按它定位，
@@ -70,6 +73,7 @@ STRATEGY_ORDER: tuple[Strategy, ...] = (
     Strategy.COMPACT,
     Strategy.RELOCATE_TAIL,
     Strategy.RECLAIM,
+    Strategy.PACK_TAIL,
 )
 
 #: 强度顺序：从最省到最狠，界面按这个顺序排。
@@ -101,10 +105,12 @@ DEFAULT_INTENSITY: dict[Strategy, Intensity] = {
     Strategy.COMPACT: Intensity.THOROUGH,
     Strategy.RELOCATE_TAIL: Intensity.STANDARD,
     Strategy.RECLAIM: Intensity.STANDARD,
+    Strategy.PACK_TAIL: Intensity.STANDARD,
 }
 
-#: 这两档不看强度：一个是约束式任务，一个不产生操作。
-_INTENSITY_FREE = (Strategy.RECLAIM, Strategy.ANALYZE_ONLY)
+#: 这几档不看强度：两个约束式任务（必须动到范围内的**全部**数据，挑一部
+#: 分就等于没做），一个不产生操作。
+_INTENSITY_FREE = (Strategy.RECLAIM, Strategy.PACK_TAIL, Strategy.ANALYZE_ONLY)
 
 
 class ReclaimPanel(QWidget):
@@ -209,6 +215,85 @@ class ReclaimPanel(QWidget):
         )
 
 
+class PackPanel(QWidget):
+    """「压实卷尾」的范围：从卷尾往前算多少 GiB。
+
+    0 用 ``setSpecialValueText`` 显示成「整卷」，而不是让用户猜"填 0 是
+    什么意思"。整卷压实等于把全盘数据都搬到卷尾，几小时的重写 —— 所以它
+    必须是能选到的，但不能是看起来像默认值的那个。
+    """
+
+    changed = Signal()
+
+    def __init__(self, palette: Palette = DARK, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._p = palette
+        self._block_size = 4096
+        self._capacity_gib = 1.0
+        self._suppress = False
+
+        self.caption = QLabel("压实范围")
+        self.caption.setObjectName("cardHint")
+
+        self.size = QSpinBox()
+        self.size.setRange(0, 1 << 20)
+        self.size.setSuffix(" GiB")
+        self.size.setSpecialValueText("整卷")
+        self.size.setSingleStep(10)
+        self.size.setValue(0)
+        self.size.setMinimumHeight(26)
+        self.size.setToolTip(
+            "从卷尾往前算多少 GiB 参与压实。选「整卷」会把整个盘的数据都重排"
+            "到卷尾，耗时以小时计"
+        )
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        lay.addWidget(self.caption)
+        lay.addWidget(self.size)
+        lay.addStretch(1)
+
+        self.size.valueChanged.connect(self._on_changed)
+        self._update_tip()
+
+    def set_geometry(self, block_size: int, block_count: int) -> None:
+        """按目标卷校准换算与上限。**换卷必须重新调用**。"""
+        self._block_size = max(1, block_size)
+        self._capacity_gib = max(1.0, block_count * block_size / 1024**3)
+        cap = max(1, int(self._capacity_gib))
+        self._suppress = True
+        self.size.setRange(0, cap)
+        if self.size.value() > cap:
+            self.size.setValue(cap)
+        self._suppress = False
+        self._update_tip()
+
+    def blocks(self) -> int:
+        """0 表示整卷（引擎里 ``pack_span_blocks=0`` 就是这个语义）。"""
+        return int(self.size.value() * 1024**3 // self._block_size)
+
+    def set_blocks(self, blocks: int) -> None:
+        self._suppress = True
+        gib = 0 if blocks <= 0 else max(1, round(blocks * self._block_size / 1024**3))
+        self.size.setValue(min(gib, self.size.maximum()))
+        self._suppress = False
+        self._update_tip()
+
+    def _on_changed(self, *_args) -> None:
+        self._update_tip()
+        if not self._suppress:
+            self.changed.emit()
+
+    def _update_tip(self) -> None:
+        if self.size.value() == 0:
+            self.caption.setToolTip(f"整卷（{self._capacity_gib:.1f} GiB）都参与压实")
+        else:
+            self.caption.setToolTip(
+                f"卷容量 {self._capacity_gib:.1f} GiB，约 {self.blocks()} 块参与压实"
+            )
+
+
 class StrategyPanel(QWidget):
     strategyChanged = Signal(object)  # Strategy
     #: 强度档位变了 —— 影响"挑哪些文件"，必须重算预演
@@ -217,6 +302,8 @@ class StrategyPanel(QWidget):
     extremeMinChanged = Signal()
     #: 可用空间整理的大小/位置变了 —— 需要重算预演
     reclaimChanged = Signal()
+    #: 压实范围变了
+    packChanged = Signal()
 
     def __init__(self, palette: Palette = DARK, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -305,6 +392,11 @@ class StrategyPanel(QWidget):
         self.reclaim.setVisible(False)
         lay.addWidget(self.reclaim)
 
+        self.pack = PackPanel(palette)
+        self.pack.changed.connect(self.packChanged.emit)
+        self.pack.setVisible(False)
+        lay.addWidget(self.pack)
+
         # -- 极端档的"大文件下限"（只在极端档出现）--------------------
         self.extreme_row = QWidget()
         erow = QHBoxLayout(self.extreme_row)
@@ -384,6 +476,7 @@ class StrategyPanel(QWidget):
     def _apply_visual(self, strategy: Strategy) -> None:
         self.hint.setText(STRATEGY_HELP[strategy])
         self.reclaim.setVisible(strategy is Strategy.RECLAIM)
+        self.pack.setVisible(strategy is Strategy.PACK_TAIL)
         self._apply_intensity_visual(self.intensity())
 
     def _apply_intensity_visual(self, intensity: Intensity) -> None:
@@ -392,11 +485,13 @@ class StrategyPanel(QWidget):
             # 这两档不适用强度。**禁用并说清原因**，不要留个能点但无效的控件 ——
             # 用户会以为"快速腾出空间"真的只搬 20%，然后按这个结果去规划下一步。
             self.intensity_row.setEnabled(False)
-            self.intensity_hint.setText(
-                "强度 · 这项任务必须搬开所有挡路文件，档位不适用"
-                if strategy is Strategy.RECLAIM
-                else "强度 · 只分析不搬任何文件，档位不适用"
-            )
+            if strategy is Strategy.RECLAIM:
+                why = "强度 · 这项任务必须搬开所有挡路文件，档位不适用"
+            elif strategy is Strategy.PACK_TAIL:
+                why = "强度 · 压实要看范围内的全部数据，只压一部分就会留洞"
+            else:
+                why = "强度 · 只分析不搬任何文件，档位不适用"
+            self.intensity_hint.setText(why)
             self.extreme_row.setVisible(False)
             return
 

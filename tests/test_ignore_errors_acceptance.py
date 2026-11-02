@@ -317,8 +317,16 @@ class TestBoundaryAndInteraction:
         assert on.failed_ops == MAX_IGNORED_FAILURES, (
             f"累计口径必须停在第 {MAX_IGNORED_FAILURES} 个失败：{on.failed_ops}"
         )
-        # 第 1000 个失败之前，成功与失败一一交替 → 已经搬成 999 个
-        assert on.moved_ops == MAX_IGNORED_FAILURES - 1, on.moved_ops
+        # 第 1000 个失败之前，成功与失败一一交替 → 大约搬成 999 个。
+        #
+        # **不能断言精确等于 999**：熔断是一次 break，此刻线程池里还有在途
+        # op（记账要落断点，比执行慢），它们要么已经记上、要么还没。所以这里
+        # 会浮动几个 —— 这是"报告只统计已结算的 op"这条口径的固有性质，不是
+        # 少搬了数据。写成精确值会让这条用例随机变红，而红的时候看起来像
+        # "累计口径算错了"，把人引向错误的方向。
+        assert MAX_IGNORED_FAILURES - 20 <= on.moved_ops <= MAX_IGNORED_FAILURES, (
+            on.moved_ops
+        )
 
         # 差分：同一条序列、只把开关关掉，就**不该**停 —— 证明差异来自开关，
         # 也顺带证明默认路径判的确实是"连续"而不是"累计"。

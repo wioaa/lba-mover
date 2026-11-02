@@ -18,7 +18,14 @@ from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from typing import Any, Iterable, Sequence, get_type_hints
 
-from .enums import ErrorClass, FreeSpaceSide, Intensity, Strategy, VolumeKind
+from .enums import (
+    ErrorClass,
+    ExecMode,
+    FreeSpaceSide,
+    Intensity,
+    Strategy,
+    VolumeKind,
+)
 
 __all__ = [
     "Extent",
@@ -708,6 +715,18 @@ class JobParams:
     #: 不让开的话「整理到卷首」这个功能永远只报错。让开之后要说清楚实际
     #: 落在哪个区间（``Plan.reclaim_extent``），不能让用户以为贴着头。
     reclaim_avoid_protected: bool = True
+    #: 「尾部压实」的作用范围（块数，从卷尾往前算）。``0`` = 整卷。
+    #:
+    #: 只压一段而不是整卷，是因为整卷压实等于把全盘数据都搬到卷尾 —— 几小时
+    #: 的重写。多数人想要的是"最后这 50 GiB 别毛毛躁躁的"，给一个 0 表示整卷
+    #: 的逃生口即可。
+    pack_span_blocks: int = 0
+    #: 搬之前先用占位文件把目标区占住，防止执行期间被别的程序写进去。
+    #:
+    #: **只防"执行那一瞬间"的抢占**：占位是在计划已定、还没开搬的窗口里
+    #: 建立的，规划阶段的抢占它管不了。默认关闭 —— 真机路径需要
+    #: SeManageVolumePrivilege，本机尚未验证过。
+    preoccupy_target: bool = False
     #: 忽略失败继续跑完整卷：不因连续失败熔断，只在累计失败达到上限时停。
     #: 与「保守收尾」相反：适合"一次跑完、失败的最后一起看"，代价是设备真的
     #: 出问题时会空转更久。
@@ -722,6 +741,12 @@ class JobParams:
     #: 的文件加锁，失败方式与影响面都还没在真机上验证过。默认打开一个未验证
     #: 的锁，风险大于收益。
     partial_lock: bool = False
+    #: 搬运方式。默认 ``NATIVE``（盘内搬簇），切到 ``CACHED`` 会走那个
+    #: **完全独立**的缓存引擎 —— 两者不共享执行代码。
+    exec_mode: ExecMode = ExecMode.NATIVE
+    #: 缓存工作目录。``CACHED`` 模式下必须填，且**应该指向另一块盘**：
+    #: 指向同一块盘时总 IO 翻倍而顺序性不会变好，纯亏。
+    cache_dir: str = ""
     #: 整理强度：与策略正交的「动多少文件」维度。默认 ``STANDARD`` 就是
     #: 2.0.0H 之前的行为（只动碎片文件），所以升级本身不改变任何结果。
     intensity: Intensity = Intensity.STANDARD
@@ -754,10 +779,18 @@ class JobParams:
             errors.append("reserve_tail_blocks 不能为负")
         if self.reclaim_blocks < 0:
             errors.append("reclaim_blocks 不能为负")
+        if self.pack_span_blocks < 0:
+            errors.append("pack_span_blocks 不能为负")
         if not isinstance(self.reclaim_at, FreeSpaceSide):
             errors.append("reclaim_at 必须是 FreeSpaceSide")
         if not isinstance(self.intensity, Intensity):
             errors.append("intensity 必须是 Intensity")
+        if not isinstance(self.exec_mode, ExecMode):
+            errors.append("exec_mode 必须是 ExecMode")
+        if self.exec_mode is ExecMode.CACHED and not self.cache_dir.strip():
+            # 构造期就炸，而不是跑到一半才发现没地方放缓存 —— 那时候
+            # 已经在写盘了，中途停止会留下一个半搬运的卷。
+            errors.append("缓存搬运必须指定 cache_dir")
         if not (1 <= self.extreme_min_mib <= 1 << 20):
             errors.append("extreme_min_mib 必须在 1..1048576")
         if errors:

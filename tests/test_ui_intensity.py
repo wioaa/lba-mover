@@ -204,3 +204,87 @@ class TestMainWindowWiring:
             assert w._params.intensity is Intensity.EXTREME
         finally:
             w.close()
+
+
+class TestPackTailPanel:
+    """「压实卷尾」的界面：它和强度档位一样是约束式任务。
+
+    压实要看范围内的**全部**数据，只压一部分就会在数据区里留下洞 —— 那是
+    比不压实更糟的结果（用户以为压实了，实际中间还有空洞）。所以档位必须
+    禁用并说明原因，而不是留一个能点但无效的控件。
+    """
+
+    def test_six_modes_including_pack_tail(self, panel):
+        from lbamover.ui.widgets.strategy_panel import STRATEGY_ORDER
+
+        assert Strategy.PACK_TAIL in STRATEGY_ORDER
+        assert len(STRATEGY_ORDER) == 6
+        assert STRATEGY_ORDER[-1] is Strategy.PACK_TAIL, "新增模式一律追加到末尾"
+
+    def test_pack_panel_visibility_follows_mode(self, panel):
+        panel._group.button(5).click()
+        assert panel.strategy() is Strategy.PACK_TAIL
+        assert panel.pack.isVisibleTo(panel)
+        assert not panel.reclaim.isVisibleTo(panel), "两个参数面板不能同时出现"
+
+        panel._group.button(1).click()
+        assert not panel.pack.isVisibleTo(panel)
+
+    def test_intensity_disabled_with_reason(self, panel):
+        panel._group.button(5).click()
+        assert not panel.intensity_row.isEnabled(), (
+            "压实必须动范围内全部数据，档位不能可用"
+        )
+        assert "留洞" in panel.intensity_hint.text(), (
+            "要说明为什么，否则用户以为功能被禁用了"
+        )
+
+    def test_switching_away_restores_intensity(self, panel):
+        panel._group.button(5).click()
+        panel._group.button(1).click()
+        assert panel.intensity_row.isEnabled()
+
+    def test_default_span_is_whole_volume(self, panel):
+        assert panel.pack.blocks() == 0, "0 的语义是整卷，不是没设置"
+        assert panel.pack.size.text() == "整卷", "要给用户看得懂的文字，不是一个 0"
+
+    def test_span_change_emits(self, panel):
+        seen: list[int] = []
+        panel.packChanged.connect(lambda: seen.append(panel.pack.blocks()))
+        panel.pack.size.setValue(20)
+        assert seen == [panel.pack.blocks()]
+        assert seen[0] > 0
+
+    def test_geometry_clamped_to_volume(self, panel):
+        panel.pack.set_geometry(4096, 1024)  # 4 MiB 的小卷
+        assert panel.pack.size.value() <= 1
+
+
+class TestPackTailReachesParams:
+    def test_span_syncs_into_params(self, app):
+        from lbamover.ui import main_window as mw
+
+        w = mw.MainWindow(palette=DARK)
+        try:
+            w.strategy_panel._group.button(5).click()
+            assert w._strategy is Strategy.PACK_TAIL
+            w.strategy_panel.pack.size.setValue(30)
+            assert w._params.pack_span_blocks == w.strategy_panel.pack.blocks()
+            assert w._params.pack_span_blocks > 0
+        finally:
+            w.close()
+
+    def test_span_survives_param_panel_change(self, app):
+        """改并发数会造一份新的 JobParams —— 压实范围不能被悄悄清回整卷。"""
+        from lbamover.contract.models import JobParams
+        from lbamover.ui import main_window as mw
+
+        w = mw.MainWindow(palette=DARK)
+        try:
+            w.strategy_panel._group.button(5).click()
+            w.strategy_panel.pack.size.setValue(12)
+            span = w._params.pack_span_blocks
+            w._on_params(JobParams(concurrency=4))
+            assert w._params.pack_span_blocks == span
+        finally:
+            w.close()

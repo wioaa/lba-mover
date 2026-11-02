@@ -34,7 +34,7 @@ from ..contract.commands import (
     StartJob,
     UpdateTarget,
 )
-from ..contract.enums import JobState, LogLevel, Strategy
+from ..contract.enums import ExecMode, JobState, LogLevel, Strategy
 from ..contract.events import (
     FragMapEvent,
     JobDoneEvent,
@@ -362,8 +362,37 @@ class EngineCore:
             return False
         return True
 
+    def _check_exec_mode(self, plan: Plan | None) -> None:
+        """缓存引擎的硬闸门：已挂载的 NTFS 卷一律拒绝。
+
+        裸写绕过文件系统，会直接覆盖 ``$MFT`` 指着的簇区 —— 文件系统当场
+        损坏，而且损坏是"看起来成功了"的那种：数据写进去了，元数据没跟。
+        真机整理只有 ``MOVE_FILE`` 一条路。
+
+        这道闸门放在**执行前**而不是构造参数里，是因为 ``JobParams`` 可以在
+        界面上随时改，而卷是运行时才知道的。
+        """
+        if self.params.exec_mode is not ExecMode.CACHED:
+            return
+        vol = self.volume
+        if vol is None:
+            return
+        if vol.filesystem.upper() == "NTFS" and vol.is_mounted:
+            raise PlanRejected(
+                [
+                    "缓存搬运不能用于已挂载的 NTFS 卷：裸写会绕过文件系统、"
+                    "覆盖 $MFT 指着的簇区，导致卷损坏。",
+                    "真机整理请用默认的盘内搬运（FSCTL_MOVE_FILE）；"
+                    "缓存模式适用于卷镜像与内存盘。",
+                ]
+            )
+        if not self.params.cache_dir.strip():
+            raise PlanRejected(["缓存搬运必须指定工作目录（施工盘应指向另一块盘）"])
+
     def make_executor_factory(self, plan: Plan | None = None):
         """返回 ``factory(runner) -> Executor``；``None`` 表示用逐块拷贝。"""
+        if self.params.exec_mode is ExecMode.CACHED:
+            return self._make_cached_factory()
         if not self.uses_cluster_mover(plan):
             return None
         from ..devices.win32 import Win32ClusterMover
@@ -375,6 +404,12 @@ class EngineCore:
 
         def factory(runner) -> "NtfsMoveExecutor":
             mover = Win32ClusterMover(volume.device_path)
+            guard = None
+            if self.params.preoccupy_target:
+                from .preoccupy import PreoccupyGuard
+
+                # 占位文件必须落在**目标卷自己**上：MOVE_FILE 只在同卷内搬簇。
+                guard = PreoccupyGuard(mover, volume.mount_point, cluster_size)
             return NtfsMoveExecutor(
                 mover,
                 runner.params,
@@ -384,6 +419,25 @@ class EngineCore:
                 on_chunk=runner.chunk_callback,
                 on_retry=runner.retry_callback,
                 verify=runner.params.verify,
+                preoccupy=guard,
+            )
+
+        return factory
+
+    def _make_cached_factory(self):
+        """缓存引擎的工厂。**与上面的 MOVE_FILE 工厂没有任何共享代码。**"""
+        from .cache_engine import CacheConfig, CachedCopyExecutor
+
+        work_dir = self.params.cache_dir
+        chunk = self.params.chunk_blocks
+
+        def factory(runner):
+            return CachedCopyExecutor(
+                runner.src,
+                runner.dst,
+                runner.params,
+                CacheConfig(work_dir=work_dir, chunk_blocks=chunk),
+                control=self.control,
             )
 
         return factory
@@ -459,6 +513,8 @@ class EngineCore:
             for reason in plan.reasons:
                 self._log(LogLevel.ERROR, reason)
             raise PlanRejected(list(plan.reasons) or ["计划标记为不可行"])
+
+        self._check_exec_mode(plan)
 
         # 执行前复核：计划里不能有受保护对象，搬完必须留够空闲。
         # 规划阶段已经过滤过一次，这里再查一次——少这一道就是漏洞，因为
