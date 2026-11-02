@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from typing import Any, Iterable, Sequence, get_type_hints
 
-from .enums import ErrorClass, FreeSpaceSide, Strategy, VolumeKind
+from .enums import ErrorClass, FreeSpaceSide, Intensity, Strategy, VolumeKind
 
 __all__ = [
     "Extent",
@@ -722,7 +722,15 @@ class JobParams:
     #: 的文件加锁，失败方式与影响面都还没在真机上验证过。默认打开一个未验证
     #: 的锁，风险大于收益。
     partial_lock: bool = False
-
+    #: 整理强度：与策略正交的「动多少文件」维度。默认 ``STANDARD`` 就是
+    #: 2.0.0H 之前的行为（只动碎片文件），所以升级本身不改变任何结果。
+    intensity: Intensity = Intensity.STANDARD
+    #: 极端档认定「大文件」的下限（MiB）。只在 ``intensity=EXTREME`` 时生效。
+    #:
+    #: 做成可调而不是写死 256：卷的规模差很多，1 TiB 盘上 256 MiB 只能算中等
+    #: 文件，而 128 GiB 的盘上它就是巨型文件。默认值取"多数人在多数盘上会
+    #: 认同这是个大东西"的位置。
+    extreme_min_mib: int = 256
 
     def __post_init__(self) -> None:
         errors: list[str] = []
@@ -748,6 +756,10 @@ class JobParams:
             errors.append("reclaim_blocks 不能为负")
         if not isinstance(self.reclaim_at, FreeSpaceSide):
             errors.append("reclaim_at 必须是 FreeSpaceSide")
+        if not isinstance(self.intensity, Intensity):
+            errors.append("intensity 必须是 Intensity")
+        if not (1 <= self.extreme_min_mib <= 1 << 20):
+            errors.append("extreme_min_mib 必须在 1..1048576")
         if errors:
             raise ValueError("; ".join(errors))
 

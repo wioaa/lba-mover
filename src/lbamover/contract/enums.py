@@ -8,6 +8,7 @@ __all__ = [
     "ErrorClass",
     "EventKind",
     "FreeSpaceSide",
+    "Intensity",
     "JobState",
     "LogLevel",
     "Strategy",
@@ -87,6 +88,49 @@ class Strategy(str, Enum):
     @property
     def writes_blocks(self) -> bool:
         return self is not Strategy.ANALYZE_ONLY
+
+
+class Intensity(str, Enum):
+    """整理强度：同一种模式下，决定**动多少文件**。
+
+    与 :class:`Strategy` 正交。策略回答"往哪搬、怎么搬"，强度回答"动多大一片"。
+    旧版把两件事绑死在策略里（``COALESCE`` 只能作用于碎片文件，想动全部文件
+    就得换策略，连落点方向也一起变了），于是"我想更彻底一点"这个需求没有
+    任何入口 —— 换策略会顺手改掉目标，用户只能猜。
+
+    五档是**体积维度上的递进**，从最省到最狠::
+
+        FAST      碎片收益前 20%（≤500 个）
+        STANDARD  全部碎片文件                ← 默认，与 2.0.0H 之前完全一致
+        DEEP      碎片文件 + 不足 1 MiB 的零散小文件
+        THOROUGH  全部文件，无下限
+        EXTREME   只动大文件（默认 ≥256 MiB），按体积降序
+
+    ``EXTREME`` 不在"包含链"上：它是从体积维度切最大的一批，可能漏掉一堆
+    小碎片。这样切是刻意的 —— 极端档的用途是"把占了大半空间的那些文件
+    一次性归位，腾出大片连续区"，而不是"治所有碎片"。
+    """
+
+    FAST = "fast"
+    STANDARD = "standard"
+    DEEP = "deep"
+    THOROUGH = "thorough"
+    EXTREME = "extreme"
+
+    @property
+    def label(self) -> str:
+        """短名。写成属性是为了让界面、CLI、诊断报告共用一个来源 ——
+        文案写三份就是等它们漂移（这个项目在 ``to_dict`` 上已经吃过一次）。"""
+        return _INTENSITY_LABELS[self]
+
+
+_INTENSITY_LABELS: dict["Intensity", str] = {
+    Intensity.FAST: "快速",
+    Intensity.STANDARD: "标准",
+    Intensity.DEEP: "深度",
+    Intensity.THOROUGH: "彻底",
+    Intensity.EXTREME: "极端",
+}
 
 
 class FreeSpaceSide(str, Enum):

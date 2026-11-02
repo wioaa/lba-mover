@@ -180,7 +180,15 @@ def build_report(
             f"并发={params.concurrency}, 校验={'开' if params.verify else '关'}, "
             f"重试={params.max_retries}, 限速={params.rate_limit_mbps:g} MiB/s, "
             # 必须写进报告：用户说"为什么这么多失败都不停"，答案就在这一项上
-            f"忽略错误={'开' if params.ignore_errors else '关'}"
+            f"忽略错误={'开' if params.ignore_errors else '关'}, "
+            # 同理：档位决定"该搬多少个文件"。报告里没有它，就分不清
+            # "预演说 4 万个文件、实际只动了 200 个"是引擎出错还是档位选错了。
+            f"强度={params.intensity.label}"
+            + (
+                f"（大文件下限 {params.extreme_min_mib} MiB）"
+                if params.intensity.value == "extreme"
+                else ""
+            )
         )
 
     out.append(

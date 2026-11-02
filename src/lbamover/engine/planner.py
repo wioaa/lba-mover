@@ -1,25 +1,36 @@
 """整理策略与规划器：把「碎片报告」变成「一串可执行的文件搬迁」。
 
-四个策略的行为差异是**可观测的**，不是命名游戏：
+**两个正交的维度**——这是 2.0.0I 的核心改动：
+
+* :class:`Strategy` 回答"往哪搬、怎么搬"，只管落点与顺序；
+* :class:`Intensity` 回答"动多大一片"，只管**选哪些文件**。
+
+旧版把两件事绑死在策略里：``COALESCE`` 只能作用于碎片文件，想动全部文件
+就必须换成 ``COMPACT``，而换策略会顺手把落点方向也改掉。于是"我想更彻底
+一点"这个需求没有任何入口 —— 用户只能猜，猜错就是几小时的重排。
 
 ===================  ==========================================  ==================
-策略                 选的哪些文件 / 什么顺序                       目标落点
+策略                 顺序                                        目标落点
 ===================  ==========================================  ==================
-``COALESCE``         仅碎片文件，按「可回收碎片量」降序            卷首方向 first-fit
-``COMPACT``          全部选中文件，按当前起始 LCN 升序            卷首方向 first-fit
-``RELOCATE_TAIL``    仅碎片文件，按「可回收碎片量」降序            卷尾方向 first-fit
-``RECLAIM``          与目标区相交的全部文件，按距目标区远端升序    目标区另一侧
+``COALESCE``         按「可回收碎片量」降序                      卷首方向 first-fit
+``COMPACT``          按当前起始 LCN 升序                         卷首方向 first-fit
+``RELOCATE_TAIL``    按「可回收碎片量」降序                      卷尾方向 first-fit
+``RECLAIM``          与目标区相交的全部文件，按距目标区远端升序  目标区另一侧
 ``ANALYZE_ONLY``     不产生任何 op                                —
 ===================  ==========================================  ==================
 
-``COALESCE`` 与 ``COMPACT`` 的区别不在算法而在**目标**：前者只治单个文件
-内部的碎片，后者顺手把一堆本来就连续的小文件也往前挤，换来更大的尾部
-连续空间。
+强度档位（:func:`select_files`）::
 
-``RECLAIM`` 是个**约束式**任务，跟上面三个「优化式」的都不一样：不是
-"尽量搬得好一点"，而是"这几块必须空出来"。因此它的判据也不同 ——
-它不挑碎片文件，只挑挡路的文件；宁可放弃也不给出一个"大概腾出了"的
-结果，因为用户是按这个数字去规划下一步的（装虚拟机、拷大文件）。
+    FAST      碎片收益前 20%（≤500 个）
+    STANDARD  全部碎片文件                ← 默认
+    DEEP      碎片文件 + 不足 1 MiB 的零散小文件
+    THOROUGH  全部文件，无下限
+    EXTREME   只动大文件（默认 ≥256 MiB），按体积降序
+
+``RECLAIM`` 是**约束式**任务，跟其它模式都不一样：不是"尽量搬得好一点"，
+而是"这几块必须空出来"。所以它**不受强度档位影响** —— 挡路的文件必须全
+搬走，不能因为选了"快速"就只搬 20%。宁可放弃也不给出一个"大概腾出了"
+的结果，因为用户是按这个数字去规划下一步的（装虚拟机、拷大文件）。
 """
 
 from __future__ import annotations
@@ -27,19 +38,51 @@ from __future__ import annotations
 import bisect
 from typing import Iterable, Sequence
 
-from ..contract.enums import FreeSpaceSide, Strategy
+from ..contract.enums import FreeSpaceSide, Intensity, Strategy
 from ..contract.models import Extent, FragReport, JobParams, MoveOp, Plan
 from .alloc import FreeSpaceMap, IntervalSet
 
-__all__ = ["build_plan", "select_files", "order_files", "validate_plan"]
+__all__ = [
+    "build_plan",
+    "select_files",
+    "order_files",
+    "validate_plan",
+    "FAST_RATIO",
+    "FAST_MAX_FILES",
+    "DEEP_SMALL_FILE_MIB",
+]
+
+#: 「快速」档只做收益最好的这一比例。20% 是按"少数文件占掉大部分碎片收益"
+#: 的经验定的：再小就变成随机挑，再大就跟标准档没区别了。
+FAST_RATIO = 0.2
+
+#: 「快速」档的文件数上限。纯比例在几十万文件的卷上会挑出几万个，
+#: 那已经不是"快速"了。500 个是"十几分钟内能跑完"的量级。
+FAST_MAX_FILES = 500
+
+#: 「深度」档额外纳入的"零散小文件"上限。这类文件单个搬没收益，但它们
+#: 散在卷首会把连续空间切成小洞，成批归位才划算。
+DEEP_SMALL_FILE_MIB = 1
+
+
+def _frag_benefit(f) -> float:
+    """可回收碎片量：搬走这个文件大概能消掉多少"段间空隙"。"""
+    return (f.run_count - 1) * (f.total_blocks / max(1, f.run_count))
 
 
 def select_files(
     report: FragReport,
     strategy: Strategy,
     file_ids: Sequence[str] = (),
+    intensity: Intensity = Intensity.STANDARD,
+    params: JobParams | None = None,
 ) -> tuple[list, tuple[str, ...]]:
-    """按策略挑选文件。返回 ``(文件列表, 未找到的 id 列表)``。"""
+    """按强度挑文件。返回 ``(文件列表, 未找到的 id 列表)``。
+
+    ``strategy`` 只用来识别两种特殊情况：``ANALYZE_ONLY`` 不选任何文件，
+    ``RECLAIM`` 不看强度（约束式，挡路的必须全搬）。其余模式下**筛选完全
+    由 ``intensity`` 决定**，这正是这次解耦的目的。
+    """
     wanted = tuple(dict.fromkeys(file_ids))
     missing: tuple[str, ...] = ()
     if wanted:
@@ -49,27 +92,54 @@ def select_files(
     else:
         pool = list(report.files)
 
-    if strategy in (Strategy.COALESCE, Strategy.RELOCATE_TAIL):
-        pool = [f for f in pool if f.is_fragmented]
-    elif strategy is Strategy.ANALYZE_ONLY:
-        pool = []
-    return pool, missing
+    if strategy is Strategy.ANALYZE_ONLY:
+        return [], missing
+    if strategy is Strategy.RECLAIM:
+        # 约束式：要腾出的区间必须真的空出来，挑三拣四就会给出假结果。
+        return pool, missing
+
+    params = params or JobParams()
+    block_size = max(1, report.geometry.block_size)
+
+    if intensity is Intensity.FAST:
+        frags = [f for f in pool if f.is_fragmented]
+        frags.sort(key=lambda f: (-_frag_benefit(f), f.file_id))
+        # 至少留一个：碎片文件只有一个时"前 20%"不该算成 0 个 —— 用户点
+        # 快速是想"做一点"，不是想"什么都不做"。
+        keep = max(1, min(FAST_MAX_FILES, round(len(frags) * FAST_RATIO)))
+        return frags[:keep], missing
+
+    if intensity is Intensity.STANDARD:
+        return [f for f in pool if f.is_fragmented], missing
+
+    if intensity is Intensity.DEEP:
+        limit = DEEP_SMALL_FILE_MIB * 1024 * 1024
+        return [
+            f for f in pool if f.is_fragmented or f.total_blocks * block_size < limit
+        ], missing
+
+    if intensity is Intensity.THOROUGH:
+        return pool, missing
+
+    # EXTREME：体积维度切最大的一批。不叠加"必须碎片"——极端档要的是
+    # "把占了半盘的大文件一次性归位"，哪怕它本来是一整段连续的。
+    limit = max(1, params.extreme_min_mib) * 1024 * 1024
+    return [f for f in pool if f.total_blocks * block_size >= limit], missing
 
 
-def order_files(files: Iterable, strategy: Strategy) -> list:
+def order_files(
+    files: Iterable, strategy: Strategy, intensity: Intensity = Intensity.STANDARD
+) -> list:
     """排序决定"先搬谁"，直接影响能否腾出空间给后面的文件。"""
     items = list(files)
+    if intensity is Intensity.EXTREME:
+        # 最大的先搬：它最难找落点，先放下去才不会最后剩一块没人能用的空洞。
+        return sorted(items, key=lambda f: (-f.total_blocks, f.file_id))
     if strategy is Strategy.COMPACT:
         # 从低地址往高地址推进，每次腾出的空洞正好接着用
         return sorted(items, key=lambda f: (min(e.start for e in f.extents), f.file_id))
     # 碎片收益大的先做：腾出的连续空间最多，后续 op 更容易放下
-    return sorted(
-        items,
-        key=lambda f: (
-            -((f.run_count - 1) * (f.total_blocks / max(1, f.run_count))),
-            f.file_id,
-        ),
-    )
+    return sorted(items, key=lambda f: (-_frag_benefit(f), f.file_id))
 
 
 def build_plan(
@@ -96,7 +166,9 @@ def build_plan(
     if strategy is Strategy.RECLAIM:
         return _build_reclaim_plan(job_id, report, params, file_ids)
 
-    selected, missing = select_files(report, strategy, file_ids)
+    selected, missing = select_files(
+        report, strategy, file_ids, intensity=params.intensity, params=params
+    )
     notes: list[str] = []
     if missing and selected:
         # 部分失效是很常见的：用户选完文件、点了开始，中间文件被删掉/改名。
@@ -108,7 +180,7 @@ def build_plan(
         why = (
             f"指定的 {len(missing)} 个文件在扫描结果中不存在"
             if missing and not selected
-            else "没有需要整理的文件（未发现碎片）"
+            else _empty_reason(report, params)
         )
         return Plan(
             job_id=job_id,
@@ -119,7 +191,7 @@ def build_plan(
             notes=(why,),
         )
 
-    ordered = order_files(selected, strategy)
+    ordered = order_files(selected, strategy, params.intensity)
     free = FreeSpaceMap(report.free_extents, capacity=geometry.block_count)
 
     # 尚未搬走的文件占的块 —— 目标区绝对不能落在这里
@@ -192,6 +264,25 @@ def build_plan(
 
 def _mib(blocks: int, geometry) -> str:
     return f"{blocks * geometry.block_size / 1048576:.1f} MiB"
+
+
+def _empty_reason(report: FragReport, params: JobParams) -> str:
+    """挑不出文件时，说清楚是**为什么**挑不出。
+
+    "未发现碎片"对极端档是一句谎话：那时候卷里可能有一堆碎片，只是没有
+    达到体积门槛的大文件。用户看到"没有需要整理的文件"会以为盘很健康，
+    然后放弃这个功能 —— 必须点出是门槛挡住了，并给出下一步。
+    """
+    if params.intensity is Intensity.EXTREME:
+        limit = max(1, params.extreme_min_mib)
+        biggest = max((f.total_blocks for f in report.files), default=0)
+        biggest_mib = biggest * report.geometry.block_size / 1048576
+        return (
+            f"极端档只动 ≥{limit} MiB 的大文件，本次扫描里最大的文件是 "
+            f"{biggest_mib:.1f} MiB（共 {len(report.files)} 个）。"
+            f"调低「大文件下限」，或换成「彻底」档"
+        )
+    return "没有需要整理的文件（未发现碎片）"
 
 
 def _free_gaps(occupied: IntervalSet, total: int) -> list[tuple[int, int]]:

@@ -18,7 +18,7 @@ import tempfile
 import time
 
 from . import VERSION_DISPLAY
-from .contract.enums import Strategy, VolumeKind
+from .contract.enums import Intensity, Strategy, VolumeKind
 from .contract.models import JobParams, JobSpec, VolumeInfo
 from .contract.models import Geometry
 from .contract.ports import ListSink
@@ -95,7 +95,12 @@ def _run_pipeline(
         for reason in plan.reasons:
             print(f"       ! {reason}")
     if not plan.ops:
+        # 只说"计划为空"等于把原因藏起来。极端档在合成卷上必然为空
+        # （合成卷里没有几百万块的大文件），这时候报 FAIL 会让人以为工具坏了，
+        # 而真正该说的是"阈值挡住了，调低或换档"。
         print("[FAIL] 计划为空")
+        for note in plan.notes:
+            print(f"       ! {note}")
         return 1
 
     result = core.execute(plan, device)
@@ -146,6 +151,8 @@ def _cmd_selftest(args: argparse.Namespace) -> int:
         verify=not args.no_verify,
         ignore_errors=bool(getattr(args, "ignore_errors", False)),
         partial_lock=bool(getattr(args, "partial_lock", False)),
+        intensity=Intensity(getattr(args, "intensity", Intensity.STANDARD.value)),
+        extreme_min_mib=int(getattr(args, "extreme_min_mib", 256)),
     )
     return _run_pipeline(
         layout,
@@ -185,6 +192,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         chunk_blocks=args.chunk,
         ignore_errors=bool(getattr(args, "ignore_errors", False)),
         partial_lock=bool(getattr(args, "partial_lock", False)),
+        intensity=Intensity(getattr(args, "intensity", Intensity.STANDARD.value)),
+        extreme_min_mib=int(getattr(args, "extreme_min_mib", 256)),
     )
     return _run_pipeline(
         layout, device, strategy=Strategy(args.strategy), params=params, quiet=False
@@ -456,6 +465,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="半锁定：动之前先给要搬的簇加共享锁（别人还能读、写不进来），"
         "让扫描时的布局到搬的时候不变",
     )
+    s.add_argument(
+        "--intensity",
+        default=Intensity.STANDARD.value,
+        choices=[i.value for i in Intensity],
+        help="整理强度：动多少文件。"
+        "fast=最碎的 20%% / standard=全部碎片文件 / deep=碎片+零散小文件 / "
+        "thorough=全部文件 / extreme=只动大文件（按体积降序）",
+    )
+    s.add_argument(
+        "--extreme-min-mib",
+        type=int,
+        default=256,
+        help="极端强度下认定「大文件」的下限（MiB，默认 256）",
+    )
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=_cmd_selftest)
 
@@ -473,6 +496,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--partial-lock",
         action="store_true",
         help="半锁定：动之前先给要搬的簇加共享锁（别人还能读、写不进来）",
+    )
+    r.add_argument(
+        "--intensity",
+        default=Intensity.STANDARD.value,
+        choices=[i.value for i in Intensity],
+        help="整理强度：fast/standard/deep/thorough/extreme",
+    )
+    r.add_argument(
+        "--extreme-min-mib", type=int, default=256, help="极端强度的「大文件」下限（MiB）"
     )
     r.add_argument("--strategy", default=Strategy.COALESCE.value,
                    choices=[s.value for s in Strategy if s.writes_blocks])

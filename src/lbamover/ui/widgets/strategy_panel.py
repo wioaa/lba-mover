@@ -1,19 +1,17 @@
-"""策略选择。
+"""策略选择：**模式**与**强度**是两行，互不干扰。
 
-旧版把 ``range / auto_fill / compact / fragment / zone / relocate`` 六个
-策略并列在一个下拉里，用户无法自解释"我到底要干什么"。新版按**优化目标**
-命名，并且每个选项都带一句"它会动什么"，让选择变成可解释的动作：
+旧版把两件事绑死在策略里 —— ``COALESCE`` 只能作用于碎片文件，想动全部
+文件就得换成 ``COMPACT``，而换策略会顺手把落点方向也改掉。于是"我想更
+彻底一点"没有任何入口，用户只能猜，猜错就是几小时的重排。
 
-* 先说清楚痛点：单个文件太碎、没有大块连续空间、还是"我要腾地方装东西"；
-* 再对应到策略；第一个永远是"只分析"，给用户一条不写盘的安全路径。
+现在拆成：上面一行选**强度**（动多少文件），下面选**模式**（往哪搬）。
+五种模式 × 五档强度全部组合都成立，其中 ``RECLAIM`` / ``ANALYZE_ONLY``
+是例外：前者是约束式任务（挡路的必须全搬，挑三拣四就会给出假结果），
+后者根本不产生操作，所以它们选中时强度整行禁用并说明原因。
 
-**排版说明。** 五个策略若沿用"按钮里塞两行说明"，左栏会多出近 50px 而
-本来就刚好装满一屏。所以按钮只放 4~6 个字（两列网格），说明搬到下面单独
-一行随选择更新 —— 省了近 80px，说明还能写完整（按钮里那半句"为卷首让位"
-其实说不清让多少）。
-
-「可用空间整理」选中时会展开它自己的两个参数（多大 / 哪一侧），其余策略
-不占这块高度。
+**排版说明。** 旧版五个策略若沿用"按钮里塞两行说明"，左栏会多出近 50px
+而本来就刚好装满一屏。所以按钮只放 4~6 个字（两列网格），说明搬到下面
+单独一行随选择更新。强度行同理：五个两字短名排一行，说明另占一行。
 """
 
 from __future__ import annotations
@@ -22,14 +20,17 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QGridLayout,
+    QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 from ...contract.commands import STRATEGY_LABELS
-from ...contract.enums import FreeSpaceSide, Strategy
+from ...contract.enums import FreeSpaceSide, Intensity, Strategy
 from ..theme import DARK, Palette
 
 __all__ = [
@@ -38,6 +39,9 @@ __all__ = [
     "STRATEGY_HELP",
     "STRATEGY_SHORT",
     "STRATEGY_ORDER",
+    "INTENSITY_HELP",
+    "INTENSITY_ORDER",
+    "DEFAULT_INTENSITY",
 ]
 
 #: 每个策略的"它会做什么"——比名字更能决定用户点哪个
@@ -45,7 +49,7 @@ STRATEGY_HELP: dict[Strategy, str] = {
     Strategy.ANALYZE_ONLY: "只扫描出报告，不写任何一块",
     Strategy.COALESCE: "把每个碎片文件重排成一段连续区",
     Strategy.COMPACT: "把文件往卷首挤，腾出尾部大块连续空间",
-    Strategy.RELOCATE_TAIL: "把碎片文件搬到卷尾，为卷首让位",
+    Strategy.RELOCATE_TAIL: "把文件搬到卷尾，为卷首让位",
     Strategy.RECLAIM: "腾出指定大小的连续可用空间，位置可选卷首或卷尾",
 }
 
@@ -67,6 +71,40 @@ STRATEGY_ORDER: tuple[Strategy, ...] = (
     Strategy.RELOCATE_TAIL,
     Strategy.RECLAIM,
 )
+
+#: 强度顺序：从最省到最狠，界面按这个顺序排。
+INTENSITY_ORDER: tuple[Intensity, ...] = (
+    Intensity.FAST,
+    Intensity.STANDARD,
+    Intensity.DEEP,
+    Intensity.THOROUGH,
+    Intensity.EXTREME,
+)
+
+#: 每档"动多少文件"。这是用户真正在选的东西，所以写在可见的一行里，
+#: 不是塞进 tooltip 就完事。
+INTENSITY_HELP: dict[Intensity, str] = {
+    Intensity.FAST: "只做最碎的 20%（最多 500 个），几分钟出结果",
+    Intensity.STANDARD: "全部碎片文件，和旧版默认行为一致",
+    Intensity.DEEP: "碎片文件 + 零散小文件，顺手消掉卷首的空洞",
+    Intensity.THOROUGH: "全部文件重排，连本来连续的也一起挪",
+    Intensity.EXTREME: "只动大文件，按体积从大到小依次归位",
+}
+
+#: 切模式时带出的默认强度。**不是绑定**——切完仍可自由改档位，这里只负责
+#: 让"切换到某个模式"的初始结果符合直觉：
+#: ``COMPACT`` 的旧语义是"全部文件都往卷首挤"，对应彻底档；
+#: ``COALESCE`` / ``RELOCATE_TAIL`` 旧语义就是碎片文件，对应标准档。
+DEFAULT_INTENSITY: dict[Strategy, Intensity] = {
+    Strategy.ANALYZE_ONLY: Intensity.STANDARD,
+    Strategy.COALESCE: Intensity.STANDARD,
+    Strategy.COMPACT: Intensity.THOROUGH,
+    Strategy.RELOCATE_TAIL: Intensity.STANDARD,
+    Strategy.RECLAIM: Intensity.STANDARD,
+}
+
+#: 这两档不看强度：一个是约束式任务，一个不产生操作。
+_INTENSITY_FREE = (Strategy.RECLAIM, Strategy.ANALYZE_ONLY)
 
 
 class ReclaimPanel(QWidget):
@@ -173,6 +211,10 @@ class ReclaimPanel(QWidget):
 
 class StrategyPanel(QWidget):
     strategyChanged = Signal(object)  # Strategy
+    #: 强度档位变了 —— 影响"挑哪些文件"，必须重算预演
+    intensityChanged = Signal(object)  # Intensity
+    #: 极端档的"大文件下限"变了
+    extremeMinChanged = Signal()
     #: 可用空间整理的大小/位置变了 —— 需要重算预演
     reclaimChanged = Signal()
 
@@ -187,6 +229,52 @@ class StrategyPanel(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
 
+        # -- 强度行：一行五个两字短名 ----------------------------------
+        # 单独包一层是为了整行一起禁用（约束式任务时强度不适用），
+        # 而不是逐个按钮 setEnabled —— 那种写法漏一个就出现"半禁用"。
+        #
+        # **不放「强度」这个标签**：左栏只有 ~240px，加一个 30px 的标签
+        # 就会把第 5 个按钮挤出可视区（实测：极端档被整个切掉，用户根本
+        # 选不到）。维度名改由下面那行说明的前缀承担，那里是整行宽度。
+        self.intensity_row = QWidget()
+        irow = QHBoxLayout(self.intensity_row)
+        irow.setContentsMargins(0, 0, 0, 0)
+        irow.setSpacing(4)
+
+        self._intensity_group = QButtonGroup(self)
+        self._intensity_group.setExclusive(True)
+        self._intensity_buttons: list[QPushButton] = []
+        for i, inten in enumerate(INTENSITY_ORDER):
+            btn = QPushButton(inten.label)
+            btn.setObjectName("chip")
+            btn.setCheckable(True)
+            btn.setMinimumHeight(26)
+            # 五档等宽铺满一行：宽度一致才像"刻度"，按文字宽度自适应会
+            # 左边挤成一坨、右边空一大块，看不出这是一条从轻到重的谱。
+            #
+            # 必须显式压 ``minimumSize``：QSS 的 padding 会让每个按钮的
+            # ``minimumSizeHint`` 撑到 81px，五个加起来正好跟面板可用宽度
+            # 打平（421 vs 421），DPI 一缩放第 5 个就被裁掉 —— 用户看得见
+            # "彻底"却选不到"极端"，而界面上没有任何提示。
+            btn.setMinimumSize(40, 26)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            btn.setToolTip(f"{inten.label}：{INTENSITY_HELP[inten]}")
+            self._intensity_group.addButton(btn, i)
+            self._intensity_buttons.append(btn)
+            irow.addWidget(btn)
+        self._intensity_buttons[INTENSITY_ORDER.index(Intensity.STANDARD)].setChecked(True)
+        lay.addWidget(self.intensity_row)
+
+        self.intensity_hint = QLabel(f"强度 · {INTENSITY_HELP[Intensity.STANDARD]}")
+        self.intensity_hint.setObjectName("cardHint")
+        self.intensity_hint.setWordWrap(True)
+        self.intensity_hint.setMinimumHeight(22)
+        self.intensity_hint.setToolTip(
+            "强度决定动多少文件，与下面的模式正交：模式决定往哪搬，强度决定搬多大一片"
+        )
+        lay.addWidget(self.intensity_hint)
+
+        # -- 模式网格 --------------------------------------------------
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(6)
@@ -217,18 +305,68 @@ class StrategyPanel(QWidget):
         self.reclaim.setVisible(False)
         lay.addWidget(self.reclaim)
 
+        # -- 极端档的"大文件下限"（只在极端档出现）--------------------
+        self.extreme_row = QWidget()
+        erow = QHBoxLayout(self.extreme_row)
+        erow.setContentsMargins(0, 0, 0, 0)
+        erow.setSpacing(6)
+        elabel = QLabel("大文件下限")
+        elabel.setObjectName("cardHint")
+        self.extreme_min = QSpinBox()
+        self.extreme_min.setRange(1, 1 << 20)
+        self.extreme_min.setSuffix(" MiB")
+        self.extreme_min.setSingleStep(64)
+        self.extreme_min.setValue(256)
+        self.extreme_min.setMinimumHeight(26)
+        self.extreme_min.setToolTip(
+            "只搬不小于这个大小的文件。卷越大越该往上调 —— 1 TiB 盘上 256 MiB "
+            "只算中等文件，而 128 GiB 盘上它就是巨型文件"
+        )
+        erow.addWidget(elabel)
+        erow.addWidget(self.extreme_min)
+        erow.addStretch(1)
+        self.extreme_row.setVisible(False)
+        lay.addWidget(self.extreme_row)
+
         self._group.idClicked.connect(self._on_clicked)
+        self._intensity_group.idClicked.connect(self._on_intensity_clicked)
+        self.extreme_min.valueChanged.connect(self._on_extreme_min_changed)
 
     # -- 对外 -------------------------------------------------------------
 
     def _on_clicked(self, idx: int) -> None:
         strategy = self._index[idx]
+        # 切模式时带出该模式的默认强度：旧语义里 ``COMPACT`` 就是"全部文件
+        # 往卷首挤"，这里停在同一档才不会让升级变成一个静默的行为变更。
+        # 带出之后用户仍可自由改档位，这不是绑定。
+        self.set_intensity(DEFAULT_INTENSITY[strategy])
         self._apply_visual(strategy)
         self.strategyChanged.emit(strategy)
+        self.intensityChanged.emit(self.intensity())
+
+    def _on_intensity_clicked(self, idx: int) -> None:
+        inten = INTENSITY_ORDER[idx]
+        self._apply_intensity_visual(inten)
+        self.intensityChanged.emit(inten)
+
+    def _on_extreme_min_changed(self, _value: int) -> None:
+        self.extremeMinChanged.emit()
 
     def strategy(self) -> Strategy:
         idx = max(0, self._group.checkedId())
         return self._index[idx]
+
+    def intensity(self) -> Intensity:
+        idx = max(0, self._intensity_group.checkedId())
+        return INTENSITY_ORDER[idx]
+
+    def extreme_min_mib(self) -> int:
+        return int(self.extreme_min.value())
+
+    def set_extreme_min_mib(self, value: int) -> None:
+        self.extreme_min.blockSignals(True)
+        self.extreme_min.setValue(max(1, int(value)))
+        self.extreme_min.blockSignals(False)
 
     def set_strategy(self, strategy: Strategy) -> None:
         """程序化切换（恢复状态用）。**不发** ``strategyChanged``。"""
@@ -236,9 +374,35 @@ class StrategyPanel(QWidget):
             self._group.button(self._index.index(strategy)).setChecked(True)
             self._apply_visual(strategy)
 
+    def set_intensity(self, intensity: Intensity) -> None:
+        """程序化切换强度。**不发** ``intensityChanged``。"""
+        if intensity in INTENSITY_ORDER:
+            idx = INTENSITY_ORDER.index(intensity)
+            self._intensity_buttons[idx].setChecked(True)
+            self._apply_intensity_visual(intensity)
+
     def _apply_visual(self, strategy: Strategy) -> None:
         self.hint.setText(STRATEGY_HELP[strategy])
         self.reclaim.setVisible(strategy is Strategy.RECLAIM)
+        self._apply_intensity_visual(self.intensity())
+
+    def _apply_intensity_visual(self, intensity: Intensity) -> None:
+        strategy = self.strategy()
+        if strategy in _INTENSITY_FREE:
+            # 这两档不适用强度。**禁用并说清原因**，不要留个能点但无效的控件 ——
+            # 用户会以为"快速腾出空间"真的只搬 20%，然后按这个结果去规划下一步。
+            self.intensity_row.setEnabled(False)
+            self.intensity_hint.setText(
+                "强度 · 这项任务必须搬开所有挡路文件，档位不适用"
+                if strategy is Strategy.RECLAIM
+                else "强度 · 只分析不搬任何文件，档位不适用"
+            )
+            self.extreme_row.setVisible(False)
+            return
+
+        self.intensity_row.setEnabled(True)
+        self.intensity_hint.setText(f"强度 · {INTENSITY_HELP[intensity]}")
+        self.extreme_row.setVisible(intensity is Intensity.EXTREME)
 
     def setEnabled(self, enabled: bool) -> None:  # noqa: N802 - Qt 命名
         super().setEnabled(enabled)

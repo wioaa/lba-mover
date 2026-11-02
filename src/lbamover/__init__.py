@@ -18,7 +18,7 @@ VERSION = "2.0.0"
 
 #: 小版本字母（A/B/C…），空字符串表示基线版本。与 VERSION 分开存放，
 #: 因为 ``2.0.0A`` 不是合法 PEP 440，pip / setuptools 会直接拒绝。
-REVISION = "H"
+REVISION = "I"
 
 #: 对外展示用版本号。
 VERSION_DISPLAY = f"{VERSION}{REVISION}"

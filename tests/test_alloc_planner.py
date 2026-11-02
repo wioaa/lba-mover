@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import pytest
 
-from lbamover.contract.enums import Strategy
+from lbamover.contract.enums import Intensity, Strategy
 from lbamover.contract.models import Extent, FileFrag, FragReport, Geometry, JobParams
 from lbamover.engine.alloc import FreeSpaceMap, IntervalSet
 from lbamover.engine.frag import analyze, free_extents_from_files
@@ -99,13 +99,34 @@ class TestSelectFiles:
         assert [f.file_id for f in picked] == ["b"]
         assert missing == ()
 
-    def test_compact_picks_all(self):
+    def test_strategy_no_longer_decides_scope(self):
+        """策略只管落点，筛选交给强度档位（2.0.0I 的解耦）。
+
+        旧版 COMPACT 自带"全部文件"，想换落点方向就必须连带换文件集，
+        "我要更彻底一点"没有入口。现在 COMPACT 在标准档下和 COALESCE
+        选的是同一批碎片文件，差别只剩顺序与落点。
+        """
         report = make_report([
             FileFrag("a", "a", (Extent(0, 10),)),
             FileFrag("b", "b", (Extent(20, 5), Extent(40, 5))),
         ])
         picked, _ = select_files(report, Strategy.COMPACT)
-        assert len(picked) == 2
+        assert [f.file_id for f in picked] == ["b"], "标准档只动碎片文件"
+
+        picked, _ = select_files(report, Strategy.COMPACT, (), Intensity.THOROUGH)
+        assert len(picked) == 2, "彻底档才把连续文件也纳入"
+
+    def test_compact_keeps_its_own_ordering(self):
+        """两个模式在标准档下文件集相同，但顺序不同 —— 这是它们真正的差别。"""
+        report = make_report([
+            FileFrag("late", "late", (Extent(80, 5), Extent(120, 5))),
+            FileFrag("early", "early", (Extent(10, 5), Extent(40, 5))),
+        ])
+        picked, _ = select_files(report, Strategy.COMPACT)
+        assert [f.file_id for f in order_files(picked, Strategy.COMPACT)] == [
+            "early",
+            "late",
+        ]
 
     def test_unknown_ids_reported(self):
         report = make_report([FileFrag("a", "a", (Extent(0, 5), Extent(20, 5)))])
@@ -277,19 +298,23 @@ class TestSelectFiles:
 
     def test_only_listed_files_are_selected(self):
         report = self._report()
-        picked, missing = select_files(report, Strategy.COMPACT, ("a", "c"))
+        picked, missing = select_files(
+            report, Strategy.COMPACT, ("a", "c"), Intensity.THOROUGH
+        )
         assert {f.file_id for f in picked} == {"a", "c"}
         assert missing == ()
 
     def test_empty_ids_means_whole_volume(self):
         report = self._report()
-        picked, missing = select_files(report, Strategy.COMPACT, ())
+        picked, missing = select_files(report, Strategy.COMPACT, (), Intensity.THOROUGH)
         assert len(picked) == report.file_count
         assert missing == ()
 
     def test_duplicate_ids_are_deduped(self):
         report = self._report()
-        picked, _ = select_files(report, Strategy.COMPACT, ("a", "a", "b"))
+        picked, _ = select_files(
+            report, Strategy.COMPACT, ("a", "a", "b"), Intensity.THOROUGH
+        )
         assert len(picked) == 2
 
     def test_coalesce_still_drops_already_contiguous(self):

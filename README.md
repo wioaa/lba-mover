@@ -45,7 +45,7 @@ python packaging/build.py            # 图标 → 版本资源 → PyInstaller �
 | --- | --- |
 | `dist/LBAMover/LBAMover.exe` | 图形界面，双击即用（单一 exe 3 MB，运行库在 `_internal/`） |
 | `dist/LBAMover/LBAMover-cli.exe` | 命令行，`--version` / `volumes` / `scan` / `selftest` / `smoke` |
-| `dist/LBAMover-2.0.0H-win64.zip` | 解包即用，约 48 MiB |
+| `dist/LBAMover-2.0.0I-win64.zip` | 解包即用，约 48 MiB |
 | `dist/lbamover-2.0.0-py3-none-any.whl` | `pip install` 用 |
 | `dist/SHA256SUMS.txt` | 上述产物的校验和 |
 
@@ -74,7 +74,7 @@ PYTHONPATH=src python -m lbamover gui --demo
 PYTHONPATH=src python -m lbamover gui
 ```
 
-左栏选卷 → 选策略 → 预演 → 开始。中央是碎片分布双带图、指标块、最该整理的文件、
+左栏选卷 → 选强度与策略 → 预演 → 开始。中央是碎片分布双带图、指标块、最该整理的文件、
 进度与吞吐曲线；底部是可过滤的日志和固定操作栏。
 
 - **整理范围**：整卷，或手动勾选（支持搜索 / 只看碎片 / 按段数或大小排序）。
@@ -91,6 +91,8 @@ lbamover scan --volume D               # 扫描真实卷，打印碎片分布（
 lbamover selftest --blocks 4096 --files 24   # 合成卷全链路 + 逐块校验，成功输出 [PASS]
 lbamover ntfs --image dump.img --make-demo   # 没有镜像就先生成一份结构合法的合成 NTFS
 lbamover run --image disk.img --layout layout.json --strategy compact   # 对镜像做离线演练
+lbamover run --image disk.img --layout layout.json --strategy relocate_tail \
+        --intensity extreme --extreme-min-mib 512   # 极端档：只把 ≥512 MiB 的大文件搬到卷尾
 lbamover smoke                        # 无头冒烟：建窗口 + 跑完一次真实搬迁
 ```
 
@@ -117,6 +119,7 @@ from lbamover.engine import EngineCore
 | 簇级搬迁（`FSCTL_MOVE_FILE`） | ✅ 代码完整，⚠ **尚未在真实卷上执行过** |
 | 保护层（元文件 / 系统目录 / 页面文件 / 空闲余量） | ✅ 规划前过滤 + 执行前二次审计 |
 | 三个动作策略：合并碎片 / 向卷首聚拢 / 搬到卷尾 | ✅ 外加「只分析」零写入模式 |
+| **五档整理强度** | ✅ 强度与策略**正交**：策略决定往哪搬，强度决定动多少文件。快速（最碎的 20%）/ 标准（全部碎片，等同旧版）/ 深度（+零散小文件）/ 彻底（全部文件）/ 极端（只动 ≥256 MiB 的大文件，按体积降序归位卷尾）。「腾出可用空间」是约束式任务，不看强度 |
 | **可用空间整理** | ✅ 按 GiB 指定大小，选卷首或卷尾。只承诺"这段连续空闲确实是空的"——做不到就报差额，不给"搬了一半"的结果 |
 | **手动选文件** | ✅ 只整理勾选的，选择身份是文件路径而非行号（跨扫描稳定） |
 | **失败原因 + 一键复制诊断** | ✅ 每条失败带阶段、异常类型、错误分类、Windows 错误码；日志面板把版本与明细打包成一段可直接粘贴求助的文本 |
@@ -162,7 +165,7 @@ GUI 的 CI 上跑完整流程，UI 能用假引擎单测，平台差异没有渗
 ## 版本号约定
 
 `pyproject.toml` 的 `version` 永远只写三段（`2.0.0`，PEP 440 合法），小版本字母放在
-`[tool.lbamover].revision`，由代码拼成 `2.0.0H` 对外展示。
+`[tool.lbamover].revision`，由代码拼成 `2.0.0I` 对外展示。
 
-`2.0.0H` 不是合法 PEP 440，pip 会直接拒绝——所以字母不能进 `version` 字段。
+`2.0.0I` 不是合法 PEP 440，pip 会直接拒绝——所以字母不能进 `version` 字段。
 两处必须一致，`tests/test_version.py` 盯着这件事。

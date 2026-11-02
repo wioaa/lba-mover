@@ -44,7 +44,7 @@ from ..contract.commands import (
     StartJob,
     UpdateTarget,
 )
-from ..contract.enums import JobState, LogLevel, Strategy, VolumeKind
+from ..contract.enums import Intensity, JobState, LogLevel, Strategy, VolumeKind
 from ..contract.models import FragReport, JobParams, JobSpec, Plan, Progress, VolumeInfo
 from ..devices.base import DeviceError
 from ..devices.memory import MemoryDevice
@@ -65,7 +65,7 @@ from .widgets.file_select import FileSelectDialog
 from .widgets.progress_card import ProgressCard
 from .widgets.rate_chart import RateChart
 from .widgets.scope_panel import ScopePanel
-from .widgets.strategy_panel import STRATEGY_HELP, StrategyPanel
+from .widgets.strategy_panel import INTENSITY_HELP, STRATEGY_HELP, StrategyPanel
 from .widgets.volume_picker import VolumePicker
 
 __all__ = ["MainWindow"]
@@ -329,6 +329,8 @@ class MainWindow(QMainWindow):
         self.picker.volumeSelected.connect(self._on_volume_selected)
         self.picker.refreshRequested.connect(self._load_volumes)
         self.strategy_panel.strategyChanged.connect(self._on_strategy)
+        self.strategy_panel.intensityChanged.connect(self._on_intensity)
+        self.strategy_panel.extremeMinChanged.connect(self._on_extreme_min)
         self.strategy_panel.reclaimChanged.connect(self._on_reclaim_changed)
         self.scope_panel.scopeChanged.connect(self._on_scope_changed)
         self.scope_panel.pickRequested.connect(self._open_file_picker)
@@ -526,18 +528,49 @@ class MainWindow(QMainWindow):
             self.service.submit(Replan(self._strategy, self._scope_file_ids()))
 
     def _merge_reclaim(self, params: JobParams) -> JobParams:
-        """把「可用空间整理」的两个参数并进 params。
+        """把「可用空间整理」参数与「强度档位」并进 params。
 
-        这两项由策略面板提供，而参数面板不知道自己不该覆盖它们：用户改一次
+        这些都由策略面板提供，而参数面板不知道自己不该覆盖它们：用户改一次
         并发数，``ParamsPanel`` 会造一份全新的 ``JobParams``，reclaim 字段
         回到默认的 0 —— 于是"腾 100 GiB"静默变成"没设置"。
+
+        强度更隐蔽：它默认是 STANDARD，丢掉之后"极端档"会静默变成"标准档"，
+        跑起来才发现要搬的文件数完全不是刚才预演的那个数。
         """
         return replace(
             params,
             reclaim_blocks=self._params.reclaim_blocks,
             reclaim_at=self._params.reclaim_at,
             reclaim_avoid_protected=self._params.reclaim_avoid_protected,
+            intensity=self._params.intensity,
+            extreme_min_mib=self._params.extreme_min_mib,
         )
+
+    def _on_intensity(self, intensity: Intensity) -> None:
+        self._params = replace(self._params, intensity=intensity)
+        self.log_view.append(
+            LogLevel.INFO,
+            f"强度：{intensity.label} —— {INTENSITY_HELP.get(intensity, '')}",
+        )
+        self._replan_if_ready()
+
+    def _on_extreme_min(self) -> None:
+        mib = self.strategy_panel.extreme_min_mib()
+        self._params = replace(self._params, extreme_min_mib=mib)
+        self.log_view.append(LogLevel.INFO, f"极端档大文件下限：{mib} MiB")
+        self._replan_if_ready()
+
+    def _replan_if_ready(self) -> None:
+        """改了"选哪些文件"的参数就重算预演。
+
+        **不要**发 ``UpdateTarget`` —— 那会完整重扫一遍卷，用户只是想看看
+        换个档位要搬多少东西，不该为此等一次扫描。
+        """
+        if self._report is None:
+            return
+        if self._manual_scope and not self._selection:
+            return
+        self.service.submit(Replan(self._strategy, self._scope_file_ids()))
 
     def _on_reclaim_changed(self) -> None:
         panel = self.strategy_panel.reclaim
@@ -624,7 +657,9 @@ class MainWindow(QMainWindow):
             self,
             "确认执行整理",
             f"目标：{vol.mount_point}（{vol.filesystem}）\n"
-            f"策略：{STRATEGY_HELP.get(self._strategy, self._strategy.value)}\n\n"
+            f"策略：{STRATEGY_HELP.get(self._strategy, self._strategy.value)}\n"
+            f"强度：{self._params.intensity.label} —— "
+            f"{INTENSITY_HELP.get(self._params.intensity, '')}\n\n"
             "执行期间请勿断电、勿强制关机。是否继续？",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
