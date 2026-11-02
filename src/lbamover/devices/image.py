@@ -70,6 +70,45 @@ class ImageDevice(BlockDeviceBase):
             fh.truncate(size)
         return ImageDevice(path, block_size=block_size, writable=True)
 
+    # -- 半锁定（读取侧） --------------------------------------------------
+
+    def lock_range(self, offset_bytes: int, length_bytes: int) -> bool:
+        """给镜像文件的这段范围加共享锁（仅 Windows 有效）。
+
+        ``msvcrt.get_osfhandle`` 把 Python 的文件描述符换成内核句柄，
+        ``LockFileEx`` 要的是后者。
+
+        非 Windows 直接返回 ``False``：POSIX 的 ``fcntl`` 锁是进程级
+        建议锁，语义和 Windows 的字节范围锁不同，假装等价只会让人误信。
+        """
+        if os.name != "nt" or self._closed or length_bytes <= 0:
+            return False
+        try:
+            import msvcrt
+
+            from .win32 import Win32Native
+
+            handle = msvcrt.get_osfhandle(self._fh.fileno())
+            Win32Native.lock_file_range(handle, offset_bytes, length_bytes)
+            return True
+        except (OSError, DeviceError):
+            # 锁不上不改变"能不能读"：降级为无保护读取，由调用方自己决定
+            # 要不要把这件事告诉用户。
+            return False
+
+    def unlock_range(self, offset_bytes: int, length_bytes: int) -> None:
+        if os.name != "nt" or self._closed or length_bytes <= 0:
+            return
+        try:
+            import msvcrt
+
+            from .win32 import Win32Native
+
+            handle = msvcrt.get_osfhandle(self._fh.fileno())
+            Win32Native.unlock_file_range(handle, offset_bytes, length_bytes)
+        except (OSError, DeviceError):
+            pass
+
     def _read(self, lba: int, count: int, want: int) -> bytes:
         offset = lba * self.block_size
         got = bytearray()

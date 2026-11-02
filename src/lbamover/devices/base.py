@@ -116,6 +116,27 @@ class BlockDeviceBase(abc.ABC):
 
     # -- 公共入口 ---------------------------------------------------------
 
+    # -- 半锁定（读取侧） --------------------------------------------------
+
+    def lock_range(self, offset_bytes: int, length_bytes: int) -> bool:
+        """给底层介质的一段范围加**共享锁**，返回是否真的锁上了。
+
+        默认实现返回 ``False``：内存盘这类没有外部写入者的设备，锁既无处
+        可加，也没有意义。支持的实现（镜像文件）覆盖它。
+
+        读取路径用它回答一个具体问题：**"我读这段的时候，别人能不能改它"**。
+        读-改-读的场景里没这道锁，就可能读到一半旧一半新的数据，而两边
+        校验都通过（因为各自都是"读的时候是对的"）。
+
+        返回 ``False`` 不是错误 —— 调用方应当照常读，只是知道这段没有
+        保护伞。
+        """
+        return False
+
+    def unlock_range(self, offset_bytes: int, length_bytes: int) -> None:
+        """释放 :meth:`lock_range` 加的锁。默认什么都不做。"""
+        return None
+
     def read_blocks(self, lba: int, count: int) -> bytes:
         if self._closed:
             raise DeviceError("设备已关闭", error_class=ErrorClass.FATAL, lba=lba, count=count)

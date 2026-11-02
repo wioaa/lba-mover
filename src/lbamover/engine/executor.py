@@ -59,6 +59,16 @@ class ClusterMover(Protocol):
 
     def close_file(self, handle: object) -> None: ...
 
+    # -- 可选能力：半锁定 ---------------------------------------------------
+    # 下面两个**不在 Protocol 里强制**：测试用的假后端只要实现上面四个动作
+    # 就能跑完整调度，锁是可选的增强。执行器用 getattr 探测，没有就跳过。
+    #
+    #   def lock_range(self, handle: object, offset: int, length: int) -> None: ...
+    #   def unlock_range(self, handle: object, offset: int, length: int) -> None: ...
+    #
+    # 语义（真机实现见 Win32ClusterMover）：offset/length 是**文件内字节**
+    # 偏移，加的是共享锁 —— 别的进程仍能读，但写不进来。
+
 
 @runtime_checkable
 class Executor(Protocol):
@@ -111,6 +121,30 @@ def _runs_from_extents(extents: tuple[Extent, ...] | list[Extent]) -> list[tuple
         runs.append((vcn, e.start, e.length))
         vcn += e.length
     return runs
+
+
+def lock_ranges(op: MoveOp, cluster_size: int) -> list[tuple[int, int]]:
+    """op 的源区间 → 文件内字节范围 ``(offset, length)``，供半锁定使用。
+
+    VCN 从 0 累加（``Extent`` 按**文件内顺序**排列），乘簇大小得到字节偏移。
+    这里绝不能改成"按 LCN 排序再累加"：那样算出的偏移与文件实际内容错位，
+    锁到的是别的数据，而"已经锁住了"这个假象会让后面的布局复核也一起失去
+    意义 —— 复核比的是 VCN→LCN 映射，锁错地方它照样通过。
+
+    **逐段锁，段与段之间的空洞不锁**：空洞里的簇属于别的文件，替它上锁既
+    没必要，也可能挡住与我们无关的写入。这正是「部分簇范围」的字面意思 ——
+    只占住本 op 真正要动的那几段，不是把整个文件圈起来。
+
+    相邻两段若首尾相接，上层已先合并为一个 ``Extent``，所以这里不必再合并，
+    锁的段数就等于 ``src_extents`` 的长度。
+    """
+    ranges: list[tuple[int, int]] = []
+    vcn = 0
+    for extent in op.src_extents:
+        if extent.length > 0:
+            ranges.append((vcn * cluster_size, extent.length * cluster_size))
+        vcn += extent.length
+    return ranges
 
 
 def layout_mismatch(
@@ -182,6 +216,10 @@ class NtfsMoveExecutor:
         self.on_chunk = on_chunk
         self.on_retry = on_retry
         self.verify = verify
+        #: 半锁定没拿到的次数与第一个错误。锁是增强项，失败不该让文件失败，
+        #: 但必须留痕 —— 否则用户会以为"开了锁就万事大吉"。
+        self.lock_failures = 0
+        self.last_lock_error = ""
         self.policy = RetryPolicy(
             max_retries=params.max_retries,
             base_delay=params.retry_base_ms / 1000.0,
@@ -214,7 +252,13 @@ class NtfsMoveExecutor:
             )
 
         done = 0
+        locked: list[tuple[int, int]] = []
         try:
+            if self.params.partial_lock:
+                # 加锁必须在 query **之前**：先锁住要动的那几段，再读当前布局，
+                # 这样"读到的布局"和"接下来搬的布局"之间不存在可被外部改动的
+                # 时间窗。反过来先 query 再加锁，窗口依然存在，等于白锁。
+                locked = self._lock_op_ranges(handle, op)
             live = self.mover.query(handle)
             expected = _runs_from_extents(op.src_extents)
             mismatch = layout_mismatch(live, expected)
@@ -256,6 +300,9 @@ class NtfsMoveExecutor:
             return self._fail(op, str(exc), cancelled=False, blocks_done=done,
                               stage="搬簇", exc=exc, error_type=type(exc).__name__)
         finally:
+            # 先解锁、再关句柄。关句柄本身也会释放锁，但那依赖"没人提前
+            # return 忘掉它"；显式解锁让锁的持有区间在代码里可见。
+            self._release_op_ranges(handle, locked)
             try:
                 self.mover.close_file(handle)
             except Exception:  # noqa: BLE001 - 关句柄失败不该影响结果判定
@@ -311,6 +358,49 @@ class NtfsMoveExecutor:
             return False
         vcn, lcn, count = runs[0]
         return vcn == 0 and lcn == op.dst_start and count == op.blocks
+
+    # -- 半锁定 -----------------------------------------------------------
+
+    def _lock_op_ranges(self, handle: object, op: MoveOp) -> list[tuple[int, int]]:
+        """给 op 要动的簇区间加共享锁，返回**实际锁上的**范围列表。
+
+        锁不上**不阻止搬运**：锁是"降低被改概率"的增强，不是正确性前提 ——
+        布局复核那一步仍然会把关，扫描结果过期照样会被拦下。它的价值是把
+        "可能失败"变成"大概率不会失败"，而不是把校验换成锁。
+
+        但锁也不是免费的：给别的进程正在用的文件加锁，会让对方的写失败。
+        所以失败次数记在 ``lock_failures`` 上，由上层决定怎么告诉用户。
+        """
+        locker = getattr(self.mover, "lock_range", None)
+        if not callable(locker):
+            # 假后端（测试里的内存实现）可能不提供锁能力。**静默跳过**，
+            # 不记失败：这不是"锁没拿到"，是这套后端根本没有锁。
+            return []
+        got: list[tuple[int, int]] = []
+        for offset, length in lock_ranges(op, self.cluster_size):
+            try:
+                locker(handle, offset, length)
+                got.append((offset, length))
+            except (DeviceError, OSError) as exc:
+                self.lock_failures += 1
+                if not self.last_lock_error:
+                    self.last_lock_error = str(exc)
+        return got
+
+    def _release_op_ranges(self, handle: object, locked: list[tuple[int, int]]) -> None:
+        """释放本 op 拿到的锁。必须在 ``close_file`` 之前调用。"""
+        if not locked:
+            return
+        unlock = getattr(self.mover, "unlock_range", None)
+        if not callable(unlock):
+            return
+        for offset, length in locked:
+            try:
+                unlock(handle, offset, length)
+            except (DeviceError, OSError):
+                # 解锁失败不改变这个文件的结论：句柄紧接着就会关掉，
+                # Windows 在句柄关闭时自动释放它持有的全部范围锁。
+                pass
 
     def _fail(
         self,

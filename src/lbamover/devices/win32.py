@@ -93,6 +93,16 @@ ERROR_INVALID_FUNCTION = 1
 #: retrieval pointers 在"文件不占任何簇"时返回它（内容常驻 MFT 的小文件）
 ERROR_HANDLE_EOF = 38
 
+#: LockFileEx 标志位。
+#:
+#: ``FAIL_IMMEDIATELY`` 不是可选项：不加它，遇到别的进程已持锁会**阻塞**，
+#: 整个整理任务就卡在一次系统调用里，连"停止"都按不动。
+#: ``EXCLUSIVE_LOCK`` 默认不加 —— 不加就是**共享锁**：别人仍能读这段，
+#: 但不能写。这正是「半锁定」想要的，挡住改动、不挡住查看。
+LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
+LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
+
+
 
 # --------------------------------------------------------------------------
 # 结构体
@@ -121,6 +131,23 @@ class _MOVE_FILE_DATA(ctypes.Structure):
         ("StartingVcn", ctypes.c_longlong),
         ("StartingLcn", ctypes.c_longlong),
         ("ClusterCount", wintypes.DWORD),
+    ]
+
+
+class _OVERLAPPED(ctypes.Structure):
+    """``OVERLAPPED`` 的最小可用形态。
+
+    ``LockFileEx`` / ``UnlockFileEx`` 只认 ``Offset`` / ``OffsetHigh`` 作为
+    起始字节偏移，其余字段在同步文件句柄上用不到，但**必须存在且清零**：
+    内核按结构体大小读，少一个字段就是读越界。
+    """
+
+    _fields_ = [
+        ("Internal", ctypes.c_size_t),
+        ("InternalHigh", ctypes.c_size_t),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
     ]
 
 
@@ -301,6 +328,64 @@ class Win32Native:
     def close(handle: int) -> None:
         if handle:
             _kernel32().CloseHandle(wintypes.HANDLE(handle))
+
+    # -- 半锁定（字节范围锁） ----------------------------------------------
+
+    @staticmethod
+    def lock_file_range(handle: int, offset: int, length: int, *, exclusive: bool = False) -> None:
+        """锁住文件内一段字节范围。
+
+        默认是**共享锁**：别的进程仍然能读这段，但写会被拒。这叫「半锁定」
+        —— 挡住改动，不挡住查看。整卷整理时用户还能播那个视频，只是内容
+        不会被改坏；而我们要的正是"扫描时的布局"到"搬的时候"保持不变。
+
+        长度 0 在 ``LockFileEx`` 里的含义是"锁到文件末尾"，那个语义太宽，
+        这里直接拒绝：调用方必须给准长度，否则一次写错就把整个文件锁死。
+
+        失败会抛 :class:`DeviceError`。**调用方应当把它当成"这次锁没拿到"，
+        而不是"这个文件不能搬"** —— 锁是降低失败概率的增强，不是正确性
+        前提，布局复核那一步仍然会把关。
+        """
+        if length <= 0:
+            raise DeviceError(
+                "半锁定长度必须大于 0（LockFileEx 把长度 0 解释为「直到文件末尾」）",
+                error_class=ErrorClass.FATAL,
+            )
+        if offset < 0:
+            raise DeviceError(f"半锁定偏移不能为负：{offset}", error_class=ErrorClass.FATAL)
+
+        ov = _OVERLAPPED()
+        ov.Offset = offset & 0xFFFFFFFF
+        ov.OffsetHigh = (offset >> 32) & 0xFFFFFFFF
+        flags = LOCKFILE_FAIL_IMMEDIATELY | (LOCKFILE_EXCLUSIVE_LOCK if exclusive else 0)
+        ok = _kernel32().LockFileEx(
+            wintypes.HANDLE(handle),
+            flags,
+            0,
+            length & 0xFFFFFFFF,
+            (length >> 32) & 0xFFFFFFFF,
+            ctypes.byref(ov),
+        )
+        if not ok:
+            raise _win_error(f"锁定范围 [{offset}, +{length})")
+
+    @staticmethod
+    def unlock_file_range(handle: int, offset: int, length: int) -> None:
+        """解除 :meth:`lock_file_range` 加的锁。必须与加锁的范围逐字节一致。"""
+        if length <= 0 or not handle:
+            return
+        ov = _OVERLAPPED()
+        ov.Offset = offset & 0xFFFFFFFF
+        ov.OffsetHigh = (offset >> 32) & 0xFFFFFFFF
+        ok = _kernel32().UnlockFileEx(
+            wintypes.HANDLE(handle),
+            0,
+            length & 0xFFFFFFFF,
+            (length >> 32) & 0xFFFFFFFF,
+            ctypes.byref(ov),
+        )
+        if not ok:
+            raise _win_error(f"解锁范围 [{offset}, +{length})")
 
     # -- IOCTL ------------------------------------------------------------
 
@@ -799,6 +884,15 @@ class Win32ClusterMover:
 
     def close_file(self, handle: int) -> None:
         Win32Native.close(handle)
+
+    # -- 半锁定 -----------------------------------------------------------
+
+    def lock_range(self, handle: int, offset: int, length: int) -> None:
+        """给文件的字节范围加共享锁（见 :meth:`Win32Native.lock_file_range`）。"""
+        Win32Native.lock_file_range(handle, offset, length)
+
+    def unlock_range(self, handle: int, offset: int, length: int) -> None:
+        Win32Native.unlock_file_range(handle, offset, length)
 
     def close(self) -> None:
         if getattr(self, "_handle", 0):

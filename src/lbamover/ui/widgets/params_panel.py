@@ -92,7 +92,21 @@ class ParamsPanel(QWidget):
         # 三个"很少动、动了容易出事"的参数收进高级区，默认折叠。
         # 常驻 7 行会让左栏在 900 高的窗口里放不下，而其中 3 个参数
         # 用户一年也改不了一次。
-        self._advanced_rows = (self.depth, self.retries, self.reserve)
+        #
+        # 「半锁定」也放这里：它改变的是与系统其它程序的交互方式，不是
+        # 一次调优，属于"知道自己为什么要开才开"的那一类。
+        self.partial_lock = QCheckBox("半锁定簇区间（实验）")
+        self.partial_lock.setChecked(False)
+        self.partial_lock.setToolTip(
+            "动之前先给要搬的簇加共享锁：别的程序仍能读，但写不进来，\n"
+            "这样「扫描时的布局」到「搬的时候」不会被改（真机上 3/20 的失败\n"
+            "就是布局复核不通过）。\n"
+            "代价：对正在使用该文件的程序，它的写操作会失败；\n"
+            "读取路径（镜像演练）也会在读每一段时加同样的锁。"
+        )
+        form.addRow("", self.partial_lock)
+
+        self._advanced_rows = (self.depth, self.retries, self.reserve, self.partial_lock)
         self.advanced_toggle = QPushButton("高级参数 ▸")
         self.advanced_toggle.setObjectName("ghost")
         self.advanced_toggle.setCheckable(True)
@@ -122,6 +136,7 @@ class ParamsPanel(QWidget):
         self.rate.valueChanged.connect(self._emit)
         self.verify.toggled.connect(self._emit)
         self.ignore_errors.toggled.connect(self._on_ignore_errors_toggled)
+        self.partial_lock.toggled.connect(self._emit)
 
         self._refresh_budget()
 
@@ -143,6 +158,7 @@ class ParamsPanel(QWidget):
                 verify=self.verify.isChecked(),
                 reserve_tail_blocks=self.reserve.value(),
                 ignore_errors=self.ignore_errors.isChecked(),
+                partial_lock=self.partial_lock.isChecked(),
             )
         except ValueError as exc:
             self.error.setText(str(exc))
@@ -161,6 +177,7 @@ class ParamsPanel(QWidget):
             self.reserve.setValue(params.reserve_tail_blocks)
             self.verify.setChecked(params.verify)
             self.ignore_errors.setChecked(params.ignore_errors)
+            self.partial_lock.setChecked(params.partial_lock)
         finally:
             self._suppress = False
         self._sync_ignore_hint()
@@ -183,6 +200,8 @@ class ParamsPanel(QWidget):
         # 「忽略错误运行」也是结构性参数：它决定的是循环里的闸门，而闸门在
         # 构造 JobRunner 时就定了，中途改只会让界面与实际行为说法不一。
         self.ignore_errors.setEnabled(not locked)
+        # 半锁定同理：锁的时机在 run_op 里，中途切换只会前后不一致。
+        self.partial_lock.setEnabled(not locked)
 
     # -- 内部 -------------------------------------------------------------
 

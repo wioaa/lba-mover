@@ -145,6 +145,7 @@ def _cmd_selftest(args: argparse.Namespace) -> int:
         max_retries=args.retries,
         verify=not args.no_verify,
         ignore_errors=bool(getattr(args, "ignore_errors", False)),
+        partial_lock=bool(getattr(args, "partial_lock", False)),
     )
     return _run_pipeline(
         layout,
@@ -183,6 +184,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         block_size=args.block_size,
         chunk_blocks=args.chunk,
         ignore_errors=bool(getattr(args, "ignore_errors", False)),
+        partial_lock=bool(getattr(args, "partial_lock", False)),
     )
     return _run_pipeline(
         layout, device, strategy=Strategy(args.strategy), params=params, quiet=False
@@ -448,6 +450,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="忽略错误继续运行：不因连续失败停下，只在累计失败到上限时停",
     )
+    s.add_argument(
+        "--partial-lock",
+        action="store_true",
+        help="半锁定：动之前先给要搬的簇加共享锁（别人还能读、写不进来），"
+        "让扫描时的布局到搬的时候不变",
+    )
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=_cmd_selftest)
 
@@ -460,6 +468,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ignore-errors",
         action="store_true",
         help="忽略错误继续运行：不因连续失败停下，只在累计失败到上限时停",
+    )
+    r.add_argument(
+        "--partial-lock",
+        action="store_true",
+        help="半锁定：动之前先给要搬的簇加共享锁（别人还能读、写不进来）",
     )
     r.add_argument("--strategy", default=Strategy.COALESCE.value,
                    choices=[s.value for s in Strategy if s.writes_blocks])

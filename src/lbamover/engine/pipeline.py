@@ -91,6 +91,12 @@ class ChunkPipeline:
             max_delay=params.retry_max_ms / 1000.0,
         )
         self.retries = 0
+        #: 读取侧半锁定：开关打开且后端**声称**支持时才走加锁路径。
+        #: 内存盘这类没有外部写入者的设备在 ``lock_range`` 里返回 False，
+        #: 白调一次而已，不必在这里再判断能力。
+        self._lock_reads = bool(getattr(params, "partial_lock", False)) and callable(
+            getattr(src, "lock_range", None)
+        )
 
     # -- 单次操作 ---------------------------------------------------------
 
@@ -225,11 +231,32 @@ class ChunkPipeline:
     # -- 读写 -------------------------------------------------------------
 
     def _read_slice(self, sl: BlockSlice) -> bytes:
-        def once() -> bytes:
-            return self.src.read_blocks(sl.src_lba, sl.blocks)
+        if not self._lock_reads:
+            return run_with_retry(
+                lambda: self.src.read_blocks(sl.src_lba, sl.blocks),
+                self.policy,
+                on_retry=self._on_retry,
+                control=self.control,
+                sleep=self._sleep,
+            )
+
+        block_size = self.params.block_size
+        offset = sl.src_lba * block_size
+        length = sl.blocks * block_size
+
+        def guarded() -> bytes:
+            # 加锁与读取必须成对包在**同一次尝试**里：重试时重新加锁，
+            # 而不是沿用上一次可能已经失效的锁。读取耗时是外部进程改它的
+            # 唯一窗口，这个窗口越窄，"读到的数据是同一份"越可信。
+            held = self.src.lock_range(offset, length)
+            try:
+                return self.src.read_blocks(sl.src_lba, sl.blocks)
+            finally:
+                if held:
+                    self.src.unlock_range(offset, length)
 
         return run_with_retry(
-            once,
+            guarded,
             self.policy,
             on_retry=self._on_retry,
             control=self.control,
