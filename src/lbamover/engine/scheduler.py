@@ -22,7 +22,13 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from typing import Callable
 
-from ..contract.models import FailureDetail, JobParams, MoveOp, Plan
+from ..contract.models import (
+    MAX_IGNORED_FAILURES,
+    FailureDetail,
+    JobParams,
+    MoveOp,
+    Plan,
+)
 from .checkpoint import Checkpoint, CheckpointStore, JsonlJournal, merge_op_progress
 from .chunk import BlockSlice
 from .control import RunControl
@@ -214,6 +220,13 @@ class JobRunner:
             f"开始执行：{len(pending)} 个待搬文件，{plan.total_blocks} 块，"
             f"并发 {workers}，chunk {self.params.chunk_blocks} 块"
         )
+        if self.params.ignore_errors:
+            # 说在前面：后面"连续失败却不停"是用户自己选的，不是漏了熔断。
+            # 不解释的话，日志看起来就像一个该停没停的 bug。
+            self._log(
+                "已开启「忽略错误运行」：不因连续失败熔断，"
+                f"累计失败到 {MAX_IGNORED_FAILURES} 个才停止"
+            )
 
         self._executor = self._make_executor()
         try:
@@ -246,6 +259,9 @@ class JobRunner:
         futures: dict[Future, MoveOp] = {}
         consecutive_system = 0
         consecutive_local = 0
+        # 「忽略错误运行」的闸门：统计**所有**失败（不分阶段），成功不清零。
+        # 关掉开关时它只累加不判断，代价可以忽略。
+        total_failures = 0
         try:
             for op in ops:
                 if self.control.cancelled:
@@ -273,6 +289,7 @@ class JobRunner:
                     continue
                 if res.cancelled:
                     continue
+                total_failures += 1
                 # 两条独立的连续计数：失败性质不同，混在一起数就会让"一整批
                 # 文件被同一个程序占着"把真正的系统故障线索淹掉（真机事故见
                 # MAX_CONSECUTIVE_UNOPENABLE 的注释）。
@@ -286,6 +303,29 @@ class JobRunner:
                     self._log(f"遇到错误且开启了 fail-fast，停止后续任务：{res.error}")
                     self.control.request_cancel()
                     break
+                if self.params.ignore_errors:
+                    # 用户显式选择了"一次跑完"：跳过两条连续熔断。它们是保守
+                    # 收尾的判断，而这里的前提恰好是"连续失败不算理由"。
+                    # 但忽略错误不等于无限容忍：设备真的掉线时每个 op 都要走
+                    # 完重试与退避才判失败，不设上限会在废设备上空转几小时。
+                    # 上限本身定义在契约层（UI 要对用户承诺同一个数）。
+                    if total_failures >= MAX_IGNORED_FAILURES:
+                        # 按剩余量说话：第 N 个失败恰好是最后一个 op 时，
+                        # "停止剩余任务"这句话就是假的，用户会去找那些根本
+                        # 不存在的"剩余任务"。
+                        remaining = len(ops) - len(result.op_results)
+                        suffix = (
+                            f"，剩余 {remaining} 个未执行"
+                            if remaining > 0
+                            else "，已无剩余任务"
+                        )
+                        result.aborted = (
+                            f"已按「忽略错误运行」跳过所有连续失败，但累计失败已达 "
+                            f"{total_failures} 个（多半是设备或整个目录被占用）{suffix}"
+                        )
+                        self._log(result.aborted)
+                        break
+                    continue
                 if consecutive_system >= MAX_CONSECUTIVE_FAILURES:
                     # 熔断的门槛是"连续"，不是"一个"：单个文件被独占打开、
                     # 权限不足都是常态，绝不能因此停掉整卷整理。

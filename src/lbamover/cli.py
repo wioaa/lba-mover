@@ -144,6 +144,7 @@ def _cmd_selftest(args: argparse.Namespace) -> int:
         queue_depth=args.depth,
         max_retries=args.retries,
         verify=not args.no_verify,
+        ignore_errors=bool(getattr(args, "ignore_errors", False)),
     )
     return _run_pipeline(
         layout,
@@ -178,7 +179,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
             "seed": 0,
         },
     )()
-    params = JobParams(block_size=args.block_size, chunk_blocks=args.chunk)
+    params = JobParams(
+        block_size=args.block_size,
+        chunk_blocks=args.chunk,
+        ignore_errors=bool(getattr(args, "ignore_errors", False)),
+    )
     return _run_pipeline(
         layout, device, strategy=Strategy(args.strategy), params=params, quiet=False
     )
@@ -438,6 +443,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--strategy", default=Strategy.COALESCE.value,
                    choices=[s.value for s in Strategy if s.writes_blocks])
     s.add_argument("--no-verify", action="store_true", help="关闭回读校验（更快）")
+    s.add_argument(
+        "--ignore-errors",
+        action="store_true",
+        help="忽略错误继续运行：不因连续失败停下，只在累计失败到上限时停",
+    )
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=_cmd_selftest)
 
@@ -446,6 +456,11 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--layout", required=True, help="布局 JSON（files/free）")
     r.add_argument("--block-size", type=int, default=4096)
     r.add_argument("--chunk", type=int, default=64)
+    r.add_argument(
+        "--ignore-errors",
+        action="store_true",
+        help="忽略错误继续运行：不因连续失败停下，只在累计失败到上限时停",
+    )
     r.add_argument("--strategy", default=Strategy.COALESCE.value,
                    choices=[s.value for s in Strategy if s.writes_blocks])
     r.set_defaults(func=_cmd_run)

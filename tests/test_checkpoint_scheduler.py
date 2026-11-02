@@ -522,3 +522,108 @@ class TestBreakerAgainstRealWorldReport:
 
         assert res.aborted == "", "交替出现的两类失败不该被当成同类连续失败"
         assert res.failed_ops == count
+
+
+class TestIgnoreErrorsRunToCompletion:
+    """「忽略错误运行」：一次跑完，失败的留到最后一起看。
+
+    用户原话是"增加一个忽略错误运行选项"。要解决的问题很具体：整卷整理时
+    大半文件被占用/正在写入，默认的两条连续熔断（20 / 200）会提前收尾，用户
+    想要的却是"能搬的都搬完，失败的最后逐条列出来"。
+
+    这里锁三件事：开关打开时**不**熔断、开关打开时仍有累计上限、以及开关
+    关掉时默认行为一字不变（防回归）。用 ``executor_factory`` 注入
+    ``_ScriptedExecutor`` 而不是 MemoryDevice 的 ``fail_lba_set``，因为后者
+    只能造"写盘失败"，造不出"打不开文件"这条真机上最常见的连续失败序列。
+    """
+
+    def _plan(self, count: int) -> Plan:
+        ops = tuple(
+            MoveOp(
+                op_id=i, file_id=str(i), path=f"/f{i}",
+                src_extents=(Extent(6000 + i * 16, 8),),
+                dst_start=100 + i * 32, verify=False,
+            )
+            for i in range(count)
+        )
+        return Plan(job_id="t", strategy=Strategy.RELOCATE_TAIL, ops=ops)
+
+    def _run(self, tmp_path, script, count: int, params: JobParams) -> tuple:
+        dev = MemoryDevice(8192, 4096)
+        logs: list[str] = []
+        runner = JobRunner(
+            dev, dev, params, RunControl(),
+            store=CheckpointStore(tmp_path / "cp.json"),
+            on_log=logs.append,
+            executor_factory=lambda _r: _ScriptedExecutor(script),
+        )
+        return runner.run(self._plan(count)), logs
+
+    def test_continues_past_breaker_and_finishes_volume(self, tmp_path):
+        """用例 A：300 个「打开文件」连续失败之后，剩下 20 个文件照样要搬。
+
+        300 已经越过默认的 200 那道闸门，所以这条用例一过就说明"跳过熔断"
+        是真的跳过了，而不是阈值恰好没撞上。
+        """
+        from lbamover.engine.scheduler import MAX_CONSECUTIVE_UNOPENABLE
+
+        fail_prefix = MAX_CONSECUTIVE_UNOPENABLE + 100  # 300
+        tail_ok = 20
+        assert fail_prefix > MAX_CONSECUTIVE_UNOPENABLE
+        script = {
+            i: ("打开文件", "DeviceError", "retryable", 32) for i in range(fail_prefix)
+        }
+        res, _logs = self._run(
+            tmp_path,
+            script,
+            fail_prefix + tail_ok,
+            JobParams(chunk_blocks=8, max_retries=0, concurrency=1, ignore_errors=True),
+        )
+
+        assert res.aborted == "", f"打开开关后不该再熔断：{res.aborted}"
+        assert res.moved_ops == tail_ok, (
+            f"熔断之外的 {tail_ok} 个文件必须搬完，实际只有 {res.moved_ops} 个"
+        )
+        assert res.failed_ops == fail_prefix
+        assert not res.cancelled
+
+    def test_total_failure_ceiling_still_stops(self, tmp_path):
+        """用例 B：忽略错误不等于无限容忍，累计失败到上限必须停并说明原因。"""
+        from lbamover.contract.models import MAX_IGNORED_FAILURES
+
+        total = MAX_IGNORED_FAILURES + 50
+        script = {i: ("打开文件", "DeviceError", "retryable", 32) for i in range(total)}
+        res, logs = self._run(
+            tmp_path,
+            script,
+            total,
+            JobParams(chunk_blocks=8, max_retries=0, concurrency=1, ignore_errors=True),
+        )
+
+        assert res.aborted, "累计失败到上限必须留下原因，否则用户只看到「任务结束了」"
+        assert "忽略错误运行" in res.aborted, (
+            f"中止原因必须点出是用户开了这个开关，否则像系统故障：{res.aborted}"
+        )
+        assert res.failed_ops == MAX_IGNORED_FAILURES
+        assert any("忽略错误运行" in m for m in logs), "中止原因也要进日志"
+
+    def test_default_behaviour_unaffected(self, tmp_path):
+        """用例 C：开关关掉时，300 个「打开文件」失败仍然在 200 个处熔断。"""
+        from lbamover.engine.scheduler import MAX_CONSECUTIVE_UNOPENABLE
+
+        fail_prefix = MAX_CONSECUTIVE_UNOPENABLE + 100  # 300
+        script = {
+            i: ("打开文件", "DeviceError", "retryable", 32) for i in range(fail_prefix)
+        }
+        res, _logs = self._run(
+            tmp_path,
+            script,
+            fail_prefix + 20,
+            JobParams(chunk_blocks=8, max_retries=0, concurrency=1, ignore_errors=False),
+        )
+
+        assert res.aborted, "默认（保守收尾）行为被改坏了：该熔断却没熔断"
+        assert "打不开" in res.aborted
+        assert res.failed_ops == MAX_CONSECUTIVE_UNOPENABLE, (
+            f"默认阈值必须仍然是 {MAX_CONSECUTIVE_UNOPENABLE}：{res.failed_ops}"
+        )

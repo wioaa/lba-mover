@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...contract.models import JobParams
+from ...contract.models import MAX_IGNORED_FAILURES, JobParams
 from ..format import fmt_bytes
 from ..theme import DARK, Palette
 
@@ -57,6 +57,23 @@ class ParamsPanel(QWidget):
         self.reserve = _spin(0, 1_000_000, 0, " 块", "卷尾保留块数，为系统预留活动空间")
         self.verify = QCheckBox("回读校验（慢一倍，但能发现坏块）")
         self.verify.setChecked(True)
+        # 默认关闭：默认行为必须是"保守收尾"。打开它等于主动放弃熔断保护，
+        # 所以要用户自己勾，且旁边把代价写清楚。
+        self.ignore_errors = QCheckBox("忽略错误继续运行")
+        self.ignore_errors.setChecked(False)
+        self.ignore_errors.setToolTip(
+            "不因连续失败停下，把整卷能搬的搬完；累计失败到 "
+            f"{MAX_IGNORED_FAILURES} 个才会停。\n"
+            "代价：设备真的出问题（掉线、只读）时会在废设备上空转更久，\n"
+            "失败的条目最后统一列在日志与报告里。"
+        )
+        self._ignore_hint = QLabel(
+            "不因连续失败停下，把整卷能搬的搬完；累计失败到 "
+            f"{MAX_IGNORED_FAILURES} 个才会停。"
+        )
+        self._ignore_hint.setWordWrap(True)
+        self._ignore_hint.setStyleSheet(f"color: {palette.text_faint}; font-size: 11px;")
+        self._ignore_hint.setVisible(False)
 
         form.addRow("分块大小", self.chunk)
         form.addRow("队列深度", self.depth)
@@ -65,6 +82,12 @@ class ParamsPanel(QWidget):
         form.addRow("限速", self.rate)
         form.addRow("尾部保留", self.reserve)
         form.addRow("", self.verify)
+        # 独立占一行：它跟"回读校验"是两个正交的决策，不能挤在同一格，
+        # 也不能靠布局间隙找位置（本项目踩过控件重叠、标题被压）。
+        form.addRow("", self.ignore_errors)
+        # 说明只在勾选时出现，平时不占面板高度（左栏在 900 高的窗口里很紧）
+        form.addRow("", self._ignore_hint)
+        form.setRowVisible(self._ignore_hint, False)
 
         # 三个"很少动、动了容易出事"的参数收进高级区，默认折叠。
         # 常驻 7 行会让左栏在 900 高的窗口里放不下，而其中 3 个参数
@@ -98,6 +121,7 @@ class ParamsPanel(QWidget):
             widget.valueChanged.connect(self._emit)
         self.rate.valueChanged.connect(self._emit)
         self.verify.toggled.connect(self._emit)
+        self.ignore_errors.toggled.connect(self._on_ignore_errors_toggled)
 
         self._refresh_budget()
 
@@ -118,6 +142,7 @@ class ParamsPanel(QWidget):
                 rate_limit_mbps=float(self.rate.value()),
                 verify=self.verify.isChecked(),
                 reserve_tail_blocks=self.reserve.value(),
+                ignore_errors=self.ignore_errors.isChecked(),
             )
         except ValueError as exc:
             self.error.setText(str(exc))
@@ -135,8 +160,10 @@ class ParamsPanel(QWidget):
             self.rate.setValue(params.rate_limit_mbps)
             self.reserve.setValue(params.reserve_tail_blocks)
             self.verify.setChecked(params.verify)
+            self.ignore_errors.setChecked(params.ignore_errors)
         finally:
             self._suppress = False
+        self._sync_ignore_hint()
         self._refresh_budget()
 
     def _toggle_advanced(self) -> None:
@@ -153,8 +180,26 @@ class ParamsPanel(QWidget):
         """任务运行期间锁住结构性参数（热更新只允许限速与校验）。"""
         for widget in (self.chunk, self.depth, self.concurrency, self.retries, self.reserve):
             widget.setEnabled(not locked)
+        # 「忽略错误运行」也是结构性参数：它决定的是循环里的闸门，而闸门在
+        # 构造 JobRunner 时就定了，中途改只会让界面与实际行为说法不一。
+        self.ignore_errors.setEnabled(not locked)
 
     # -- 内部 -------------------------------------------------------------
+
+    def _on_ignore_errors_toggled(self, checked: bool) -> None:
+        self._sync_ignore_hint(checked)
+        self._emit()
+
+    def _sync_ignore_hint(self, show: bool | None = None) -> None:
+        """说明文字只在勾选时出现，避免常驻多占一行高度。"""
+        if show is None:
+            show = self.ignore_errors.isChecked()
+        form = self.layout().itemAt(0).layout()
+        if form is not None:
+            form.setRowVisible(self._ignore_hint, show)
+            form.activate()
+        self._ignore_hint.setVisible(show)
+        self.updateGeometry()
 
     def _emit(self) -> None:
         if self._suppress:

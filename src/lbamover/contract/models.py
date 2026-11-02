@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field, replace
-from typing import Any, Iterable, Sequence
+from dataclasses import dataclass, field, fields, replace
+from enum import Enum
+from typing import Any, Iterable, Sequence, get_type_hints
 
 from .enums import ErrorClass, FreeSpaceSide, Strategy, VolumeKind
 
@@ -28,6 +29,7 @@ __all__ = [
     "Geometry",
     "JobParams",
     "JobSpec",
+    "MAX_IGNORED_FAILURES",
     "MoveOp",
     "Plan",
     "Progress",
@@ -653,6 +655,14 @@ class Plan:
 # --------------------------------------------------------------------------
 
 
+#: 开启「忽略错误运行」后，累计失败到多少个才停止。
+#:
+#: 放在契约层而不是调度器里：它是 UI 要**对用户承诺**的数字，而 widget
+#: 不许 import engine（见 ui/widgets/__init__.py）。用户看到的「到 1000 个
+#: 才停」必须与引擎实际行为是同一个数——写两份就是等着它们漂移。
+MAX_IGNORED_FAILURES = 1000
+
+
 @dataclass(frozen=True, slots=True)
 class JobParams:
     """运行参数。UI 的「参数配置」面板映射到这里，非法值在构造期就炸。
@@ -698,6 +708,10 @@ class JobParams:
     #: 不让开的话「整理到卷首」这个功能永远只报错。让开之后要说清楚实际
     #: 落在哪个区间（``Plan.reclaim_extent``），不能让用户以为贴着头。
     reclaim_avoid_protected: bool = True
+    #: 忽略失败继续跑完整卷：不因连续失败熔断，只在累计失败达到上限时停。
+    #: 与「保守收尾」相反：适合"一次跑完、失败的最后一起看"，代价是设备真的
+    #: 出问题时会空转更久。
+    ignore_errors: bool = False
 
     def __post_init__(self) -> None:
         errors: list[str] = []
@@ -743,25 +757,46 @@ class JobParams:
         return replace(self, **kw)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "block_size": self.block_size,
-            "chunk_blocks": self.chunk_blocks,
-            "queue_depth": self.queue_depth,
-            "concurrency": self.concurrency,
-            "max_retries": self.max_retries,
-            "retry_base_ms": self.retry_base_ms,
-            "retry_max_ms": self.retry_max_ms,
-            "rate_limit_mbps": self.rate_limit_mbps,
-            "verify": self.verify,
-            "checkpoint_every_chunks": self.checkpoint_every_chunks,
-            "allow_raw_write_on_mounted": self.allow_raw_write_on_mounted,
-            "reserve_tail_blocks": self.reserve_tail_blocks,
-        }
+        """按字段自动导出，**不手写键名**。
+
+        手写列表已经漏过四个字段（``reclaim_blocks`` / ``reclaim_at`` /
+        ``reclaim_avoid_protected`` / ``ignore_errors``），而漏掉的表现是
+        "往返后静默回到默认值"——界面和日志都看不出来，只有行为悄悄变了。
+        照着 ``fields(self)`` 走，以后加字段就自动跟随。
+
+        枚举导出成 ``.value``（可 JSON 化）；还原由 :meth:`from_dict` 按类型
+        注解转回来，两边是一对，改一边必须改另一边。
+        """
+        out: dict[str, Any] = {}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            out[f.name] = value.value if isinstance(value, Enum) else value
+        return out
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "JobParams":
-        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
-        return cls(**{k: v for k, v in raw.items() if k in known})
+        """``to_dict`` 的逆操作：按类型注解把字符串还原成枚举。
+
+        必须做这一步，因为 ``to_dict`` 输出的是 ``.value``，而
+        ``__post_init__`` 会校验"``reclaim_at`` 必须是 ``FreeSpaceSide``"，
+        不转换就是构造期直接 ``ValueError``。
+        未知键直接忽略（老版本断点文件里可能多出已删除的字段）。
+        """
+        hints = get_type_hints(cls)
+        known = {f.name for f in fields(cls)}
+        kw: dict[str, Any] = {}
+        for key, value in raw.items():
+            if key not in known:
+                continue
+            want = hints.get(key)
+            if (
+                isinstance(want, type)
+                and issubclass(want, Enum)
+                and not isinstance(value, want)
+            ):
+                value = want(value)
+            kw[key] = value
+        return cls(**kw)
 
 
 @dataclass(frozen=True, slots=True)

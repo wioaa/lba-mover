@@ -178,7 +178,9 @@ def build_report(
         out.append(
             f"参数: chunk={params.chunk_blocks} 块, 队列={params.queue_depth}, "
             f"并发={params.concurrency}, 校验={'开' if params.verify else '关'}, "
-            f"重试={params.max_retries}, 限速={params.rate_limit_mbps:g} MiB/s"
+            f"重试={params.max_retries}, 限速={params.rate_limit_mbps:g} MiB/s, "
+            # 必须写进报告：用户说"为什么这么多失败都不停"，答案就在这一项上
+            f"忽略错误={'开' if params.ignore_errors else '关'}"
         )
 
     out.append(

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from lbamover.contract.enums import ErrorClass, JobState, Strategy
+from lbamover.contract.enums import ErrorClass, FreeSpaceSide, JobState, Strategy
 from lbamover.contract.models import (
     Extent,
     FileFrag,
@@ -153,6 +153,62 @@ class TestJobParams:
     def test_roundtrip_dict(self):
         p = JobParams(chunk_blocks=64, concurrency=3)
         assert JobParams.from_dict(p.to_dict()) == p
+
+    def test_roundtrip_covers_every_field(self):
+        """每个字段都要往返 —— ``to_dict`` 手写键名的年代漏过四个字段。
+
+        漏字段的表现不是报错，而是"往返后静默回到默认值"：用户在界面勾了
+        「忽略错误运行」，参数一旦落盘/回放就变回保守收尾，日志里看不出区别。
+        所以这里不只比相等，还先比**键集合**，让漏字段立刻指认到具体名字；
+        再逐字段比，让值错时能指出是哪一项（``==`` 只给一个 False）。
+        """
+        from dataclasses import fields
+
+        p = JobParams(
+            block_size=8192,
+            chunk_blocks=32,
+            queue_depth=3,
+            concurrency=2,
+            max_retries=5,
+            retry_base_ms=20,
+            retry_max_ms=500,
+            rate_limit_mbps=12.0,
+            verify=False,
+            checkpoint_every_chunks=8,
+            allow_raw_write_on_mounted=True,
+            reserve_tail_blocks=64,
+            reclaim_blocks=4096,
+            reclaim_at=FreeSpaceSide.HEAD,
+            reclaim_avoid_protected=False,
+            ignore_errors=True,
+        )
+        dumped = p.to_dict()
+
+        declared = {f.name for f in fields(JobParams)}
+        assert declared == set(dumped), (
+            f"to_dict 漏字段：{sorted(declared - set(dumped))}；"
+            f"多出未知键：{sorted(set(dumped) - declared)}"
+        )
+
+        back = JobParams.from_dict(dumped)
+        assert back == p
+        for f in fields(JobParams):
+            assert getattr(back, f.name) == getattr(p, f.name), f"字段 {f.name} 往返后变了"
+
+    def test_from_dict_restores_enum_from_plain_value(self):
+        """``to_dict`` 输出 ``.value``，``from_dict`` 必须按注解转回枚举。
+
+        不做这一步就是构造期直接炸：``reclaim_at 必须是 FreeSpaceSide``。
+        """
+        raw = JobParams(reclaim_at=FreeSpaceSide.TAIL).to_dict()
+        assert raw["reclaim_at"] == "tail", "枚举应导出成可 JSON 化的 value"
+        assert JobParams.from_dict(raw).reclaim_at is FreeSpaceSide.TAIL
+
+    def test_from_dict_ignores_unknown_keys(self):
+        """老断点文件里可能带着已删除的字段，不能因此构造失败。"""
+        raw = JobParams(chunk_blocks=32).to_dict()
+        raw["legacy_field_from_2_0_0a"] = "x"
+        assert JobParams.from_dict(raw).chunk_blocks == 32
 
 
 class TestProgressAndGeometry:

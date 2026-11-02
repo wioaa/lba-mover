@@ -30,7 +30,7 @@ where = ["src"]
 # 这里是**声明**。两者必须一致，tests/test_version.py 会盯着——
 # 只写一处而另一处忘了改，是"发布了 2.0.0A 但 pip 装出来是 2.0.0"的成因。
 [tool.lbamover]
-revision = "F"
+revision = "G"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
