@@ -389,6 +389,19 @@ class ParamsPanel(QWidget):
         self.cache_dir.setEnabled(self.exec_cached.isChecked())
         self.mem_blocks.setEnabled(self.exec_memcached.isChecked())
         self.mem_kib.setEnabled(self.exec_memcached.isChecked())
+        # 预占与半锁定都是 **MOVE_FILE 路径**上的动作：前者用占位文件占住目标
+        # 簇，后者给要搬的簇加共享锁。缓存引擎写的是裸块设备，这两件事对它
+        # 没有意义 —— 留着能勾就是"看着生效、实际被忽略"。
+        cache_on = self.exec_cached.isChecked() or self.exec_memcached.isChecked()
+        self.preoccupy.setEnabled(not cache_on)
+        self.partial_lock.setEnabled(not cache_on)
+        hint = "缓存搬运不使用盘内搬簇，预占与半锁定对它不适用"
+        self.preoccupy.setToolTip(
+            hint
+            if cache_on
+            else "搬之前先用占位文件把目标区占住，防止执行期间被别的程序写进去。\n"
+            "只防执行那一瞬间的抢占，规划阶段的抢占管不了。\n需要管理员权限；真机尚未验证。"
+        )
 
     def _toggle_advanced(self) -> None:
         shown = self.advanced_toggle.isChecked()

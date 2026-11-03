@@ -597,6 +597,17 @@ class EngineCore:
             raise PlanRejected(list(plan.reasons) or ["计划标记为不可行"])
 
         self.check_exec_mode(plan)
+        # 预占与半锁定都挂在 MOVE_FILE 路径上（占位文件、簇级共享锁），缓存
+        # 引擎写裸块设备，用不上。用户勾了却什么都不发生，比报错更难查 ——
+        # 至少说一句，别让诊断报告里那句"预占=开"变成假话。
+        if self.params.exec_mode.uses_cache and (
+            self.params.preoccupy_target or self.params.partial_lock
+        ):
+            self._log(
+                LogLevel.WARNING,
+                "预占目标区与半锁定簇区间只作用于盘内搬簇（MOVE_FILE），"
+                f"当前是「{self.params.exec_mode.value}」搬运，这两项被忽略",
+            )
 
         # 执行前复核：计划里不能有受保护对象，搬完必须留够空闲。
         # 规划阶段已经过滤过一次，这里再查一次——少这一道就是漏洞，因为

@@ -168,30 +168,53 @@ class CachedCopyExecutor:
 
         path = self._cache_path(op)
         done = max(0, start_blocks)
+        written = 0
         try:
-            self._fill_cache(op, runs, path, block_size)
+            filled = self._fill_cache(op, runs, path, block_size)
+            if filled < total:
+                # 第一阶段被打断（取消），缓存文件里只有前 filled 块是真数据。
+                # **绝不能让第二阶段去读它**：``preallocate`` 把文件扩到了最终
+                # 大小，未写部分是零，读出来写进目标就是拿零覆盖别人的数据；
+                # 断点续做时更糟 —— 前面 done 块被跳过，正好从零区长开始写。
+                return OpResult(
+                    op.op_id,
+                    0,
+                    0,
+                    ok=False,
+                    cancelled=True,
+                    error=f"写缓存被中断（{filled}/{total} 块），未向目标写入任何数据",
+                )
             written = self._drain_cache(op, runs, path, block_size, done)
         except DeviceError as exc:
             return OpResult(
                 op.op_id,
-                0,
-                0,
+                written,
+                written * block_size,
                 ok=False,
                 error=f"{exc}",
                 stage="缓存搬运",
                 error_type=type(exc).__name__,
-                error_class=ErrorClass.RETRYABLE.value,
+                error_class=getattr(
+                    getattr(exc, "error_class", None), "value", ErrorClass.RETRYABLE.value
+                ),
                 winerror=getattr(exc, "winerror", 0) or 0,
             )
         except OSError as exc:
             # 缓存盘满、路径不可写、文件被占用 —— 这些都只影响这一个 op，
             # 但都不该重试（同一个错误会立刻再发生一次）。
+            hint = ""
+            if getattr(exc, "errno", None) == 28:  # ENOSPC / ERROR_DISK_FULL
+                need = total * block_size / 1048576
+                hint = (
+                    f"（这个文件需要 {need:.1f} MiB 中转空间，"
+                    f"缓存目录 {self.config.work_dir} 空间不足）"
+                )
             return OpResult(
                 op.op_id,
-                0,
-                0,
+                written,
+                written * block_size,
                 ok=False,
-                error=f"缓存文件操作失败：{exc}",
+                error=f"缓存文件操作失败{hint}：{exc}",
                 stage="写缓存",
                 error_type=type(exc).__name__,
                 error_class=ErrorClass.FATAL.value,
@@ -249,12 +272,18 @@ class CachedCopyExecutor:
                 pos += n
             offset += blocks
 
-    def _fill_cache(self, op: MoveOp, runs, path: str, block_size: int) -> None:
-        """阶段一：读源 → 顺序写缓存。"""
+    def _fill_cache(self, op: MoveOp, runs, path: str, block_size: int) -> int:
+        """阶段一：读源 → 顺序写缓存。返回**真正写进缓存的块数**。
+
+        返回值不是装饰：调用方必须靠它判断缓存文件是不是完整。被打断时缓存
+        里只有前半段是真数据，后半段（``preallocate`` 扩出来的）是零 ——
+        拿它去写目标就是拿零覆盖别人的数据。
+        """
         total = sum(n for _, _, n in runs)
         expected = total * block_size
         started = time.monotonic()
         last_end = -1
+        filled = 0
         with open(path, "wb") as fh:
             if self.config.preallocate and expected > 0:
                 # 一次性扩到最终大小，让文件系统预留连续空间。写入过程中反复
@@ -263,7 +292,15 @@ class CachedCopyExecutor:
                 fh.seek(0)
             for src_lba, _dst_lba, n, _off in self._iter_chunks(runs, block_size):
                 data = self.src.read_blocks(src_lba, n)
+                if len(data) != n * block_size:
+                    # 与 BlockDevice 契约一致：短读必须是错误。写进缓存的话，
+                    # 它会让整个 op 的数据从这一点起错位（长度对、内容错）。
+                    raise DeviceError(
+                        f"读取不完整：期望 {n * block_size} 字节，实得 {len(data)} 字节"
+                        f"（LBA {src_lba}，{n} 块）"
+                    )
                 fh.write(data)
+                filled += n
                 self.stats.src_reads += 1
                 # 第一次没有"上一段"可比，它不构成跳读 —— 把起点算成非顺序
                 # 会让单段文件永远显示 87.5%，读数的人以为有优化空间。
@@ -273,8 +310,9 @@ class CachedCopyExecutor:
                 self.stats.cache_writes += 1  # 追加写，天然顺序
                 self.stats.cached_bytes += len(data)
                 if self.control is not None and getattr(self.control, "cancelled", False):
-                    return
+                    break
         self.stats.cache_seconds += time.monotonic() - started
+        return filled
 
     def _drain_cache(
         self, op: MoveOp, runs, path: str, block_size: int, done: int
@@ -299,6 +337,18 @@ class CachedCopyExecutor:
                         f"实得 {len(data)}"
                     )
                 self.dst.write_blocks(dst_lba, data)
+                if getattr(self.params, "verify", False):
+                    # 回读校验。界面上的「校验=开」承诺的就是这件事，而缓存
+                    # 往返最典型的错正是"长度对、内容错"——只有回读能发现。
+                    back = self.dst.read_blocks(dst_lba, n)
+                    if bytes(back) != data:
+                        raise DeviceError(
+                            f"回读校验不一致（LBA {dst_lba}，{n} 块）："
+                            "写下去的数据读回来不一样",
+                            error_class=ErrorClass.VERIFY_MISMATCH,
+                            lba=dst_lba,
+                            count=n,
+                        )
                 self.stats.cache_reads += 1  # 从 0 往后顺序读
                 self.stats.dst_writes += 1
                 if last_end < 0 or dst_lba == last_end:

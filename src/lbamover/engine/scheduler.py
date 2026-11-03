@@ -37,7 +37,7 @@ from ..diagnostics import hint_for
 from .pipeline import OpResult
 from .progress import ProgressTracker
 
-__all__ = ["RateLimiter", "ExecutionResult", "JobRunner"]
+__all__ = ["RateLimiter", "ExecutionResult", "JobRunner", "resolve_workers"]
 
 #: 连续失败到多少个就熔断。
 #:
@@ -145,6 +145,27 @@ class ExecutionResult:
         return self.failed_ops == 0 and not self.cancelled
 
 
+def resolve_workers(executor, plan, params) -> tuple[int, str]:
+    """决定并发数，并给出"为什么降了"的说明（空串表示没降）。
+
+    三件事按顺序压：计划是否必须串行 → 引擎是否声明自己只能串行 → 用户设置。
+
+    **引擎声明优先于用户的并发设置**，因为它知道一些用户看不到的事：内存
+    缓存引擎的块池是实例级共享缓冲，``blocks_done`` 也只能归属"当前这个 op"。
+    两个 op 交错跑时，A 的回写会被算进 B 的计数，断点于是记下比实际更多的
+    块数 —— 续做时直接跳过没写的块，是**静默的数据缺失**。这种降级不该
+    悄悄发生，所以要有一句日志。
+    """
+    want = max(1, int(getattr(params, "concurrency", 1) or 1))
+    if getattr(plan, "requires_serial", False):
+        if want > 1:
+            return 1, "计划需要复用腾出的空间，并发强制降为 1 以保证读前写后"
+        return 1, ""
+    if getattr(executor, "serial_only", False) and want > 1:
+        return 1, f"当前搬运引擎使用共享中转缓冲，并发由 {want} 强制降为 1"
+    return want, ""
+
+
 class JobRunner:
     """执行一份 :class:`Plan`。"""
 
@@ -213,9 +234,11 @@ class JobRunner:
             else:
                 pending.append(op)
 
-        workers = 1 if plan.requires_serial else max(1, self.params.concurrency)
-        if plan.requires_serial and self.params.concurrency > 1:
-            self._log("计划需要复用腾出的空间，并发强制降为 1 以保证读前写后")
+        self._executor = self._make_executor()
+
+        workers, why = resolve_workers(self._executor, plan, self.params)
+        if why:
+            self._log(why)
         self._log(
             f"开始执行：{len(pending)} 个待搬文件，{plan.total_blocks} 块，"
             f"并发 {workers}，chunk {self.params.chunk_blocks} 块"
@@ -228,13 +251,14 @@ class JobRunner:
                 f"累计失败到 {MAX_IGNORED_FAILURES} 个才停止"
             )
 
-        self._executor = self._make_executor()
         prepare = getattr(self._executor, "prepare", None)
         if prepare is not None and pending:
             try:
                 prepare(pending)
-            except Exception as exc:  # noqa: BLE001 - 预占失败不该阻止搬运
-                self._log(f"目标区预占失败（按原样继续）：{exc}")
+            except Exception as exc:  # noqa: BLE001 - 准备失败不该阻止搬运
+                # 这里的失败不一定是预占：内存缓存引擎在 prepare 里一次性
+                # 分配整个块池。一律写成"目标区预占失败"会把内存不足指错方向。
+                self._log(f"执行器准备失败（按原样继续）：{exc}")
             note = getattr(self._executor, "_preoccupy_note", "")
             if note:
                 self._log(note)

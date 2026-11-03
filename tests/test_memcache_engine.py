@@ -19,9 +19,10 @@ from __future__ import annotations
 
 import pytest
 
-from lbamover.contract.enums import ExecMode, Strategy
+from lbamover.contract.enums import ErrorClass, ExecMode, Strategy
 from lbamover.contract.models import Extent, JobParams, MoveOp, Plan, VolumeInfo
 from lbamover.contract.enums import VolumeKind
+from lbamover.devices.base import DeviceError
 from lbamover.devices.memory import MemoryDevice
 from lbamover.engine.cache_engine import CachedCopyExecutor, CacheConfig
 from lbamover.engine.memcache_engine import (
@@ -380,3 +381,248 @@ class TestInterfaceParity:
         disk.close()
         assert (a.ok, a.blocks_done) == (b.ok, b.blocks_done)
         assert device.read_blocks(100, 4) == device.read_blocks(200, 4)
+
+
+class TestConfigScale:
+    """块大小的合法范围必须与界面一致（1..65536 KiB）。"""
+
+    def test_large_block_does_not_break_the_config(self):
+        """单块 8 MiB / 64 MiB 是合法配置，不能因为合并上限写死 4 MiB 就抛错。
+
+        2.0.0L 之前：``MemCacheConfig.from_params`` 不传 ``coalesce_limit_bytes``，
+        默认 4 MiB 小于块大小 → 构造期 ``ValueError: coalesce_limit_bytes
+        不能小于单块大小``。界面上这个值能一路调上去，报出来却是纯内部约定的话。
+        """
+        for kib in (4096, 8192, 65536):
+            params = JobParams(
+                exec_mode=ExecMode.MEMCACHED,
+                mem_cache_blocks=2,
+                mem_cache_block_kib=kib,
+            )
+            cfg = MemCacheConfig.from_params(params)
+            assert cfg.block_bytes == kib * 1024
+            assert cfg.coalesce_limit_bytes >= cfg.block_bytes, (
+                "合并上限必须跟着块大小走，否则构造期就会判非法"
+            )
+
+    def test_block_size_is_aligned_down_to_whole_blocks(self):
+        """非整块倍的 KiB 向下取整，绝不能让块里出现半个卷块。"""
+        # 17 KiB = 17408 B，除以 2 KiB 得 8.5 块 —— 必须向下取整到 8 块
+        params = JobParams(
+            block_size=2048, mem_cache_blocks=2, mem_cache_block_kib=17
+        )
+        cfg = MemCacheConfig.from_params(params)
+        assert cfg.block_bytes == 8 * 2048, f"应当取整到 16384，实得 {cfg.block_bytes}"
+        assert cfg.block_bytes % 2048 == 0
+
+
+class TestPoolIntegrity:
+    """失败不能把槽位从池子里弄丢。
+
+    丢一块的后果不在这一次失败，而在之后：失败攒够 ``block_count`` 次，
+    ``_acquire_slot`` 会在空的 ``_dirty`` 上 ``popleft`` 直接 IndexError ——
+    一个 IO 错误最后表现成"引擎崩了"。开了「忽略错误运行」时这条路走得到。
+    """
+
+    def _exec(self, blocks: int = 2, **kw):
+        cfg = MemCacheConfig(block_count=blocks, block_bytes=BLOCK)
+        return MemCacheExecutor(
+            kw.pop("src"), kw.pop("dst"), JobParams(block_size=BLOCK), cfg, **kw
+        )
+
+    def test_write_failure_returns_slots(self):
+        class FlakyDst:
+            fail = True
+
+            def __init__(self, inner):
+                self.inner = inner
+
+            def write_blocks(self, lba, data):
+                if self.fail:
+                    raise DeviceError("模拟写失败", error_class=ErrorClass.RETRYABLE)
+                return self.inner.write_blocks(lba, data)
+
+            def read_blocks(self, lba, n):
+                return self.inner.read_blocks(lba, n)
+
+        dev = MemoryDevice(64, BLOCK)
+        dev.write_blocks(0, patterned(4))
+        dst = FlakyDst(dev)
+        ex = self._exec(src=dev, dst=dst)
+        res = ex.run_op(op([(0, 4)], dst_start=8))
+        assert not res.ok
+        assert len(ex._free) == 2 and not ex._dirty, (
+            f"失败后池子必须完整，实际 free={len(ex._free)} dirty={len(ex._dirty)}"
+        )
+
+        dst.fail = False
+        ok = ex.run_op(op([(0, 4)], dst_start=8, op_id=2))
+        assert ok.ok and ok.blocks_done == 4
+        assert dev.read_blocks(8, 4) == patterned(4)
+
+    def test_read_failure_returns_slot(self):
+        dev = MemoryDevice(64, BLOCK)
+
+        def boom(lba, n):
+            raise DeviceError("模拟读失败", error_class=ErrorClass.RETRYABLE)
+
+        dev.read_blocks = boom
+        ex = self._exec(src=dev, dst=dev)
+        res = ex.run_op(op([(0, 4)], dst_start=8))
+        assert not res.ok
+        assert len(ex._free) == 2 and not ex._dirty, "读失败也不能吃掉槽位"
+
+    def test_many_failures_do_not_exhaust_the_pool(self):
+        """连续失败远超池容量也不能崩 —— 这是 IndexError 的直接回归。"""
+        calls = {"n": 0}
+
+        class AlwaysFail:
+            def write_blocks(self, lba, data):
+                calls["n"] += 1
+                raise DeviceError("总是失败", error_class=ErrorClass.RETRYABLE)
+
+        dev = MemoryDevice(64, BLOCK)
+        dev.write_blocks(0, patterned(4))
+        ex = self._exec(blocks=1, src=dev, dst=AlwaysFail())
+        for _ in range(10):
+            res = ex.run_op(op([(0, 4)], dst_start=8))
+            assert not res.ok, "应当老老实实报失败"
+        assert calls["n"] == 10
+
+
+class TestWorkerResolution:
+    """并发数必须被引擎的串行声明压住。
+
+    2.0.0L 之前这里没有任何约束：``workers = concurrency``（默认 2），
+    两个 op 共用同一个块池执行。``_written_blocks`` 是实例级计数，A 的回写
+    会被算进 B 的结果 —— 断点记下的块数比真正写下去的多，续做时跳过没写的
+    块，**数据静默缺失**。所以这条不是性能取舍，是正确性。
+    """
+
+    def _params(self, concurrency=4):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(concurrency=concurrency)
+
+    def test_memcache_forces_single_worker(self):
+        from types import SimpleNamespace
+
+        from lbamover.engine.scheduler import resolve_workers
+
+        dev = MemoryDevice(64, BLOCK)
+        ex = MemCacheExecutor(
+            dev, dev, JobParams(block_size=BLOCK),
+            MemCacheConfig(block_count=2, block_bytes=BLOCK),
+        )
+        workers, why = resolve_workers(
+            ex, SimpleNamespace(requires_serial=False), self._params(4)
+        )
+        assert workers == 1, "共享块池的引擎必须串行"
+        assert "共享中转缓冲" in why, "降并发要写在日志里，不能悄悄改"
+
+    def test_other_engines_keep_user_concurrency(self):
+        from types import SimpleNamespace
+
+        from lbamover.engine.scheduler import resolve_workers
+
+        workers, why = resolve_workers(
+            object(), SimpleNamespace(requires_serial=False), self._params(4)
+        )
+        assert workers == 4 and why == ""
+
+    def test_requires_serial_still_wins(self):
+        from types import SimpleNamespace
+
+        from lbamover.engine.scheduler import resolve_workers
+
+        workers, why = resolve_workers(
+            object(), SimpleNamespace(requires_serial=True), self._params(4)
+        )
+        assert workers == 1 and "复用" in why
+
+
+class TestEngineWiringLargeBlocks:
+    def test_large_block_reaches_the_executor(self):
+        """大块配置要能一路走到执行器，不能在中途被配置校验拦下。
+
+        2.0.0L 之前 ``start_job`` 会直接失败并报「coalesce_limit_bytes
+        不能小于单块大小」—— 用户看到的是"命令执行失败"，完全对不上界面上的
+        「块大小 8 MiB」。
+        """
+        from types import SimpleNamespace
+
+        from lbamover.engine.engine import EngineCore
+
+        core = EngineCore()
+        core.params = JobParams(
+            block_size=BLOCK,
+            exec_mode=ExecMode.MEMCACHED,
+            mem_cache_blocks=2,
+            mem_cache_block_kib=8192,
+        )
+        factory = core.make_executor_factory(None)
+        assert factory is not None
+        dev = MemoryDevice(64, BLOCK)
+        runner = SimpleNamespace(
+            src=dev,
+            dst=dev,
+            params=core.params,
+            limiter=None,
+            chunk_callback=None,
+            retry_callback=None,
+        )
+        ex = factory(runner)
+        assert ex.config.block_bytes == 8192 * 1024
+        assert ex.serial_only is True
+
+
+class _CorruptingDst:
+    """写下去的数据会被改坏一个字节 —— 模拟"长度对、内容错"。"""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.reads = 0
+
+    def write_blocks(self, lba, data):
+        bad = bytearray(data)
+        bad[0] ^= 0xFF
+        return self.inner.write_blocks(lba, bad)
+
+    def read_blocks(self, lba, n):
+        self.reads += 1
+        return self.inner.read_blocks(lba, n)
+
+
+class TestVerifyWired:
+    """「校验」这个勾选在缓存引擎里必须真的做事。
+
+    2.0.0L 之前两条缓存路径 **完全没有实现** 回读校验：界面上写着
+    「校验=开」，诊断报告也照抄这一项，实际一次回读都没有。用户据此认为
+    "坏块会被发现"，而那正是这个选项存在的理由。
+    """
+
+    def _run(self, verify: bool):
+        dev = MemoryDevice(64, BLOCK)
+        dev.write_blocks(0, patterned(4))
+        dst = _CorruptingDst(dev)
+        ex = MemCacheExecutor(
+            dev,
+            dst,
+            JobParams(block_size=BLOCK, verify=verify),
+            MemCacheConfig(block_count=2, block_bytes=BLOCK),
+        )
+        return ex.run_op(op([(0, 4)], dst_start=8)), dst
+
+    def test_mismatch_is_detected(self):
+        res, dst = self._run(verify=True)
+        assert not res.ok
+        assert res.error_class == "verify_mismatch", (
+            f"校验不一致不能被归成可重试，实际 {res.error_class}"
+        )
+        assert "校验" in res.error
+        assert dst.reads >= 1, "开着校验就必须回读，否则这个开关是空的"
+
+    def test_switch_off_really_skips_it(self):
+        res, dst = self._run(verify=False)
+        assert res.ok
+        assert dst.reads == 0, "关掉校验就不该产生回读 IO"

@@ -334,3 +334,144 @@ class TestEndToEndOnMemoryDevice:
 
         assert result.moved_ops == 1, f"失败：{result.failures[:1]}"
         assert list(tmp_path.glob("lbamover-cache-*")) == []
+
+
+class _Ctl:
+    """最小控制对象：只需要 ``cancelled`` 这一个属性。"""
+
+    def __init__(self) -> None:
+        self.cancelled = False
+
+
+class TestInterruptedFill:
+    """阶段一被打断时，**绝不能**拿缓存文件去写目标。
+
+    ``preallocate`` 会把缓存文件一次扩到最终大小，未写部分是零。若照样跑
+    阶段二，目标区就被零覆盖了 —— 那里可能正躺着还没搬走的数据。断点续做
+    时更隐蔽：前 ``done`` 块被跳过，正好从零区长开始写。
+    """
+
+    def _setup(self, device):
+        data = patterned(12, seed=5)
+        device.write_blocks(100, data)
+        device.write_blocks(1000, b"\x55" * (12 * BLOCK))
+        return data
+
+    def _cancel_after_first_read(self, device, ctl):
+        real = device.read_blocks
+        calls: list[tuple[int, int]] = []
+
+        def wrapper(lba, n):
+            data = real(lba, n)
+            calls.append((lba, n))
+            ctl.cancelled = True
+            return data
+
+        device.read_blocks = wrapper
+        return real, calls
+
+    def test_cancel_mid_fill_writes_nothing(self, device, tmp_path):
+        self._setup(device)
+        ctl = _Ctl()
+        ex = CachedCopyExecutor(
+            device,
+            device,
+            JobParams(block_size=BLOCK),
+            CacheConfig(work_dir=str(tmp_path), chunk_blocks=2),
+            control=ctl,
+        )
+        real, calls = self._cancel_after_first_read(device, ctl)
+        res = ex.run_op(op([(100, 12)], dst_start=1000))
+        device.read_blocks = real
+        ex.close()
+
+        assert not res.ok and res.cancelled
+        assert res.blocks_done == 0, "一个字节都没写，就不该报进度"
+        assert device.read_blocks(1000, 12) == b"\x55" * (12 * BLOCK), (
+            "中断后目标区必须原样不动，不能被缓存文件里的零覆盖"
+        )
+
+    def test_cancel_mid_fill_with_resume_offset(self, device, tmp_path):
+        """续做偏移 + 中断：最容易写出零的组合。"""
+        self._setup(device)
+        ctl = _Ctl()
+        ex = CachedCopyExecutor(
+            device,
+            device,
+            JobParams(block_size=BLOCK),
+            CacheConfig(work_dir=str(tmp_path), chunk_blocks=2),
+            control=ctl,
+        )
+        real, _calls = self._cancel_after_first_read(device, ctl)
+        res = ex.run_op(op([(100, 12)], dst_start=1000), start_blocks=4)
+        device.read_blocks = real
+        ex.close()
+
+        assert not res.ok
+        assert res.blocks_done == 0
+        assert device.read_blocks(1000, 12) == b"\x55" * (12 * BLOCK), (
+            "断点之前的块被跳过之后，剩下的必须整段不写"
+        )
+
+    def test_short_read_from_source_is_an_error(self, device, tmp_path):
+        """设备短读必须报错，不能把半截数据写进缓存（那会让后面整体错位）。"""
+        self._setup(device)
+        real = device.read_blocks
+
+        def short(lba, n):
+            return real(lba, n)[:-BLOCK]  # 少一块
+
+        device.read_blocks = short
+        ex = CachedCopyExecutor(
+            device,
+            device,
+            JobParams(block_size=BLOCK),
+            CacheConfig(work_dir=str(tmp_path), chunk_blocks=2),
+        )
+        res = ex.run_op(op([(100, 12)], dst_start=1000))
+        device.read_blocks = real
+        ex.close()
+
+        assert not res.ok
+        assert "读取不完整" in res.error
+        assert device.read_blocks(1000, 12) == b"\x55" * (12 * BLOCK)
+
+
+class TestVerifyWired:
+    """磁盘缓存路径也要真的回读校验（同 2.0.0L 的漏项）。"""
+
+    def test_mismatch_is_detected(self, device, tmp_path):
+        class CorruptingDst:
+            def write_blocks(self, lba, data):
+                bad = bytearray(data)
+                bad[0] ^= 0xFF
+                return device.write_blocks(lba, bad)
+
+            def read_blocks(self, lba, n):
+                return device.read_blocks(lba, n)
+
+        device.write_blocks(100, patterned(4))
+        ex = CachedCopyExecutor(
+            CorruptingDst(),
+            CorruptingDst(),
+            JobParams(block_size=BLOCK, verify=True),
+            CacheConfig(work_dir=str(tmp_path), chunk_blocks=2),
+        )
+        res = ex.run_op(op([(100, 4)], dst_start=1000))
+        ex.close()
+        assert not res.ok
+        assert res.error_class == "verify_mismatch"
+        assert "校验" in res.error
+
+    def test_switch_off_allows_no_readback(self, device, tmp_path):
+        device.write_blocks(100, patterned(4))
+        ex = CachedCopyExecutor(
+            device,
+            device,
+            JobParams(block_size=BLOCK, verify=False),
+            CacheConfig(work_dir=str(tmp_path), chunk_blocks=2),
+        )
+        res = ex.run_op(op([(100, 4)], dst_start=1000))
+        ex.close()
+        assert res.ok
+        assert device.read_blocks(1000, 4) == patterned(4)

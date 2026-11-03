@@ -378,6 +378,21 @@ class TestParamsPanel:
         p.exec_memcached.setChecked(True)
         assert p.exec_mode() is ExecMode.MEMCACHED
 
+    def test_move_only_options_disabled_in_cache_mode(self, qapp):
+        """预占与半锁定只作用于 MOVE_FILE；缓存模式下勾了也不会发生。
+
+        留着能勾就是"看着生效、实际被忽略"—— 诊断报告里那句「预占=开」
+        会变成假话。
+        """
+        p = ParamsPanel(DARK)
+        assert p.preoccupy.isEnabled() and p.partial_lock.isEnabled()
+        p.exec_memcached.setChecked(True)
+        assert not p.preoccupy.isEnabled(), "缓存搬运不用占位文件"
+        assert not p.partial_lock.isEnabled(), "缓存搬运不锁簇"
+        assert "不适用" in p.preoccupy.toolTip()
+        p.exec_memcached.setChecked(False)
+        assert p.preoccupy.isEnabled() and p.partial_lock.isEnabled()
+
     def test_lock_toggles_structural_params(self, qapp):
         p = ParamsPanel(DARK)
         p.set_locked(True)

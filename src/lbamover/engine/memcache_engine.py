@@ -38,6 +38,7 @@
 
 from __future__ import annotations
 
+import threading
 from collections import deque
 from dataclasses import dataclass
 
@@ -47,6 +48,11 @@ from ..devices.base import DeviceError
 from .pipeline import OpResult
 
 __all__ = ["MemCacheConfig", "MemCacheStats", "MemCacheExecutor"]
+
+#: 相邻脏块合并回写的默认上限。**是下限而不是定值**：块本身比它还大时
+#: 必须跟着放大，否则 ``coalesce_limit_bytes < block_bytes`` 会在构造期
+#: 被判非法（界面允许单块到 64 MiB）。
+DEFAULT_COALESCE_BYTES = 4 << 20
 
 
 @dataclass(frozen=True)
@@ -94,6 +100,11 @@ class MemCacheConfig:
         return cls(
             block_count=max(1, int(params.mem_cache_blocks)),
             block_bytes=aligned,
+            # 合并上限必须**跟着块大小走**。写死 4 MiB 的话，用户把块设成
+            # 8 MiB / 64 MiB（界面允许到 64 MiB）时构造期就会抛
+            # "coalesce_limit_bytes 不能小于单块大小" —— 一个合法配置被
+            # 判非法，而且报出来是这句纯内部约定的话。
+            coalesce_limit_bytes=max(DEFAULT_COALESCE_BYTES, aligned),
         )
 
 
@@ -139,6 +150,18 @@ class _Slot:
         self.dirty = False
 
 
+def _class_of(exc: BaseException) -> str:
+    """取 ``DeviceError`` 自带的错误分类。
+
+    写死 ``RETRYABLE`` 会把"回读校验不一致"也归成可重试 —— 而校验不一致
+    说明这块数据写下去就是错的，盲目重试等于再错一次。
+    """
+    value = getattr(exc, "error_class", None)
+    if value is None:
+        return ErrorClass.RETRYABLE.value
+    return getattr(value, "value", str(value))
+
+
 def _runs(op: MoveOp) -> list[tuple[int, int, int]]:
     """``(源 LBA, 目标 LBA, 块数)``，按 VCN 顺序。
 
@@ -168,6 +191,10 @@ class MemCacheExecutor:
     ``close()``。调度器只认这三样，所以三套引擎可以互换。
     """
 
+    #: 调度器看到这个标记就把并发压到 1。块池是**实例级共享缓冲**，
+    #: 多线程只能排队用；让调度器知道这一点，好过让它开 4 个线程抢一把锁。
+    serial_only = True
+
     def __init__(self, src, dst, params, config: MemCacheConfig, control=None) -> None:
         self.src = src
         self.dst = dst
@@ -175,6 +202,7 @@ class MemCacheExecutor:
         self.config = config
         self.control = control
         self.stats = MemCacheStats()
+        self._lock = threading.RLock()
         self._slots: list[_Slot] = []
         self._free: deque[_Slot] = deque()
         self._dirty: deque[_Slot] = deque()
@@ -185,6 +213,9 @@ class MemCacheExecutor:
         self._written_blocks = 0
 
         self._block_size = max(1, int(params.block_size))
+        #: 回读校验开关。与 NATIVE 路径同一个来源（``JobParams.verify``），
+        #: 否则界面上那个勾选在缓存模式下就是一句空话。
+        self._verify = bool(getattr(params, "verify", False))
         #: 一块能装几个卷块。至少 1 —— 配置里块比簇小时向下取整会得到 0，
         #: 那会让下面的循环永远不前进。
         self._blocks_per_slot = max(1, config.block_bytes // self._block_size)
@@ -217,7 +248,21 @@ class MemCacheExecutor:
     # -- 对外 -------------------------------------------------------------
 
     def run_op(self, op: MoveOp, start_blocks: int = 0) -> OpResult:
-        """搬运一个 op。``start_blocks`` 是断点续做：前这么多块已经写完了。"""
+        """搬运一个 op。``start_blocks`` 是断点续做：前这么多块已经写完了。
+
+        **整段持锁**。块池是实例级共享状态（``_free`` / ``_dirty``），而
+        ``_written_blocks`` 这类计数只能归属"当前这个 op"——两个 op 交错执行
+        时，一个 op 的计数会被另一个 op 的 flush 加进去，于是断点记的块数比
+        真正写下去的多，续做时直接跳过没写的块 = 数据静默缺失。
+
+        所以这里的并发只能是"排队"，不能是"并行"。调度器那边另有一道
+        ``serial_only`` 直接把它压成 1 线程（见 ``JobRunner.run``），锁是
+        第二重保险：调用方换了也不会错。
+        """
+        with self._lock:
+            return self._run_op_locked(op, start_blocks)
+
+    def _run_op_locked(self, op: MoveOp, start_blocks: int = 0) -> OpResult:
         runs = _runs(op)
         total = sum(n for _, _, n in runs)
         if total == 0:
@@ -255,6 +300,7 @@ class MemCacheExecutor:
             self._flush_all()
         except DeviceError as exc:
             # 读源/写目标的失败：重试可能成功（块级 IO 错误多为随机）
+            self._abandon_dirty()
             return OpResult(
                 op.op_id,
                 self._written_blocks,
@@ -263,7 +309,7 @@ class MemCacheExecutor:
                 error=f"{exc}",
                 stage="内存缓存搬运",
                 error_type=type(exc).__name__,
-                error_class=ErrorClass.RETRYABLE.value,
+                error_class=_class_of(exc),
                 winerror=getattr(exc, "winerror", 0) or 0,
             )
         except MemoryError:
@@ -318,38 +364,50 @@ class MemCacheExecutor:
     def _fill_slot(
         self, dst_lba: int, blocks: int, parts: list[tuple[int, int]], skip: int
     ) -> None:
-        """把这一块的数据读进池里。攒满即成为"脏块"，等回写。"""
+        """把这一块的数据读进池里。攒满即成为"脏块"，等回写。
+
+        读失败时**必须把刚取的槽位还回去**。不还的话它既不在 ``_free`` 也不在
+        ``_dirty``，等于从池里蒸发了；失败攒够 ``block_count`` 次之后，
+        ``_acquire_slot`` 会在空的 ``_dirty`` 上 ``popleft`` 直接 IndexError ——
+        一个 IO 错误最后表现成"引擎崩了"。
+        """
         slot = self._acquire_slot()
         buf = slot.buf
         used = 0
         remaining = skip
-        for src_lba, take in parts:
-            if remaining >= take:
-                remaining -= take
-                continue
-            start = src_lba + remaining
-            count = take - remaining
-            remaining = 0
-            data = self.src.read_blocks(start, count)
-            expect = count * self._block_size
-            if len(data) != expect:
-                # BlockDevice 契约是"要么给满、要么抛错"。短读意味着设备层
-                # 有 bug，继续往下写会把残缺数据当正常数据写进目标。
-                raise DeviceError(
-                    f"读取不完整：期望 {expect} 字节，实得 {len(data)}",
-                    error_class=ErrorClass.FATAL,
-                    lba=start,
-                    count=count,
-                )
-            buf[used : used + len(data)] = data
-            used += len(data)
-            self.stats.src_reads += 1
-            self.stats.bytes_read += len(data)
-            # 顺序率：第一段没有"上一段"可比，算作顺序（否则单段文件永远
-            # 显示 87.5%，读数的人会以为有优化空间）
-            if self._last_src_end < 0 or start == self._last_src_end:
-                self.stats.src_seq_reads += 1
-            self._last_src_end = start + count
+        try:
+            for src_lba, take in parts:
+                if remaining >= take:
+                    remaining -= take
+                    continue
+                start = src_lba + remaining
+                count = take - remaining
+                remaining = 0
+                data = self.src.read_blocks(start, count)
+                expect = count * self._block_size
+                if len(data) != expect:
+                    # BlockDevice 契约是"要么给满、要么抛错"。短读意味着设备层
+                    # 有 bug，继续往下写会把残缺数据当正常数据写进目标。
+                    raise DeviceError(
+                        f"读取不完整：期望 {expect} 字节，实得 {len(data)}",
+                        error_class=ErrorClass.FATAL,
+                        lba=start,
+                        count=count,
+                    )
+                buf[used : used + len(data)] = data
+                used += len(data)
+                self.stats.src_reads += 1
+                self.stats.bytes_read += len(data)
+                # 顺序率：第一段没有"上一段"可比，算作顺序（否则单段文件永远
+                # 显示 87.5%，读数的人会以为有优化空间）
+                if self._last_src_end < 0 or start == self._last_src_end:
+                    self.stats.src_seq_reads += 1
+                self._last_src_end = start + count
+        except BaseException:
+            slot.used = 0
+            slot.dirty = False
+            self._free.append(slot)
+            raise
 
         slot.used = used
         slot.dst_lba = dst_lba
@@ -390,14 +448,40 @@ class MemCacheExecutor:
         if len(batch) == 1:
             slot = batch[0]
             data = memoryview(slot.buf)[: slot.used]
-            self.dst.write_blocks(slot.dst_lba, data)
         else:
             merged = bytearray(total)
             off = 0
             for slot in batch:
                 merged[off : off + slot.used] = slot.buf[: slot.used]
                 off += slot.used
-            self.dst.write_blocks(batch[0].dst_lba, merged)
+            data = merged
+        try:
+            self.dst.write_blocks(batch[0].dst_lba, data)
+            if self._verify:
+                # 回读校验。界面上的「校验=开」承诺的就是这件事 —— 之前两个
+                # 缓存引擎都没实现，勾了等于没勾：报告里写着"校验=开"，实际
+                # 一次回读都没有。缓存往返最容易出的错恰好是"长度对、内容错"，
+                # 正是回读才能发现的那类。
+                written_blocks = total // self._block_size
+                back = self.dst.read_blocks(batch[0].dst_lba, written_blocks)
+                if bytes(back) != bytes(data):
+                    raise DeviceError(
+                        f"回读校验不一致（LBA {batch[0].dst_lba}，"
+                        f"{written_blocks} 块）：写下去的数据读回来不一样",
+                        error_class=ErrorClass.VERIFY_MISMATCH,
+                        lba=batch[0].dst_lba,
+                        count=written_blocks,
+                    )
+        except BaseException:
+            # 写失败时这批槽位已经离开 ``_dirty`` 了，必须还回去 —— 否则每次
+            # 失败丢几块，池子迟早空掉（见 ``_fill_slot`` 的注释）。
+            # 槽里的数据是残的，但空闲槽在下次使用前一定会被整段覆盖。
+            for slot in batch:
+                slot.used = 0
+                slot.dirty = False
+                self._free.append(slot)
+            raise
+        if len(batch) > 1:
             self.stats.coalesced_blocks += len(batch)
 
         # 顺序写统计：目标地址接着上一次写的末尾就算顺序
@@ -417,3 +501,15 @@ class MemCacheExecutor:
 
     def _cancelled(self) -> bool:
         return self.control is not None and bool(getattr(self.control, "cancelled", False))
+
+    def _abandon_dirty(self) -> None:
+        """丢掉当前 op 尚未回写的脏块，把槽位还给池子。
+
+        只在一个 op **失败**时调用：这些块属于一个已经判定失败的操作，
+        留着它们会在下一个 op 的 flush 里被算进对方的 ``blocks_done``。
+        """
+        while self._dirty:
+            slot = self._dirty.popleft()
+            slot.used = 0
+            slot.dirty = False
+            self._free.append(slot)
