@@ -456,9 +456,10 @@ class MainWindow(QMainWindow):
         # "必须先锁定卷" —— 那句话既没说明原因，也没说明该改成什么。
         self.params_panel.set_cache_allowed(
             not (vol.filesystem.upper() == "NTFS" and vol.is_mounted),
-            "这块盘是已挂载的 NTFS 卷：缓存与内存缓存都要裸写块设备，"
-            "会绕过文件系统损坏卷，因此不可用。整理它请用默认的盘内搬簇"
-            "（FSCTL_MOVE_FILE）。缓存方式只适用于卷镜像与内存盘。",
+            "已挂载的 NTFS 卷只能用「盘内搬簇」。Windows 规定写原始卷必须先"
+            "锁卷（卸下该盘），而卸下之后盘上的文件就全打不开了——整理又必须"
+            "打开文件。这是平台限制，不是这里的设置没调对。缓存方式留给卷镜像"
+            "与内存盘。",
         )
         # 「可用空间整理」的大小上限与单位换算都跟着卷走，换卷必须重新校准
         self.strategy_panel.reclaim.set_geometry(

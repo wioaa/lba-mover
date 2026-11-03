@@ -45,7 +45,7 @@ python packaging/build.py            # 图标 → 版本资源 → PyInstaller �
 | --- | --- |
 | `dist/LBAMover/LBAMover.exe` | 图形界面，双击即用（单一 exe 3 MB，运行库在 `_internal/`） |
 | `dist/LBAMover/LBAMover-cli.exe` | 命令行，`--version` / `volumes` / `scan` / `selftest` / `smoke` |
-| `dist/LBAMover-2.0.0M-win64.zip` | 解包即用，约 48 MiB |
+| `dist/LBAMover-2.0.0N-win64.zip` | 解包即用，约 48 MiB |
 | `dist/lbamover-2.0.0-py3-none-any.whl` | `pip install` 用 |
 | `dist/SHA256SUMS.txt` | 上述产物的校验和 |
 
@@ -175,7 +175,7 @@ GUI 的 CI 上跑完整流程，UI 能用假引擎单测，平台差异没有渗
 ## 版本号约定
 
 `pyproject.toml` 的 `version` 永远只写三段（`2.0.0`，PEP 440 合法），小版本字母放在
-`[tool.lbamover].revision`，由代码拼成 `2.0.0M` 对外展示。
+`[tool.lbamover].revision`，由代码拼成 `2.0.0N` 对外展示。
 
-`2.0.0M` 不是合法 PEP 440，pip 会直接拒绝——所以字母不能进 `version` 字段。
+`2.0.0N` 不是合法 PEP 440，pip 会直接拒绝——所以字母不能进 `version` 字段。
 两处必须一致，`tests/test_version.py` 盯着这件事。

@@ -124,6 +124,10 @@ class ParamsPanel(QWidget):
             "必须指向另一块盘：同盘时总 IO 翻倍、顺序性不会变好。\n"
             "只能用于镜像与内存盘 —— 已挂载的 NTFS 卷会被拒绝（裸写会损坏文件系统）"
         )
+        #: 原始提示要留着。禁用时在它前面加一句"当前卷为什么点不了"，
+        #: 切回镜像卷时必须**还原** —— 否则 tooltip 会一直挂着上一次的判词，
+        #: 用户会以为这块盘也不支持。
+        self._tip_cached = self.exec_cached.toolTip()
         self.cache_dir = QLineEdit()
         self.cache_dir.setPlaceholderText("缓存工作目录（应指向另一块盘）")
         self.cache_dir.setMinimumHeight(26)
@@ -137,6 +141,7 @@ class ParamsPanel(QWidget):
             "它和跨盘缓存一样只用于镜像与内存盘（真机仍走搬簇）。\n"
             "内存占用是固定的：块数 × 块大小，运行期不增长。"
         )
+        self._tip_memcached = self.exec_memcached.toolTip()
         # 两个数字含义不同：块大小决定一次能凑多长，块数决定能提前读多少。
         # 合成一个"总大小"旋钮就调不动这个取舍了。
         self.mem_blocks = _spin(
@@ -290,9 +295,13 @@ class ParamsPanel(QWidget):
     def set_cache_allowed(self, allowed: bool, reason: str = "") -> None:
         """目标卷是否允许缓存搬运（磁盘中转 / 内存块池）。
 
-        已挂载的 NTFS 卷一律不允许：缓存引擎写的是裸块设备，会绕过文件系统
-        覆盖 ``$MFT`` 指着的簇区。**在选卷时就禁掉，而不是等按下开始才报错**
-        —— 后者用户已经排了半天参数，最后拿到一句关于锁卷的报错。
+        已挂载的 NTFS 卷一律不允许。理由不是本工具保守，而是 **Windows 的
+        接口约束**：写原始卷必须先 ``FSCTL_LOCK_VOLUME``（卸下该卷），卸下
+        之后卷上的文件全部打不开，而整理又必须打开文件。两个前提互斥，
+        真机上只剩 ``FSCTL_MOVE_FILE`` 一条路。
+
+        **在选卷时就禁掉，而不是等按下开始才报错** —— 后者用户已经排了半天
+        参数，最后拿到的是一句关于锁卷的实现细节。
         """
         self._cache_allowed = allowed
         if not allowed:
@@ -302,6 +311,15 @@ class ParamsPanel(QWidget):
                 box.blockSignals(True)
                 box.setChecked(False)
                 box.blockSignals(False)
+        # 灰掉的控件配上原样的 tooltip，读起来像"这功能还没做"。禁用时
+        # 把原因顶到 tooltip 第一行，悬停就能看到为什么点不了。
+        locked = "当前卷不可用：已挂载的 NTFS 卷（原因见下方说明）\n\n"
+        self.exec_cached.setToolTip(
+            self._tip_cached if allowed else locked + self._tip_cached
+        )
+        self.exec_memcached.setToolTip(
+            self._tip_memcached if allowed else locked + self._tip_memcached
+        )
         self.cache_note.setText(reason)
         self.cache_note.setVisible(bool(reason))
         self._sync_exec_rows()

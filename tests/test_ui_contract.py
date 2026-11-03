@@ -378,6 +378,24 @@ class TestParamsPanel:
         p.exec_memcached.setChecked(True)
         assert p.exec_mode() is ExecMode.MEMCACHED
 
+    def test_disabled_cache_explains_itself_on_hover(self, qapp):
+        """置灰 + 原样 tooltip 会被读成"功能没做"，原因必须顶在第一行。
+
+        这块盘的规则来自 Windows 接口而不是本工具的偏好，说不清的话用户会
+        一直去找"更高级的设置"，而这正是 2.0.0L 真机报告里那次误判的成因。
+        """
+        p = ParamsPanel(DARK)
+        original = p._tip_cached
+        p.set_cache_allowed(False, "已挂载的 NTFS 卷只能用盘内搬簇")
+        tip = p.exec_cached.toolTip()
+        assert tip.startswith("当前卷不可用"), f"原因必须在第一行，实际：{tip[:40]}"
+        assert original in tip, "原有功能说明不能被吞掉"
+
+        # 切回镜像卷：**必须还原**，否则判词会跟着卷一直挂下去
+        p.set_cache_allowed(True)
+        assert p.exec_cached.toolTip() == original
+        assert p.exec_memcached.toolTip() == p._tip_memcached
+
     def test_move_only_options_disabled_in_cache_mode(self, qapp):
         """预占与半锁定只作用于 MOVE_FILE；缓存模式下勾了也不会发生。
 
