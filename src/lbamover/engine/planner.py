@@ -309,11 +309,17 @@ def _empty_reason(report: FragReport, params: JobParams) -> str:
 #: * ``DEEP``     同 ``STANDARD``：压实没有"小文件"这个维度，多搬大文件
 #:                并不更彻底，只会更慢；
 #: * ``THOROUGH`` 范围内全部数据，且**落点必须紧贴**（宁可搬不动也不留空隙）；
-#: * ``EXTREME``  只搬 ≥「大文件下限」的文件，把它们一次性贴到卷尾。
+#: * ``EXTREME``  只搬 ≥「大文件下限」的文件，同样必须紧贴。
+#:
+#: ``EXTREME`` 为什么也要紧贴：只把大文件挑出来、丢到前面随便一个空洞里，
+#: 对压实是**负收益** —— 卷尾原来占的地方没变短（它腾出的洞又被别人填不上），
+#: 白白搬了几十 GB。2.0.0K 真机实测就是这样：13 个 ≥1 GiB 的文件被塞进前面
+#: 的连续空闲，卷尾一个字节都没往前推，却报出"压实完成"。要么贴上去，要么
+#: 老实说放不进去。
 #:
 #: ``DEEP`` 与 ``STANDARD`` 等价是刻意的：与其编一个假的差异，不如让用户在
 #: 说明行里看到"这两档在压实下一样"。见 ``ui/widgets/strategy_panel.py``。
-_PACK_TAIL_STRICT = frozenset({Intensity.THOROUGH})
+_PACK_TAIL_STRICT = frozenset({Intensity.THOROUGH, Intensity.EXTREME})
 
 
 def _pack_tail_pool(files: list, params: JobParams) -> list:
@@ -426,13 +432,19 @@ def _build_pack_tail_plan(
     stuck: list[str] = []
     loose = 0
     loose_sample: list[str] = []
-    holes = 0
+    #: 前置落点留下的空隙。**必须按区间并集累计**：游标不前移，所以多个
+    #: 落点算出来的空隙区间会互相重叠，逐个相加会算出比压实范围还大的数
+    #: （2.0.0K 真机：400 GiB 的范围报出 628 GiB 空隙）。
+    holes = IntervalSet()
     strict = params.intensity in _PACK_TAIL_STRICT
 
     if missing:
         notes.append(f"{len(missing)} 个指定文件已不在本次扫描结果里，已跳过")
     if strict:
-        notes.append("「彻底」档要求落点紧贴已压实区，放不进紧贴位置的整份文件不动")
+        notes.append(
+            f"「{params.intensity.label}」档要求落点紧贴已压实区，"
+            f"放不进紧贴位置的整份文件不动"
+        )
 
     for i, f in enumerate(ordered):
         check_cancel(cancel, i)
@@ -481,7 +493,8 @@ def _build_pack_tail_plan(
             )
             if fallback is not None:
                 gap = cursor - (fallback + n)
-                holes += max(0, gap)
+                if gap > 0:
+                    holes.add(Extent(fallback + n, gap))
                 loose += 1
                 if len(loose_sample) < 3:
                     loose_sample.append(f.path)
@@ -508,31 +521,50 @@ def _build_pack_tail_plan(
         cursor = min(cursor, f_start)
         continue
 
+    hole_blocks = sum(e.length for e in holes)
+    packed = tail_limit - cursor
+
     if already:
         notes.append(f"{already} 个文件已经贴着卷尾，不需要动")
     if loose:
         notes.append(
             f"{loose} 个文件放不进紧贴位置（多为大文件，紧贴段被尚未搬走的数据占着），"
             f"已改为落在前面最近的连续空闲里（例如 {loose_sample[0]}）；"
-            f"压实区内部因此留下约 {_mib(holes, geometry)} 空隙"
+            f"压实区内部因此留下约 {_mib(hole_blocks, geometry)} 空隙"
         )
     if stuck:
-        notes.append(
-            f"{len(stuck)} 个文件既找不到紧贴位置、也没有足够大的连续空闲（例如 {stuck[0]}），"
-            f"它们会在压实数据区里留下空隙"
-        )
-    if ops:
-        notes.append(
-            f"压实后紧密段从 {cursor} 到 {tail_limit} 共 "
-            f"{_mib(tail_limit - cursor, geometry)}，其前方为连续空闲"
-            + (f"（内部另有约 {_mib(holes, geometry)} 空隙）" if holes else "")
-        )
-        if cursor > start_bound:
-            notes.append(
-                f"压实范围还剩 {_mib(cursor - start_bound, geometry)} 未能搬空"
+        hint = "。本档要求落点必须紧贴，放不进就不动"
+        if params.intensity is Intensity.EXTREME:
+            hint = (
+                "。本档只搬大文件且要求紧贴；换成「标准」档可以让它们落到"
+                "前面的连续空闲里（会留下空隙，但至少能把卷尾腾松）"
             )
-    else:
-        notes.append("卷尾数据已经在最靠尾的位置，没有可压实的部分")
+        notes.append(
+            f"{len(stuck)} 个文件放不进紧贴位置，按要求没有动它们（例如 {stuck[0]}）{hint}"
+        )
+    if ops and packed > 0:
+        notes.append(
+            f"压实后 {cursor}~{tail_limit} 共 {_mib(packed, geometry)} 是连续数据段，"
+            f"其前方为连续空闲"
+            + (f"（段内另有约 {_mib(hole_blocks, geometry)} 空隙）" if hole_blocks else "")
+        )
+    elif ops:
+        # 有落位、但没有一个是紧贴的：卷尾那段长度一点没变。旧文案在这里
+        # 报「紧密段 0.0 MiB，其前方为连续空闲」，读起来像成功了。
+        notes.append(
+            f"共落位 {len(ops)} 个文件，但没有一个落在紧贴位置，"
+            f"卷尾连续数据段的长度没有变化 —— 这不算压实"
+        )
+    if ops and cursor > start_bound:
+        notes.append(f"压实范围还剩 {_mib(cursor - start_bound, geometry)} 未能搬空")
+    if not ops:
+        if stuck:
+            notes.append(
+                "本次没有产生任何搬迁：范围内被选中的文件都放不进紧贴位置。"
+                "压实只有数据真的贴上去才有意义，换档位或调整压实范围再试"
+            )
+        else:
+            notes.append("卷尾数据已经在最靠尾的位置，没有可压实的部分")
 
     # 压实天然是"后者搬进前者腾出的位置"：最靠尾的文件一搬走，它的原址
     # 立刻成为下一个的落点。所以目标区踩到别的 op 的源区是**正常**的，

@@ -391,7 +391,7 @@ class EngineCore:
             return False
         return True
 
-    def _check_exec_mode(self, plan: Plan | None) -> None:
+    def check_exec_mode(self, plan: Plan | None) -> None:
         """缓存引擎的硬闸门：已挂载的 NTFS 卷一律拒绝。
 
         裸写绕过文件系统，会直接覆盖 ``$MFT`` 指着的簇区 —— 文件系统当场
@@ -412,10 +412,13 @@ class EngineCore:
         if vol.filesystem.upper() == "NTFS" and vol.is_mounted:
             raise PlanRejected(
                 [
-                    "缓存搬运不能用于已挂载的 NTFS 卷：裸写会绕过文件系统、"
-                    "覆盖 $MFT 指着的簇区，导致卷损坏。",
-                    "真机整理请用默认的盘内搬运（FSCTL_MOVE_FILE）；"
-                    "缓存模式适用于卷镜像与内存盘。",
+                    f"当前选的是「{self.params.exec_mode.value}」搬运，"
+                    f"它要裸写 {vol.mount_point} 的块设备；"
+                    "已挂载的 NTFS 卷这样做会绕过文件系统、覆盖 $MFT 指着的簇区，"
+                    "导致卷损坏，所以被拒绝。",
+                    "要整理这块盘：把「搬运方式」换回默认的盘内搬簇"
+                    "（FSCTL_MOVE_FILE），它由文件系统自己搬，不需要锁卷。",
+                    "缓存与内存缓存只适用于卷镜像和内存盘。",
                 ]
             )
         if self.params.exec_mode is ExecMode.CACHED and not self.params.cache_dir.strip():
@@ -593,7 +596,7 @@ class EngineCore:
                 self._log(LogLevel.ERROR, reason)
             raise PlanRejected(list(plan.reasons) or ["计划标记为不可行"])
 
-        self._check_exec_mode(plan)
+        self.check_exec_mode(plan)
 
         # 执行前复核：计划里不能有受保护对象，搬完必须留够空闲。
         # 规划阶段已经过滤过一次，这里再查一次——少这一道就是漏洞，因为
@@ -906,6 +909,12 @@ class EngineService:
                 # 锁卷，而锁了卷就打不开卷上的文件，MOVE_FILE 也就无从谈起。
                 self.core.execute(plan, None)
             else:
+                # 必须在**打开设备之前**判一次执行模式。设备构造期就会拒绝
+                # "writable 但没锁卷"，而那条例外（"对原始卷写入必须先锁定卷"）
+                # 说的是实现细节，用户读不出"你选错了搬运方式"这层意思 ——
+                # 2.0.0K 实测：memeched 选在已挂载的 F: 上，日志只有这一句，
+                # 没有任何修复方向。这里先过闸门，报的是能照做的话。
+                self.core.check_exec_mode(plan)
                 self._device = self._open(self.core.volume)
                 self.core.execute(plan, self._device)
                 self._release_device()

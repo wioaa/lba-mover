@@ -11,6 +11,9 @@
 
 from __future__ import annotations
 
+import random
+import re
+
 import pytest
 
 from lbamover.contract.enums import Intensity, Strategy
@@ -332,3 +335,80 @@ class TestBigFilesAndIntensity:
         assert plan.ops == ()
         text = " ".join(plan.notes)
         assert "极端档" in text and "没有" not in text.replace("没有一个", ""), text
+
+
+class TestPackTailHonesty:
+    """压实不能报"完成"却什么也没压实。
+
+    真机（F:，1.8 TiB，极端档 + 400 GiB 范围）报出三条自相矛盾的结论：
+    「紧密段 0.0 MiB」「内部空隙 643221.5 MiB」（比 400 GiB 的范围还大）、
+    「还剩 409600.0 MiB 未能搬空」。根因有两个：空隙按段累加而各段互相重叠；
+    以及极端档把大文件丢进前面的空洞，卷尾一个字节都没动。
+    """
+
+    def test_extreme_will_not_dump_big_files_into_random_holes(self):
+        """大文件贴不到卷尾时，极端档**不搬**它们。
+
+        搬进前面的空洞对压实是负收益：卷尾长度不变，白搬几十 GB，还会占掉
+        之后真正紧贴时需要的连续空闲。
+        """
+        # 压实范围 [800, 1200)：大文件占 800~1100，卷尾 1110~ 全是小文件。
+        files = [f("big", (800, 300))]
+        files += [f(f"s{i}", (1110 + i * 15, 8)) for i in range(6)]
+        report = make_report(files, total=1200)
+        params = JobParams(
+            intensity=Intensity.EXTREME, extreme_min_mib=1, pack_span_blocks=400
+        )
+        plan = build_plan("t", Strategy.PACK_TAIL, report, params=params)
+        assert plan.ops == (), "贴不上就不该搬，否则只是把大文件挪个地方"
+        text = " ".join(plan.notes)
+        assert "没有产生任何搬迁" in text, f"必须直说没搬，实际：{plan.notes}"
+        assert "标准" in text, f"要指出换哪个档能解决，实际：{plan.notes}"
+
+    def test_holes_never_exceed_the_span(self):
+        """空隙是区间并集，不是各段落差之和。
+
+        游标不前移，所以每个前置落点算出的空隙都从同一个 cursor 起算、
+        互相包含；逐个相加会得到"比压实范围还大"的空隙（真机 628 GiB 对
+        400 GiB，那个数字当场就说明账算错了）。
+        """
+        span_blocks = 1000
+        span_mib = span_blocks * BLOCK / 1024**2
+        reported = 0
+        rng = random.Random(7)
+        for _ in range(30):
+            files, pos = [], 900
+            while pos < 2000 - 10:
+                n = rng.choice([20, 40, 60, 80, 120])
+                if pos + n > 2000:
+                    break
+                files.append(f(f"t{len(files)}", (pos, n)))
+                pos += n + rng.choice([0, 4, 8, 16, 24])
+            files.append(f("big", (200, rng.choice([120, 160, 200]))))
+            plan = build_plan(
+                "t",
+                Strategy.PACK_TAIL,
+                make_report(files, total=2000),
+                params=JobParams(
+                    intensity=Intensity.STANDARD, pack_span_blocks=span_blocks
+                ),
+            )
+            for note in plan.notes:
+                m = re.search(r"约 ([\d.]+) MiB 空隙", note)
+                if not m:
+                    continue
+                got = float(m.group(1))
+                reported += 1
+                assert got <= span_mib + 1e-6, (
+                    f"空隙 {got} MiB 超过 {span_mib:.1f} MiB 的压实范围：{note}"
+                )
+        assert reported, "这组布局本该至少触发一次前置落点，否则断言是空的"
+
+    def test_no_op_is_not_reported_as_compacted(self):
+        """一个 op 都没有时，不能出现"紧密段 共 0.0 MiB，其前方为连续空闲"。"""
+        report = make_report([f("a", (900, 50)), f("b", (1000, 50))], total=1200)
+        params = JobParams(intensity=Intensity.EXTREME, extreme_min_mib=1)
+        plan = build_plan("t", Strategy.PACK_TAIL, report, params=params)
+        assert plan.ops == ()
+        for note in plan.notes:
+            assert "紧密段" not in note, note

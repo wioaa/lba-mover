@@ -106,7 +106,8 @@ PACK_TAIL_INTENSITY_HELP: dict[Intensity, str] = {
     Intensity.STANDARD: "压实范围内全部数据，贴不紧时改放前面最近的空位",
     Intensity.DEEP: "同「标准」：压实不区分文件大小，多搬大文件只会更慢",
     Intensity.THOROUGH: "全部数据，且必须紧贴 —— 放不进去的文件就不动，不留空隙",
-    Intensity.EXTREME: "只压不小于「大文件下限」的文件，一次性贴到卷尾",
+    Intensity.EXTREME: "只压不小于「大文件下限」的文件，且必须紧贴 —— 卷尾不干净时"
+    "通常一个都贴不上，那就什么都不搬（换「标准」档可以让它们先挪开）",
 }
 
 #: 切模式时带出的默认强度。**不是绑定**——切完仍可自由改档位，这里只负责

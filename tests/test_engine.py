@@ -11,7 +11,15 @@ import time
 import pytest
 
 from lbamover.contract.commands import CancelJob, StartJob, UpdateTarget
-from lbamover.contract.enums import ErrorClass, EventKind, JobState, LogLevel, Strategy, VolumeKind
+from lbamover.contract.enums import (
+    ErrorClass,
+    EventKind,
+    ExecMode,
+    JobState,
+    LogLevel,
+    Strategy,
+    VolumeKind,
+)
 from lbamover.contract.models import Extent, FileFrag, Geometry, JobParams, Plan, VolumeInfo
 from lbamover.contract.ports import ListSink
 from lbamover.devices.memory import MemoryDevice
@@ -334,6 +342,57 @@ class TestEngineService:
         svc, _core, _sink = self._service(tmp_path, layout, dev, vol)
         svc.stop(timeout=3)
         assert svc._thread is None
+
+    def test_cache_mode_is_refused_before_opening_the_device(self, tmp_path):
+        """已挂载 NTFS 卷 + 缓存搬运：必须在**打开设备之前**就明确拒绝。
+
+        2.0.0K 真机（F:，memcached）：``StartJob`` 先 ``_open`` 再 ``execute``，
+        而卷设备的构造函数一看到「writable 但没有锁卷」就抛 FATAL，于是用户
+        拿到的是「对原始卷写入必须先锁定卷（lock_volume=True）」—— 一句
+        既没说明原因、也没说明该改成什么的话，看起来像引擎内部故障。
+        """
+        import dataclasses
+
+        layout = build_layout(256, file_count=6, seed=5)
+        dev = MemoryDevice(layout.total_blocks, layout.geometry.block_size)
+        populate(dev, layout)
+        # 伪装成"已挂载的 NTFS 卷"：正是缓存引擎的硬边界
+        vol = dataclasses.replace(
+            make_volume(layout.geometry), filesystem="NTFS", is_mounted=True
+        )
+        opened: list[VolumeInfo] = []
+        sink = ListSink()
+        core = EngineCore(
+            sink=sink,
+            catalog=StaticCatalog(layout.files, layout.free, volume_key=vol.device_path),
+            state_dir=tmp_path / "s",
+        )
+        core.params = JobParams(
+            chunk_blocks=16, exec_mode=ExecMode.MEMCACHED, mem_cache_blocks=8
+        )
+        svc = EngineService(
+            core,
+            device_provider=lambda v: opened.append(v) or dev,
+        )
+        svc.start()
+        try:
+            svc.submit(UpdateTarget(vol, core.params, strategy=Strategy.COALESCE))
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and core.plan is None:
+                time.sleep(0.01)
+            assert core.plan is not None
+            svc.submit(StartJob())
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not opened:
+                # 给工作线程足够时间走到设备打开那一步
+                time.sleep(0.05)
+                if any("NTFS" in e.message for e in sink.of_kind(EventKind.LOG)):
+                    break
+            assert not opened, "缓存模式不该去打开裸块设备：那时已经晚了一步"
+            logs = "\n".join(e.message for e in sink.of_kind(EventKind.LOG))
+            assert "NTFS" in logs, f"必须说清是卷类型不允许，实际日志：{logs}"
+        finally:
+            svc.stop(timeout=3)
 
 
 class TestScanProgress:

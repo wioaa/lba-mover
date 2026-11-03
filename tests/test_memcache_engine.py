@@ -322,7 +322,7 @@ class TestEngineWiring:
         core.params = JobParams(exec_mode=ExecMode.MEMCACHED)
         core.volume = _volume("NTFS", mounted=True)
         with pytest.raises(PlanRejected):
-            core._check_exec_mode(None)
+            core.check_exec_mode(None)
 
     def test_unmounted_image_allowed(self):
         from lbamover.engine.engine import EngineCore
@@ -330,7 +330,7 @@ class TestEngineWiring:
         core = EngineCore()
         core.params = JobParams(exec_mode=ExecMode.MEMCACHED)
         core.volume = _volume("NTFS", mounted=False)
-        core._check_exec_mode(None)  # 不抛即通过
+        core.check_exec_mode(None)  # 不抛即通过
 
     def test_factory_returns_memcache_executor(self, device):
         from lbamover.engine.engine import EngineCore

@@ -17,7 +17,7 @@ from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtTest import QSignalSpy, QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication, QMessageBox  # noqa: E402
 
-from lbamover.contract.enums import JobState, LogLevel, Strategy, VolumeKind  # noqa: E402
+from lbamover.contract.enums import ExecMode, JobState, LogLevel, Strategy, VolumeKind  # noqa: E402
 from lbamover.contract.events import (  # noqa: E402
     FragMapEvent,
     JobDoneEvent,
@@ -340,6 +340,44 @@ class TestParamsPanel:
         assert p.depth.isHidden()
         assert "▸" in p.advanced_toggle.text()
 
+    def test_cache_modes_locked_on_mounted_ntfs(self, qapp):
+        """已挂载 NTFS 卷上，两种缓存搬运必须在**选卷时**就禁掉。
+
+        2.0.0K 真机：在 F: 上选了 memcached，按下开始后只得到一句
+        「对原始卷写入必须先锁定卷（lock_volume=True）」—— 那是设备构造期的
+        实现细节，用户读不出"选错了搬运方式"。
+        """
+        p = ParamsPanel(DARK)
+        p.set_cache_allowed(False, "已挂载的 NTFS 卷不能用缓存")
+        assert not p.exec_cached.isEnabled()
+        assert not p.exec_memcached.isEnabled()
+        assert not p.cache_note.isHidden()
+        assert "NTFS" in p.cache_note.text()
+        assert p.exec_mode() is ExecMode.NATIVE
+
+    def test_stale_cache_setting_cannot_survive_volume_switch(self, qapp):
+        """配置里存着 memcached，换到已挂载 NTFS 卷后不能又被恢复出来。
+
+        只把复选框置灰挡不住这条：``apply()`` 从配置读出来的勾选状态仍然
+        在，``current()`` 照样会造出一份 memcached 参数。
+        """
+        p = ParamsPanel(DARK)
+        p.apply(JobParams(exec_mode=ExecMode.MEMCACHED, mem_cache_blocks=8))
+        assert p.exec_mode() is ExecMode.MEMCACHED
+        p.set_cache_allowed(False, "不支持")
+        p.apply(JobParams(exec_mode=ExecMode.MEMCACHED, mem_cache_blocks=8))
+        assert p.exec_mode() is ExecMode.NATIVE
+        assert p.current().exec_mode is ExecMode.NATIVE
+
+    def test_cache_allowed_again_restores_control(self, qapp):
+        p = ParamsPanel(DARK)
+        p.set_cache_allowed(False, "不支持")
+        p.set_cache_allowed(True)
+        assert p.exec_cached.isEnabled() and p.exec_memcached.isEnabled()
+        assert p.cache_note.isHidden()
+        p.exec_memcached.setChecked(True)
+        assert p.exec_mode() is ExecMode.MEMCACHED
+
     def test_lock_toggles_structural_params(self, qapp):
         p = ParamsPanel(DARK)
         p.set_locked(True)
@@ -384,10 +422,50 @@ class TestLogView:
         v.append(LogLevel.ERROR, "保留")
         assert "保留" in v.text.toPlainText()
 
+    def test_default_filter_matches_the_visible_choice(self, qapp):
+        """下拉框写着「信息+」，就必须真的按 INFO 过滤。
+
+        旧实现把 ``setCurrentIndex`` 放在 ``connect`` 之前，默认项从不触发
+        过滤回调，内部阈值一直是 DEBUG —— 界面显示「信息+」，实际一条都没滤。
+        """
+        v = LogView(DARK)
+        assert v.filter.currentText() == "信息+"
+        assert v._min_level is LogLevel.INFO
+        v.append(LogLevel.DEBUG, "调试不该出现")
+        v.append(LogLevel.INFO, "信息应该出现")
+        text = v.text.toPlainText()
+        assert "调试不该出现" not in text
+        assert "信息应该出现" in text
+
+    def test_widening_the_filter_brings_lines_back(self, qapp):
+        """级别筛选是「看」的开关，不是「留」的开关。
+
+        旧实现按当前级别直接丢弃，于是「仅错误 → 全部」之后日志是空的，
+        用户看到的现象就是"筛选坏了"。
+        """
+        v = LogView(DARK)
+        v.filter.setCurrentIndex(3)  # 仅错误
+        v.append(LogLevel.DEBUG, "被筛掉的调试行")
+        v.append(LogLevel.INFO, "被筛掉的信息行")
+        assert v.text.toPlainText() == ""
+        v.filter.setCurrentIndex(0)  # 全部
+        text = v.text.toPlainText()
+        assert "被筛掉的调试行" in text and "被筛掉的信息行" in text
+
+    def test_diagnostic_gets_unfiltered_lines(self, qapp):
+        """复制诊断取全量：求助时最需要的正是被筛掉的上下文。"""
+        v = LogView(DARK)
+        v.filter.setCurrentIndex(3)
+        v.append(LogLevel.DEBUG, "细节甲")
+        v.append(LogLevel.INFO, "细节乙")
+        tail = v.plain_tail(20)
+        assert any("细节甲" in line for line in tail)
+        assert any("细节乙" in line for line in tail)
+
     def test_html_is_escaped(self, qapp):
         v = LogView(DARK)
         v.append(LogLevel.INFO, "<script>alert(1)</script>")
-        raw = v._lines[-1]
+        _level, raw, _plain = v._lines[-1]
         assert "&lt;script&gt;" in raw, "日志消息必须做 HTML 转义"
         assert "<script>" not in raw
 

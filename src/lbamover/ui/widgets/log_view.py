@@ -7,6 +7,11 @@
 2. **有上限**。无上限日志会在长时间任务里吃掉几百 MB，最终把界面拖死。
    这里保留最近 3000 行，超出从头部丢。
 3. **异常单独置顶提示**。错误埋在一屏滚动文字里，用户第一反应是"卡住了"。
+
+还有一条容易被写错的：**先存全量、渲染时才过滤**。反过来做（写入时按当前
+级别丢弃）会有两个后果 —— 换回更宽的级别时之前被丢的行再也回不来，而且
+"复制诊断"拿到的日志会缺掉恰好最需要的那部分。级别筛选是**看**的开关，
+不是**留**的开关。
 """
 
 from __future__ import annotations
@@ -54,7 +59,9 @@ class LogView(QWidget):
         super().__init__(parent)
         self._p = palette
         self._min_level = LogLevel.DEBUG
-        self._lines: deque[str] = deque(maxlen=self.max_lines)
+        #: ``(级别, 富文本, 纯文本)``。**保存全部级别**，过滤只作用于渲染 ——
+        #: 见模块 docstring。
+        self._lines: deque[tuple[LogLevel, str, str]] = deque(maxlen=self.max_lines)
 
         head = QHBoxLayout()
         head.setSpacing(8)
@@ -67,9 +74,16 @@ class LogView(QWidget):
         for label, lvl in (("全部", LogLevel.DEBUG), ("信息+", LogLevel.INFO),
                            ("警告+", LogLevel.WARNING), ("仅错误", LogLevel.ERROR)):
             self.filter.addItem(label, lvl)
-        self.filter.setCurrentIndex(1)
-        self.filter.currentIndexChanged.connect(self._on_filter)
         self.filter.setFixedWidth(96)
+        # **先设默认项、connect 放到 self.text 建好之后**。两处都有讲究：
+        # 默认项在 connect 之前设，不会触发 _on_filter（那时 text 还不存在）；
+        # 而 _min_level 必须**显式**跟着默认项走 —— 忘了这一步，下拉框写着
+        # 「信息+」而内部阈值还是 DEBUG，界面一切正常但筛选从没生效过。
+        self.filter.setCurrentIndex(1)
+        # currentData() 回来的是**字符串**（LogLevel 是 str 枚举，Qt 存的原值），
+        # 必须转回枚举再用作 _ORDER 的键 —— 字符串恰好能查到，但那靠的是
+        # str 混入的哈希，换个枚举类型就会静默失配。
+        self._min_level = LogLevel(self.filter.currentData())
         head.addWidget(self.filter)
 
         self.diagnose_btn = QPushButton("复制诊断")
@@ -101,6 +115,8 @@ class LogView(QWidget):
         self.text.setMaximumBlockCount(self.max_lines)
         self.text.setFont(mono_font(9))
         self.text.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        # 到这里 text 才存在，现在可以把下拉框接上（见上面的注释）。
+        self.filter.currentIndexChanged.connect(self._on_filter)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -112,10 +128,6 @@ class LogView(QWidget):
     # -- 写入 -------------------------------------------------------------
 
     def append(self, level: LogLevel, message: str, detail: str = "") -> None:
-        if _ORDER[level] < _ORDER[self._min_level]:
-            self._lines.append("")
-            self._lines.pop()
-            return
         color = {
             LogLevel.DEBUG: self._p.text_faint,
             LogLevel.INFO: self._p.text_dim,
@@ -132,19 +144,26 @@ class LogView(QWidget):
         )
         if detail:
             line += f' <span style="color:{self._p.text_faint}">· {html.escape(detail)}</span>'
-        self._lines.append(line)
-        self.text.appendHtml(line)
+        plain = f"{ts} [{label}] {message}" + (f" · {detail}" if detail else "")
+        self._lines.append((level, line, plain))
+        if _ORDER[level] >= _ORDER[self._min_level]:
+            self._render(line)
         if level is LogLevel.ERROR:
+            # 横幅不受级别筛选影响：被筛掉的是"翻不到"，不是"没发生"。
             self.show_banner(message)
+
+    def _render(self, line: str) -> None:
+        self.text.appendHtml(line)
         self.text.moveCursor(QTextCursor.MoveOperation.End)
 
     def plain_tail(self, lines: int = 40) -> list[str]:
-        """最近若干行**纯文本**。
+        """最近若干行**纯文本**，取自全量缓存，不受级别筛选影响。
 
-        诊断报告要的是能直接读的文字，而 ``_lines`` 里存的是带颜色的 HTML。
-        从控件取纯文本还能顺带反映"用户当前看到的过滤条件"。
+        诊断报告要的是能直接读的文字，而且**必须是完整的那一份**：用户把
+        日志筛到「仅错误」正是因为他只想看错误，但求助时需要的是上下文。
+        按当前筛选取的话，报告里会恰好缺掉定位问题的那几行。
         """
-        text = self.text.toPlainText().splitlines()
+        text = [plain for _lvl, _html, plain in self._lines]
         return text[-lines:] if lines > 0 else text
 
     def show_banner(self, message: str) -> None:
@@ -159,10 +178,23 @@ class LogView(QWidget):
         self.text.clear()
         self.clear_banner()
 
+    def set_min_level(self, level: LogLevel) -> None:
+        """程序化设置级别阈值（与下拉框双向同步）。"""
+        index = self.filter.findData(level)
+        if index >= 0 and index != self.filter.currentIndex():
+            self.filter.setCurrentIndex(index)  # 会触发 _on_filter
+            return
+        self._min_level = level
+        self._rerender()
+
     def _on_filter(self) -> None:
-        self._min_level = self.filter.currentData()
-        # 过滤条件变化时用缓存重建，避免"过滤后日志消失且再也回不来"
+        self._min_level = LogLevel(self.filter.currentData())
+        self._rerender()
+
+    def _rerender(self) -> None:
+        """按当前阈值重画。**从全量缓存重画**，所以放宽级别能找回旧行。"""
         self.text.clear()
-        for line in self._lines:
-            if line:
+        for level, line, _plain in self._lines:
+            if _ORDER[level] >= _ORDER[self._min_level]:
                 self.text.appendHtml(line)
+        self.text.moveCursor(QTextCursor.MoveOperation.End)

@@ -247,14 +247,14 @@ class TestEngineGate:
         core = self._core()
         core.params = JobParams(exec_mode=ExecMode.CACHED, cache_dir="I:/cache")
         with pytest.raises(PlanRejected) as ei:
-            core._check_exec_mode(None)
+            core.check_exec_mode(None)
         text = str(ei.value)
         assert "NTFS" in text and "损坏" in text, "拒绝原因必须说清后果"
 
     def test_native_mode_passes(self):
         core = self._core()
         core.params = JobParams()
-        core._check_exec_mode(None)  # 不抛
+        core.check_exec_mode(None)  # 不抛
 
     def test_cached_mode_without_dir_rejected(self):
         from lbamover.engine.engine import EngineCore
@@ -281,7 +281,7 @@ class TestEngineGate:
         object.__setattr__(params, "cache_dir", "  ")
         core.params = params
         with pytest.raises(PlanRejected):
-            core._check_exec_mode(None)
+            core.check_exec_mode(None)
 
 
 class TestEndToEndOnMemoryDevice:

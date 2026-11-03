@@ -41,6 +41,9 @@ class ParamsPanel(QWidget):
         self._p = palette
         self._block_size = 4096
         self._suppress = False
+        #: 目标卷是否允许缓存搬运。默认允许（镜像 / 内存盘就是这样），
+        #: 选中已挂载的 NTFS 卷时由主窗口关掉。
+        self._cache_allowed = True
 
         form = QFormLayout()
         form.setLabelAlignment(form.labelAlignment())
@@ -198,11 +201,19 @@ class ParamsPanel(QWidget):
         self.error.setVisible(False)
         self.error.setStyleSheet(f"color: {palette.danger}; font-size: 11px;")
 
+        # 缓存方式为什么不可用。**不能只把复选框置灰**：灰掉的控件在用户眼里
+        # 是"功能没做"，而不是"这块盘不支持"。
+        self.cache_note = QLabel()
+        self.cache_note.setWordWrap(True)
+        self.cache_note.setVisible(False)
+        self.cache_note.setStyleSheet(f"color: {palette.text_faint}; font-size: 11px;")
+
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
         lay.addLayout(form)
         lay.addWidget(self.advanced_toggle)
+        lay.addWidget(self.cache_note)
         lay.addWidget(self.budget)
         lay.addWidget(self.error)
 
@@ -261,12 +272,41 @@ class ParamsPanel(QWidget):
             return None
 
     def exec_mode(self) -> ExecMode:
-        """三种搬运方式互斥。**判定只看勾选**，不猜默认值。"""
+        """三种搬运方式互斥。**判定只看勾选**，不猜默认值。
+
+        但有一条例外：目标卷不允许缓存时，勾选也一律按 ``NATIVE`` 算。
+        配置是跨会话恢复的 —— 上次在镜像上用 memcached，这次选中的是 C:，
+        复选框会被禁用，但 ``apply()`` 恢复出来的勾选状态还在。只靠置灰
+        挡不住「参数已经带上 memcached 了」这件事。
+        """
+        if not self._cache_allowed:
+            return ExecMode.NATIVE
         if self.exec_memcached.isChecked():
             return ExecMode.MEMCACHED
         if self.exec_cached.isChecked():
             return ExecMode.CACHED
         return ExecMode.NATIVE
+
+    def set_cache_allowed(self, allowed: bool, reason: str = "") -> None:
+        """目标卷是否允许缓存搬运（磁盘中转 / 内存块池）。
+
+        已挂载的 NTFS 卷一律不允许：缓存引擎写的是裸块设备，会绕过文件系统
+        覆盖 ``$MFT`` 指着的簇区。**在选卷时就禁掉，而不是等按下开始才报错**
+        —— 后者用户已经排了半天参数，最后拿到一句关于锁卷的报错。
+        """
+        self._cache_allowed = allowed
+        if not allowed:
+            # 先屏蔽信号再取消勾选：否则每个 setChecked 都会发 toggled，
+            # _emit 抓到的是一份"两个都没勾"的中间态。
+            for box in (self.exec_cached, self.exec_memcached):
+                box.blockSignals(True)
+                box.setChecked(False)
+                box.blockSignals(False)
+        self.cache_note.setText(reason)
+        self.cache_note.setVisible(bool(reason))
+        self._sync_exec_rows()
+        if not allowed:
+            self._emit()
 
     def apply(self, params: JobParams) -> None:
         self._suppress = True
@@ -281,8 +321,12 @@ class ParamsPanel(QWidget):
             self.verify.setChecked(params.verify)
             self.ignore_errors.setChecked(params.ignore_errors)
             self.partial_lock.setChecked(params.partial_lock)
-            self.exec_cached.setChecked(params.exec_mode is ExecMode.CACHED)
-            self.exec_memcached.setChecked(params.exec_mode is ExecMode.MEMCACHED)
+            self.exec_cached.setChecked(
+                self._cache_allowed and params.exec_mode is ExecMode.CACHED
+            )
+            self.exec_memcached.setChecked(
+                self._cache_allowed and params.exec_mode is ExecMode.MEMCACHED
+            )
             self.mem_blocks.setValue(params.mem_cache_blocks)
             self.mem_kib.setValue(params.mem_cache_block_kib)
             if params.cache_dir:
@@ -336,7 +380,12 @@ class ParamsPanel(QWidget):
 
         不禁用而是提示：用户会先勾再填。把输入框整行隐藏会让"要填什么"
         完全不可见，那正是旧版"勾了缓存才发现没地方放"的成因。
+
+        但**复选框本身**在目标卷不支持时必须禁用：可点却一定失败的选择，
+        比灰掉的控件更糟。
         """
+        self.exec_cached.setEnabled(self._cache_allowed)
+        self.exec_memcached.setEnabled(self._cache_allowed)
         self.cache_dir.setEnabled(self.exec_cached.isChecked())
         self.mem_blocks.setEnabled(self.exec_memcached.isChecked())
         self.mem_kib.setEnabled(self.exec_memcached.isChecked())
@@ -372,6 +421,9 @@ class ParamsPanel(QWidget):
         self.ignore_errors.setEnabled(not locked)
         # 半锁定同理：锁的时机在 run_op 里，中途切换只会前后不一致。
         self.partial_lock.setEnabled(not locked)
+        # 上面统一 setEnabled(True) 会顺手把"这块盘不支持"的复选框放开，
+        # 所以最后按当前卷的能力再收一次。
+        self._sync_exec_rows()
 
     # -- 内部 -------------------------------------------------------------
 

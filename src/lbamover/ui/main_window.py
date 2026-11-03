@@ -448,8 +448,18 @@ class MainWindow(QMainWindow):
         self._volume = vol
         self.control.set_target_available(vol is not None)
         if vol is None:
+            self.params_panel.set_cache_allowed(True)
             return
         self.params_panel.set_block_size(vol.geometry.block_size)
+        # 已挂载的 NTFS 卷不能用缓存引擎（裸写会覆盖 $MFT 指着的簇区）。
+        # 在**选卷时**就把这两个选项关掉，而不是等按下「开始整理」才抛
+        # "必须先锁定卷" —— 那句话既没说明原因，也没说明该改成什么。
+        self.params_panel.set_cache_allowed(
+            not (vol.filesystem.upper() == "NTFS" and vol.is_mounted),
+            "这块盘是已挂载的 NTFS 卷：缓存与内存缓存都要裸写块设备，"
+            "会绕过文件系统损坏卷，因此不可用。整理它请用默认的盘内搬簇"
+            "（FSCTL_MOVE_FILE）。缓存方式只适用于卷镜像与内存盘。",
+        )
         # 「可用空间整理」的大小上限与单位换算都跟着卷走，换卷必须重新校准
         self.strategy_panel.reclaim.set_geometry(
             vol.geometry.block_size, vol.geometry.block_count
